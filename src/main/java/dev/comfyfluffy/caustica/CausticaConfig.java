@@ -10,7 +10,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.DoubleUnaryOperator;
 import java.util.function.IntUnaryOperator;
 import java.util.function.UnaryOperator;
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.loading.FMLPaths;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -104,7 +104,7 @@ public final class CausticaConfig {
 
     private static Path resolveConfigPath() {
         try {
-            return FabricLoader.getInstance().getConfigDir().resolve("caustica.toml");
+            return FMLPaths.CONFIGDIR.get().resolve("caustica.toml");
         } catch (Throwable t) {
             return Path.of("config", "caustica.toml");
         }

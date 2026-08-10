@@ -1,15 +1,15 @@
 package dev.comfyfluffy.caustica;
 
-import net.fabricmc.api.ModInitializer;
+import net.neoforged.fml.common.Mod;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public final class CausticaMod implements ModInitializer {
+@Mod(CausticaMod.MOD_ID)
+public final class CausticaMod {
 	public static final String MOD_ID = "caustica";
 	public static final Logger LOGGER = LoggerFactory.getLogger("Caustica");
 
-	@Override
-	public void onInitialize() {
+	public CausticaMod() {
 		// Register every setting (applying TOML file values) and write a default config on first run.
 		CausticaConfig.ensureRegistered();
 		CausticaConfig.saveIfMissing();

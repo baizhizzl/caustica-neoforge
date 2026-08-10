@@ -3,8 +3,10 @@ import org.gradle.process.ExecOperations
 import dev.comfyfluffy.caustica.build.GenerateShaderRecords
 
 plugins {
-	id "fabric-loom" version "${loom_version}"
+	id "java-library"
 	id "maven-publish"
+	id "net.neoforged.moddev" version "2.0.143"
+	id "idea"
 }
 
 version = project.mod_version
@@ -15,64 +17,70 @@ base {
 }
 
 repositories {
-	maven {
-		name = "Fabric"
-		url = "https://maven.fabricmc.net/"
-	}
 	mavenCentral()
 }
 
-loom {
+neoForge {
+	version = project.neoforge_version
+
 	runs {
 		client {
 			client()
-			setConfigName("Fabric Client")
-			ideConfigGenerated = true
-			runDir = "run"
 			// java.lang.foreign restricted methods (FFM bindings to amd_fidelityfx_vk.dll)
-			vmArg "--enable-native-access=ALL-UNNAMED"
+			jvmArgument "--enable-native-access=ALL-UNNAMED"
 
-            // NVIDIA NGX (DLSS) allocates ~1MB on the stack during init, which overflows Java's default 1MB thread stack.
-            // pass -Xss here directly so the main render thread is resized before the VM parses JAVA_TOOL_OPTIONS.
-            vmArg "-Xss16m"
+			// NVIDIA NGX (DLSS) allocates ~1MB on the stack during init, which overflows Java's default 1MB thread stack.
+			// pass -Xss here directly so the main render thread is resized before the VM parses JAVA_TOOL_OPTIONS.
+			jvmArgument "-Xss16m"
 
-            // NixOS fix: Gradle forks drop the dev-shell's LD_LIBRARY_PATH.
-            // We manually add the driver path so NGX can successfully dlopen libnvidia-ngx.so.1.
-            if (file("/run/opengl-driver/lib").exists()) {
-                def inherited = System.getenv("LD_LIBRARY_PATH")
-                environmentVariable "LD_LIBRARY_PATH",
-                        inherited ? "/run/opengl-driver/lib:${inherited}" : "/run/opengl-driver/lib"
-            }
+			// NixOS fix: Gradle forks drop the dev-shell's LD_LIBRARY_PATH.
+			// We manually add the driver path so NGX can successfully dlopen libnvidia-ngx.so.1.
+			if (file("/run/opengl-driver/lib").exists()) {
+				def inherited = System.getenv("LD_LIBRARY_PATH")
+				environment "LD_LIBRARY_PATH",
+						inherited ? "/run/opengl-driver/lib:${inherited}" : "/run/opengl-driver/lib"
+			}
 		}
+	}
 
-		server {
-			server()
-			setConfigName("Fabric Server")
-			ideConfigGenerated = true
-			runDir = "run"
+	mods {
+		caustica {
+			sourceSet(sourceSets.main)
 		}
+	}
+
+	// Wire the NeoForge/Minecraft artifacts into the test source set so unit tests
+	// (src/test/java) can compile against Minecraft classes (Identifier, Gson, fastutil, ...).
+	unitTest {
+		enable()
+		testedMod = mods.caustica
 	}
 }
 
 dependencies {
-	minecraft "com.mojang:minecraft:${project.minecraft_version}"
-	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
-	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
 	testImplementation platform("org.junit:junit-bom:5.12.2")
 	testImplementation "org.junit.jupiter:junit-jupiter"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 
 	// Layered TOML config (config/caustica.toml) — NightConfig, the same library NeoForge's
-	// ModConfigSpec is built on.
-	include implementation("com.electronwill.night-config:core:3.8.3")
-	include implementation("com.electronwill.night-config:toml:3.8.3")
+	// ModConfigSpec is built on. jarJar bundles them into the mod jar's META-INF/jarjar.
+	implementation "com.electronwill.night-config:core:3.8.3"
+	implementation "com.electronwill.night-config:toml:3.8.3"
+	jarJar "com.electronwill.night-config:core:3.8.3"
+	jarJar "com.electronwill.night-config:toml:3.8.3"
 }
 
 processResources {
 	inputs.property "version", project.version
+	inputs.property "mod_id", project.mod_id
+	inputs.property "mod_name", project.mod_name
+	inputs.property "mod_license", project.mod_license
+	inputs.property "mod_version", project.mod_version
+	inputs.property "neoforge_version", project.neoforge_version
+	inputs.property "minecraft_version_range", project.minecraft_version_range
 
-	filesMatching("fabric.mod.json") {
-		expand "version": inputs.properties.version
+	filesMatching("META-INF/neoforge.mods.toml") {
+		expand inputs.properties
 	}
 }
 
@@ -210,163 +218,16 @@ sourceSets.main.java.srcDir(files(layout.buildDirectory.dir("generated/sources/s
 // same /caustica/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
 
-def ngxNativeGenRoot = layout.buildDirectory.dir("generated/ngx-natives")
-def requestedTaskNames = gradle.startParameter.taskNames.collect { it.toLowerCase(java.util.Locale.ROOT) }
-def isRunClientInvocation = requestedTaskNames.any { it == "runclient" || it.endsWith(":runclient") }
-def ngxShimConfig = (findProperty("ngxShimConfig") ?: findProperty("ngxNativeConfig") ?: "release")
-		.toString().toLowerCase(java.util.Locale.ROOT)
-def normalizeNgxVendorConfig = { String config ->
-	def normalized = config.toLowerCase(java.util.Locale.ROOT)
-	if (normalized == "release") {
-		return "rel"
+java {
+	toolchain {
+		languageVersion = JavaLanguageVersion.of(25)
 	}
-	if (normalized == "debug") {
-		return "dev"
-	}
-	if (normalized != "rel" && normalized != "dev") {
-		throw new GradleException("Unknown NGX vendor config '${config}'. Expected 'rel' or 'dev'.")
-	}
-	return normalized
+	withSourcesJar()
 }
-def ngxVendorConfig = normalizeNgxVendorConfig(
-		(findProperty("ngxVendorConfig") ?: (isRunClientInvocation ? "dev" : "rel")).toString())
-def ngxNativeRoot = layout.buildDirectory.dir("native/ngx_shim").get().asFile
-def ngxShimOutDir = new File(ngxNativeRoot, ngxShimConfig)
-def currentNgxPlatform = {
-	def os = org.gradle.internal.os.OperatingSystem.current()
-	def arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT)
-	def x64 = arch == "x86_64" || arch == "amd64"
-	if (os.windows && x64) {
-		return "windows-x64"
-	}
-	if (os.linux && x64) {
-		return "linux-x64"
-	}
-	return null
-}()
-def ngxNativePlatforms = [
-	[
-		name: "windows-x64",
-		shimIncludes: [
-			"ngxshim.dll"
-		],
-		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Windows_x86_64/${vendorConfig}") },
-		vendorIncludes: [
-			"nvngx_dlssd.dll",
-			"nvngx_dlssg.dll"
-		]
-	],
-	[
-		name: "linux-x64",
-		shimIncludes: [
-			"libngxshim.so"
-		],
-		vendorRoot: { dlssSdkRoot, vendorConfig -> new File(dlssSdkRoot, "lib/Linux_x86_64/${vendorConfig}") },
-		vendorIncludes: [
-			"libnvidia-ngx-dlssd.so*",
-			"libnvidia-ngx-dlssg.so*"
-		]
-	]
-]
-def ngxNativePlatformByName = ngxNativePlatforms.collectEntries { platform -> [(platform.name): platform] }
-def requestedNgxPlatformsRaw = (findProperty("ngxPlatforms") ?: "current").toString()
-		.split(",")
-		.collect { it.trim() }
-		.findAll { !it.isEmpty() }
-def selectedNgxNativePlatforms
-if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("all")) {
-	selectedNgxNativePlatforms = ngxNativePlatforms
-} else if (requestedNgxPlatformsRaw.size() == 1 && requestedNgxPlatformsRaw[0].equalsIgnoreCase("current")) {
-	if (currentNgxPlatform == null || !ngxNativePlatformByName.containsKey(currentNgxPlatform)) {
-		throw new GradleException("No NGX native platform is configured for this host.")
-	}
-	selectedNgxNativePlatforms = [ngxNativePlatformByName[currentNgxPlatform]]
-} else {
-	def unknownPlatforms = requestedNgxPlatformsRaw.findAll { !ngxNativePlatformByName.containsKey(it) }
-	if (!unknownPlatforms.empty) {
-		throw new GradleException("Unknown NGX platform(s): ${unknownPlatforms.join(', ')}")
-	}
-	selectedNgxNativePlatforms = requestedNgxPlatformsRaw.collect { ngxNativePlatformByName[it] }
-}
-
-def dlssSdkEnv = providers.environmentVariable("DLSS_SDK")
-def dlssSdkRootProvider = dlssSdkEnv.map { file(it) }
-
-def bundleNgxNatives = tasks.register("bundleNgxNatives") {
-	group = "build"
-	description = "Bundles NGX shim and ${ngxVendorConfig} DLSS native libraries into the mod resources."
-
-	inputs.property "ngxShimConfig", ngxShimConfig
-	inputs.property "ngxVendorConfig", ngxVendorConfig
-
-	selectedNgxNativePlatforms.each { platform ->
-		inputs.files(fileTree(ngxShimOutDir) {
-			include platform.shimIncludes
-		}).withPropertyName("ngxNatives.${platform.name}.shim")
-		inputs.files(fileTree(platform.vendorRoot(dlssSdkRootProvider.getOrElse(file("__missing_dlss_sdk__")), ngxVendorConfig)) {
-			include platform.vendorIncludes
-		}).withPropertyName("ngxNatives.${platform.name}.vendor")
-	}
-	outputs.dir(ngxNativeGenRoot)
-	outputs.upToDateWhen { false }
-
-	doLast {
-		delete(ngxNativeGenRoot)
-		def missing = []
-		def dlssSdkRoot = dlssSdkRootProvider.orNull
-		if (dlssSdkRoot == null) {
-			throw new GradleException("DLSS_SDK environment variable is not set.")
-		}
-		selectedNgxNativePlatforms.each { platform ->
-			def platformShimFiles = fileTree(ngxShimOutDir) {
-				include platform.shimIncludes
-			}.files
-			if (platformShimFiles.empty) {
-				missing += "${platform.name} shim library in ${ngxShimOutDir}"
-			}
-		}
-		selectedNgxNativePlatforms.each { platform ->
-			def platformVendorRoot = platform.vendorRoot(dlssSdkRoot, ngxVendorConfig)
-			def missingVendorIncludes = platform.vendorIncludes.findAll { vendorInclude ->
-				fileTree(platformVendorRoot) {
-					include vendorInclude
-				}.files.empty
-			}
-			if (!missingVendorIncludes.empty) {
-				missing += "${platform.name} vendor libraries ${missingVendorIncludes.join(', ')} in ${platformVendorRoot}"
-			}
-		}
-		if (!missing.empty) {
-			throw new GradleException("Missing NGX native inputs:\n - " + missing.join("\n - "))
-		}
-
-		copy {
-			selectedNgxNativePlatforms.each { platform ->
-				from(fileTree(ngxShimOutDir) {
-					include platform.shimIncludes
-				}) {
-					into "caustica/natives/${platform.name}"
-				}
-				from(fileTree(platform.vendorRoot(dlssSdkRoot, ngxVendorConfig))) {
-					include platform.vendorIncludes
-					into "caustica/natives/${platform.name}"
-				}
-			}
-			into ngxNativeGenRoot
-		}
-	}
-}
-
-sourceSets.main.resources.srcDir(files(ngxNativeGenRoot).builtBy(bundleNgxNatives))
 
 tasks.withType(JavaCompile).configureEach {
 	it.options.release = 25
-}
-
-java {
-	sourceCompatibility = JavaVersion.VERSION_25
-	targetCompatibility = JavaVersion.VERSION_25
-	withSourcesJar()
+	it.options.encoding = "UTF-8"
 }
 
 tasks.named("jar", Jar).configure {

@@ -7,7 +7,8 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 
-import net.fabricmc.loader.api.FabricLoader;
+import net.neoforged.fml.ModList;
+import net.neoforged.fml.loading.FMLPaths;
 
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
@@ -123,7 +124,7 @@ public final class NgxRuntime {
 
         lib = NgxLibrary.load(shim);
 
-        Path dataPath = FabricLoader.getInstance().getGameDir().resolve("caustica-ngx");
+        Path dataPath = FMLPaths.GAMEDIR.get().resolve("caustica-ngx");
         try {
             Files.createDirectories(dataPath);
         } catch (Exception e) {
@@ -160,7 +161,7 @@ public final class NgxRuntime {
     }
 
     private static Path extractBundledNatives() {
-        Path dir = FabricLoader.getInstance().getGameDir().resolve("caustica-ngx")
+        Path dir = FMLPaths.GAMEDIR.get().resolve("caustica-ngx")
                 .resolve("natives").resolve(PLATFORM_NATIVES.platformDir());
         try {
             Files.createDirectories(dir);
@@ -199,9 +200,13 @@ public final class NgxRuntime {
 
     private static List<String> bundledFeatureLibraryNames() {
         List<String> names = new ArrayList<>();
-        FabricLoader.getInstance().getModContainer("caustica").ifPresent(container -> {
+        // FabricLoader.getModContainer(...).getRootPaths() was the source of truth for the bundled
+        // feature libraries in dev (the run directory's resources). NeoForge loads mods from SecureJars,
+        // so enumerate the mod file's own content roots the same way.
+        var modFile = ModList.get().getModFileById(CausticaMod.MOD_ID);
+        if (modFile != null) {
             String nativeDir = "caustica/natives/" + PLATFORM_NATIVES.platformDir();
-            for (Path root : container.getRootPaths()) {
+            for (Path root : modFile.getFile().getContents().getContentRoots()) {
                 Path dir = root.resolve(nativeDir);
                 if (!Files.isDirectory(dir)) {
                     continue;
@@ -214,7 +219,7 @@ public final class NgxRuntime {
                     CausticaMod.LOGGER.warn("Could not list bundled NGX natives in {}", dir, e);
                 }
             }
-        });
+        }
         return names;
     }
 

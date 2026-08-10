@@ -2,6 +2,8 @@ package dev.comfyfluffy.caustica.rt.terrain;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.compat.AtlasSpriteFinder;
+import dev.comfyfluffy.caustica.compat.VanillaModelQuads;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
@@ -23,11 +25,6 @@ import it.unimi.dsi.fastutil.longs.LongIterator;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import it.unimi.dsi.fastutil.longs.LongSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
-import net.fabricmc.fabric.api.client.renderer.v1.Renderer;
-import net.fabricmc.fabric.api.client.renderer.v1.mesh.MutableQuadView;
-import net.fabricmc.fabric.api.client.renderer.v1.mesh.QuadEmitter;
-import net.fabricmc.fabric.api.client.renderer.v1.sprite.SpriteFinder;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.color.block.BlockColors;
 import net.minecraft.client.color.block.BlockTintSource;
 import net.minecraft.client.multiplayer.ClientChunkCache;
@@ -40,6 +37,7 @@ import net.minecraft.client.renderer.chunk.ChunkSectionLayer;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.client.model.geom.builders.UVPair;
+import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.SectionPos;
@@ -50,6 +48,7 @@ import net.minecraft.world.level.block.RenderShape;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Vector3fc;
 import org.lwjgl.system.MemoryUtil;
 
 import java.util.ArrayList;
@@ -60,20 +59,19 @@ final class RtTerrainMesher {
      * Reusable per-worker-thread meshing state. The mesh + captures are reset between tasks so their
      * backing arrays amortize across sections instead of re-growing per task. Everything the result carries out —
      * {@link PackedSection}, OMM data — is copied out of this state before the job returns, so reuse on
-     * the next task cannot corrupt a queued result. The Fabric block emitter is also thread-confined and
-     * reused; the fluid renderer stays per-task because it captures the dispatch context's model set.
+     * the next task cannot corrupt a queued result. The fluid renderer stays per-task because it captures
+     * the dispatch context's model set.
      */
     static final class WorkerTessState {
         final QuadCapture capture = new QuadCapture();
-        final QuadEmitter blockEmitter = Renderer.get().quadEmitter(capture::putFabric);
         final RandomSource blockRandom = RandomSource.createThreadLocalInstance(0L);
         final FluidCapture fluidCapture = new FluidCapture();
         final SectionMesh mesh = new SectionMesh();
         final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 
-        void reset(BlockColors blockColors, SpriteFinder blockSpriteFinder) {
+        void reset(BlockColors blockColors, AtlasSpriteFinder spriteFinder) {
             capture.blockColors = blockColors;
-            capture.spriteFinder = blockSpriteFinder;
+            capture.spriteFinder = spriteFinder;
             capture.discardBlock(); // defensive: a prior job's throw could leave buffered quads
             fluidCapture.reset();
             mesh.reset();
@@ -90,16 +88,16 @@ final class RtTerrainMesher {
      * Returns the mesh (possibly empty — caller checks {@code idx}).
      */
     static CpuSection buildCpuSection(BlockAndTintGetter region, BlockStateModelSet modelSet,
-                                              QuadEmitter blockEmitter, RandomSource blockRandom,
+                                              RandomSource blockRandom,
                                               QuadCapture capture,
-                                              FluidRenderer fluidRenderer, FluidCapture fluidCapture,
+                                              FluidStateModelSet fluidModelSet, FluidCapture fluidCapture,
                                               SectionMesh mesh, BlockPos.MutableBlockPos m,
                                               RtMaterialRegistry.Snapshot materials,
                                               int scx, int scy, int scz) {
         capture.materials = materials;
         fluidCapture.materials = materials;
-        tessellate(region, modelSet, blockEmitter, blockRandom, capture,
-                fluidRenderer, fluidCapture, mesh, m, scx, scy, scz);
+        tessellate(region, modelSet, blockRandom, capture,
+                fluidModelSet, fluidCapture, mesh, m, scx, scy, scz);
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
@@ -159,8 +157,8 @@ final class RtTerrainMesher {
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
-                                   QuadEmitter blockEmitter, RandomSource blockRandom, QuadCapture capture,
-                                   FluidRenderer fluidRenderer, FluidCapture fluidCapture,
+                                   RandomSource blockRandom, QuadCapture capture,
+                                   FluidStateModelSet fluidModelSet, FluidCapture fluidCapture,
                                    SectionMesh mesh, BlockPos.MutableBlockPos m, int scx, int scy, int scz) {
         int sox = scx << 4, soy = scy << 4, soz = scz << 4;
         capture.cur = mesh;
@@ -185,7 +183,7 @@ final class RtTerrainMesher {
                         // Water is the dielectric fluid; lava stays an opaque emitter. Tagged per-prim
                         // so the path tracer can branch (see emitQuad).
                         fluidCapture.water = fluid.is(FluidTags.WATER);
-                        RtFluidMesher.tesselate(region, m, fluidCapture, fluidRenderer.fluidModels, state, fluid);
+                        RtFluidMesher.tesselate(region, m, fluidCapture, fluidModelSet, state, fluid);
                     }
                     if (state.getRenderShape() != RenderShape.MODEL) {
                         continue;
@@ -201,7 +199,13 @@ final class RtTerrainMesher {
                     capture.originY = ly + (float) offset.y;
                     capture.originZ = lz + (float) offset.z;
                     blockRandom.setSeed(state.getSeed(m));
-                    model.emitQuads(blockEmitter, region, m, state, blockRandom, capture.cullTest);
+                    // NeoForge has no FRAPI: collect the model's baked quads through the vanilla
+                    // BlockStateModel parts (VanillaModelQuads mirrors FabricBlockStateModel.emitQuads's
+                    // cull + force-opaque semantics) and capture them pre-raster-lighting, as before.
+                    // The extended collectParts(level, pos, ...) path is used so NeoForge model mods
+                    // (NeoContinuity CTM) can emit their UV-remapped quads; vanilla models fall back to
+                    // the deprecated vanilla collectParts internally (see VanillaModelQuads).
+                    VanillaModelQuads.emit(model, region, m, state, blockRandom, capture.cullTest, capture::putQuad);
                     capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
                 }
             }
@@ -367,16 +371,18 @@ final class RtTerrainMesher {
         }
     }
 
-    /** Captures final Fabric model quads into the current section's mesh. */
+    /** Captures final vanilla model quads into the current section's mesh. */
     private static final class QuadCapture {
         SectionMesh cur; // set before each block model emission
         RtMaterialRegistry.Snapshot materials;
-        SpriteFinder spriteFinder;
 
         // Per-block context for biome tint, set before each model emission. We resolve it straight from
-        // BlockColors and combine it with the Fabric quad's authored color before raster lighting, so the
+        // BlockColors and combine it with the quad's authored color before raster lighting, so the
         // path tracer receives unlit albedo rather than vanilla AO + directional shading.
         BlockColors blockColors;
+        // UV→sprite reverse lookup for the block atlas (see AtlasSpriteFinder). Set per task from the
+        // dispatch context; shared read-only across the worker thread's sections.
+        AtlasSpriteFinder spriteFinder;
         BlockAndTintGetter view;
         BlockState state;
         BlockPos pos;
@@ -398,14 +404,20 @@ final class RtTerrainMesher {
         private int pendingCount;
         private int[] gidScratch = new int[0];
 
-        /** Capture a final Fabric Renderer API quad before raster AO/directional lighting is applied. */
-        private void putFabric(MutableQuadView quad) {
+        /**
+         * Capture a final vanilla baked quad before raster AO/directional lighting is applied. The
+         * NeoForge port reads everything straight off {@link BakedQuad} (positions, packed UVs, material
+         * info) instead of the Fabric quad view; see the FRAPI-elimination spec for the mapping.
+         */
+        private void putQuad(BakedQuad quad, ChunkSectionLayer layer) {
             PendingQuad q = acquire();
             for (int i = 0; i < 4; i++) {
-                q.x[i] = quad.x(i) + originX;
-                q.y[i] = quad.y(i) + originY;
-                q.z[i] = quad.z(i) + originZ;
-                q.uv[i] = UVPair.pack(quad.u(i), quad.v(i));
+                Vector3fc p = quad.position(i);
+                q.x[i] = p.x() + originX;
+                q.y[i] = p.y() + originY;
+                q.z[i] = p.z() + originZ;
+                long uv = quad.packedUV(i);
+                q.uv[i] = UVPair.pack(Float.intBitsToFloat((int) (uv >>> 32)), Float.intBitsToFloat((int) uv));
             }
 
             float ex1 = q.x[1] - q.x[0], ey1 = q.y[1] - q.y[0], ez1 = q.z[1] - q.z[0];
@@ -415,23 +427,17 @@ final class RtTerrainMesher {
             if (len > 1.0e-6f) { nx /= len; ny /= len; nz /= len; }
             q.nx = nx; q.ny = ny; q.nz = nz;
 
-            ChunkSectionLayer layer = quad.chunkLayer();
             q.cutout = layer != ChunkSectionLayer.SOLID;
             q.translucent = layer == ChunkSectionLayer.TRANSLUCENT;
 
-            // Fabric colors are authored albedo. Continuity uses them for already-resolved overlay tint;
-            // ordinary biome-tinted quads retain tintIndex and are multiplied by the world tint below.
-            int sr = 0, sg = 0, sb = 0;
-            for (int i = 0; i < 4; i++) {
-                int color = quad.color(i);
-                sr += (color >> 16) & 0xFF;
-                sg += (color >> 8) & 0xFF;
-                sb += color & 0xFF;
-            }
-            float tr = sr / 1020f;
-            float tg = sg / 1020f;
-            float tb = sb / 1020f;
-            int tintIndex = quad.tintIndex();
+            // Vanilla quads carry no authored per-vertex color (FRAPI's color(i) is white by default for
+            // baked quads), so the albedo starts at 1. Continuity's already-resolved overlay tint is a
+            // FRAPI-only feature and does not apply on NeoForge; ordinary biome-tinted quads retain
+            // tintIndex and are multiplied by the world tint below. (NeoContinuity's CTM quads are
+            // handled by the UV reverse-lookup below — the connected variant's sprite is resolved from
+            // the quad's remapped UVs, and its material is resolved from that sprite.)
+            float tr = 1f, tg = 1f, tb = 1f;
+            int tintIndex = quad.materialInfo().tintIndex();
             q.tinted = tintIndex >= 0;
             if (tintIndex >= 0 && blockColors != null && state != null) {
                 BlockTintSource src = blockColors.getTintSource(state, tintIndex);
@@ -444,13 +450,39 @@ final class RtTerrainMesher {
             }
             q.tr = tr; q.tg = tg; q.tb = tb;
 
-            q.emission = quad.emissive() ? 1f : (state != null ? state.getLightEmission() / 15f : 0f);
-            TextureAtlasSprite sprite = spriteFinder.find(quad);
+            // FRAPI's emissive() defaults to false, so the vanilla block-light emission is equivalent.
+            q.emission = state != null ? state.getLightEmission() / 15f : 0f;
+            // Sprite resolution, aligned with Fabric upstream's spriteFinder.find(quad): the declared
+            // materialInfo().sprite() is the fast path (vanilla quads always carry the right sprite),
+            // but connected-texture mods (Continuity / NeoContinuity) emit UV-remapped quads whose
+            // declared sprite is the base tile while the vertex UVs point into the connected variant's
+            // atlas region. For those, the UV centroid falls inside the variant sprite's rectangle, so
+            // the finder recovers the variant and the material resolves to the connected texture. The
+            // declared sprite wins when the centroid is inside its own rectangle (the common case —
+            // avoids a tree descent per quad); the finder is consulted only when it is not, and the
+            // declared sprite is kept as the final fallback (e.g. a UV outside every sprite region).
+            TextureAtlasSprite sprite = quad.materialInfo().sprite();
+            if (sprite != null && spriteFinder != null) {
+                float cu = 0f, cv = 0f;
+                for (int i = 0; i < 4; i++) {
+                    long uv = quad.packedUV(i);
+                    cu += Float.intBitsToFloat((int) (uv >>> 32));
+                    cv += Float.intBitsToFloat((int) uv);
+                }
+                cu *= 0.25f;
+                cv *= 0.25f;
+                if (cu < sprite.getU0() || cu > sprite.getU1() || cv < sprite.getV0() || cv > sprite.getV1()) {
+                    TextureAtlasSprite found = spriteFinder.find(cu, cv);
+                    if (found != null) {
+                        sprite = found;
+                    }
+                }
+            }
             q.sprite = sprite;
             q.materialId = materials.resolve(sprite, state, q.translucent);
         }
 
-        /** Fabric's cull predicate returns true when the nominal face should be discarded. */
+        /** The cull predicate returns true when the nominal face should be discarded. */
         private boolean isCulled(Direction direction) {
             if (direction == null) {
                 return false;

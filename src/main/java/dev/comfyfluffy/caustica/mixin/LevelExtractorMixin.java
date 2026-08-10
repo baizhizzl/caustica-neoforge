@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.mixin;
 
+import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import net.minecraft.client.renderer.extract.LevelExtractor;
 import net.minecraft.core.BlockPos;
@@ -17,6 +18,10 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
  *   <li>{@code blockChanged(BlockPos, int)} — packet/prediction block changes.</li>
  *   <li>{@code setBlocksDirty(int×6)} — multi-block changes (explosions, etc.) and the
  *       {@code setBlockDirty(pos, old, new)} render-shape path.</li>
+ *   <li>{@code allChanged()} — vanilla's full render-state invalidation (dimension change via
+ *       {@code setLevel}, render-distance change, F3+A): drop RT terrain residency so it rebuilds for
+ *       the new world. Fixes stale geometry persisting across an End→Overworld switch (coords alone
+ *       aren't world-unique). Resource reloads do NOT fire this; that path is handled separately.</li>
  * </ul>
  *
  * <p>We deliberately do <em>not</em> hook {@code setSectionDirty}: lighting-only invalidations
@@ -33,5 +38,17 @@ public class LevelExtractorMixin {
     @Inject(method = "setBlocksDirty(IIIIII)V", at = @At("HEAD"))
     private void caustica$rtBlocksDirty(int minX, int minY, int minZ, int maxX, int maxY, int maxZ, CallbackInfo ci) {
         RtTerrain.markBlocksDirty(minX, minY, minZ, maxX, maxY, maxZ);
+    }
+
+    /**
+     * Vanilla's full render-state invalidation ({@code LevelExtractor.allChanged()}: dimension change via
+     * {@code setLevel}, render-distance change, F3+A) — drop RT terrain residency so it rebuilds for the new
+     * world. Fixes stale geometry persisting across an End→Overworld switch (coords alone aren't
+     * world-unique). Resource reloads do NOT fire this; that path is handled separately.
+     */
+    @Inject(method = "allChanged()V", at = @At("RETURN"))
+    private void caustica$rtAllChanged(CallbackInfo ci) {
+        RtTerrain.requestFullClear();
+        RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
     }
 }
