@@ -26,6 +26,37 @@ Caustica 仍处于早期阶段。在渲染器持续完善的过程中，可能�
 - **[Argon4W](https://github.com/Argon4W/NeoContinuity)** —— NeoContinuity
   （Continuity 的 NeoForge 原生分支）的作者，本移植版的连接纹理捕获与其兼容。
 
+## 移植说明（相对 Fabric 原版的改动）
+
+本移植基于 Caustica **0.1.1**，目标平台从 Fabric 改为 NeoForge：
+
+- Fabric Loader 入口点 → `@Mod` 入口（`CausticaMod`，以及
+  `dist = Dist.CLIENT` 的 `CausticaClient`）。
+- Fabric API 事件 → NeoForge 事件总线（`ClientTickEvent.Pre`、
+  `GameShuttingDownEvent`）；`InvalidateRenderStateCallback` →
+  对 `LevelExtractor.allChanged()` 的 mixin 注入。
+- `FabricLoader` 的路径/环境接口 → `FMLPaths` / `FMLEnvironment` / `ModList`。
+- **完全移除了 Fabric Rendering API（FRAPI）依赖**——NeoForge 没有 FRAPI：
+  - `compat/VanillaModelQuads` 基于 vanilla `BakedQuad` 迭代复现了 FRAPI
+    `FabricBlockStateModel.emitQuads` 的默认语义，并调用 NeoForge 扩展版
+    `collectParts(level, pos, state, random, parts)`，使 NeoForge 模型模组
+    （如 NeoContinuity）输出的 quad 能被正确捕获。
+  - `compat/AtlasSpriteFinder` 以四叉树反查恢复了上游的 UV→sprite 反向查找
+    （用于 UV 重映射的连接纹理 quad），vanilla quad 走声明 sprite 快路径。
+  - FRAPI 的 mesh / `SubmitRenderPhase` 支持代码已删除（NeoForge 上不存在
+    FRAPI 模组）；保留 NeoForge `submitSpecial` 的默认行为。
+- NightConfig 改用 NeoForge JarJar 打包（替代 Fabric 的 `include`）。
+- 构建：Fabric Loom → ModDevGradle；着色器在构建期由 Slang/GLSL 源码编译为
+  SPIR-V（需要 `slangc`、`glslangValidator`、`spirv-val`）；NVIDIA NGX/DLSS
+  原生库原样打包，未做修改。
+
+### 已知移植限制
+
+- 不支持依赖 FRAPI 输出几何体的 Fabric 模组（如 Fabric 版 Continuity）——
+  请改用对应的 NeoForge 模组（如 NeoContinuity）。
+- 本移植已对全部 26 个 mixin 做了针对 NeoForge 补丁后源码的静态审计，
+  并通过了上游单元测试，但真实硬件上的渲染表现仍可能与 Fabric 版存在差异。
+
 ## 功能特性
 
 - Vulkan 硬件路径追踪世界渲染
@@ -74,37 +105,6 @@ Caustica 仍处于早期阶段。在渲染器持续完善的过程中，可能�
 
 Caustica 接管了世界渲染器，因此任何深度修改世界渲染、着色器管线、
 后处理或 Vulkan 后端的模组都可能冲突。纯 UI 类模组大概率兼容。
-
-## 移植说明（相对 Fabric 原版的改动）
-
-本移植基于 Caustica **0.1.1**，目标平台从 Fabric 改为 NeoForge：
-
-- Fabric Loader 入口点 → `@Mod` 入口（`CausticaMod`，以及
-  `dist = Dist.CLIENT` 的 `CausticaClient`）。
-- Fabric API 事件 → NeoForge 事件总线（`ClientTickEvent.Pre`、
-  `GameShuttingDownEvent`）；`InvalidateRenderStateCallback` →
-  对 `LevelExtractor.allChanged()` 的 mixin 注入。
-- `FabricLoader` 的路径/环境接口 → `FMLPaths` / `FMLEnvironment` / `ModList`。
-- **完全移除了 Fabric Rendering API（FRAPI）依赖**——NeoForge 没有 FRAPI：
-  - `compat/VanillaModelQuads` 基于 vanilla `BakedQuad` 迭代复现了 FRAPI
-    `FabricBlockStateModel.emitQuads` 的默认语义，并调用 NeoForge 扩展版
-    `collectParts(level, pos, state, random, parts)`，使 NeoForge 模型模组
-    （如 NeoContinuity）输出的 quad 能被正确捕获。
-  - `compat/AtlasSpriteFinder` 以四叉树反查恢复了上游的 UV→sprite 反向查找
-    （用于 UV 重映射的连接纹理 quad），vanilla quad 走声明 sprite 快路径。
-  - FRAPI 的 mesh / `SubmitRenderPhase` 支持代码已删除（NeoForge 上不存在
-    FRAPI 模组）；保留 NeoForge `submitSpecial` 的默认行为。
-- NightConfig 改用 NeoForge JarJar 打包（替代 Fabric 的 `include`）。
-- 构建：Fabric Loom → ModDevGradle；着色器在构建期由 Slang/GLSL 源码编译为
-  SPIR-V（需要 `slangc`、`glslangValidator`、`spirv-val`）；NVIDIA NGX/DLSS
-  原生库原样打包，未做修改。
-
-### 已知移植限制
-
-- 不支持依赖 FRAPI 输出几何体的 Fabric 模组（如 Fabric 版 Continuity）——
-  请改用对应的 NeoForge 模组（如 NeoContinuity）。
-- 本移植已对全部 26 个 mixin 做了针对 NeoForge 补丁后源码的静态审计，
-  并通过了上游单元测试，但真实硬件上的渲染表现仍可能与 Fabric 版存在差异。
 
 ## 借鉴组件（出处声明）
 
