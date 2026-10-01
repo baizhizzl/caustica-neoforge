@@ -18,10 +18,9 @@ import org.lwjgl.vulkan.VkSetLatencyMarkerInfoNV;
 import java.nio.LongBuffer;
 
 /**
- * NVIDIA Reflex (Phase 1b): the per-frame sleep/pacing loop + latency markers, built on the timeline
- * semaphore signaled by {@code vkLatencySleepNV}. Phase 0 (extension + capability probe, see
- * {@link RtDeviceBringup}) and Phase 1a (swapchain {@code VkSwapchainLatencyCreateInfoNV}, see
- * {@code VulkanGpuSurfaceMixin}) are prerequisites this builds on.
+ * NVIDIA Reflex per-frame sleep/pacing and latency markers, built on the timeline semaphore signaled
+ * by {@code vkLatencySleepNV}. {@link RtDeviceBringup} enables the device support and
+ * {@code VulkanGpuSurfaceMixin} configures each swapchain for latency mode.
  *
  * <p>{@code vkLatencySleepNV} does not itself block — per the extension, it schedules the driver to signal
  * a semaphore value once the paced frame-start time is reached, and the caller is expected to wait on that

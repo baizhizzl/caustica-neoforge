@@ -1,0 +1,33 @@
+plugins { id "java" }
+repositories { mavenCentral() }
+java { toolchain { languageVersion = JavaLanguageVersion.of(25) } }
+sourceSets.main.java {
+    srcDir(rootProject.file("src/main/java"))
+    include("dev/comfyfluffy/caustica/compat/ScratchLists.java")
+    include("dev/comfyfluffy/caustica/compat/UvRectIndex.java")
+}
+dependencies {
+    testImplementation platform("org.junit:junit-bom:5.12.2")
+    testImplementation "org.junit.jupiter:junit-jupiter"
+    testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+tasks.named("test") { useJUnitPlatform() }
+tasks.withType(JavaCompile).configureEach { options.encoding = "UTF-8" }
+
+sourceSets {
+    benchmark {
+        compileClasspath += sourceSets.main.output
+        runtimeClasspath += sourceSets.main.output
+    }
+}
+tasks.register("benchmarkAllocations", JavaExec) {
+    group = "verification"
+    description = "Compare model-parts scratch storage allocation; not an in-game FPS benchmark."
+    dependsOn(tasks.named("benchmarkClasses"))
+    classpath = sourceSets.benchmark.runtimeClasspath
+    mainClass = "dev.comfyfluffy.caustica.compat.ModelPartsAllocationBenchmark"
+    jvmArgs("-Xms256m", "-Xmx256m")
+}
+
+sourceSets { contracts }
+dependencies { contractsImplementation "org.ow2.asm:asm-tree:9.9" }

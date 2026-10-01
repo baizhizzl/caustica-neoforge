@@ -1,8 +1,8 @@
 package dev.comfyfluffy.caustica.rt.overlay;
 
-import com.mojang.blaze3d.textures.GpuTextureView;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
 import com.mojang.blaze3d.vertex.VertexConsumer;
-import com.mojang.blaze3d.vulkan.VulkanGpuTextureView;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuTextureView;
 
 import org.joml.Matrix4f;
 import org.joml.Quaternionf;
@@ -30,6 +30,7 @@ import net.minecraft.util.ARGB;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 
@@ -95,7 +96,8 @@ final class RtNameTagFeature implements RtOverlayFeature {
     }
 
     @Override
-    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, int width, int height) {
+    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, RtGpuExecutor.GraphicsUse graphicsUse,
+                           int width, int height) {
         if (!RtEntities.nameTagsEnabled()) {
             return false;
         }
@@ -157,7 +159,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
         }
         imageSetPool = RtOverlayPipelines.sampledImageSetPool(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, MAX_ATLAS_PAGES, "name tag");
         sampler = RtOverlayPipelines.createNearestClampSampler(ctx, "name tag font atlas");
-        pipeline = new RtOverlayPipelines.Spec("name_tag.vert.spv", "name_tag.frag.spv")
+        pipeline = new RtOverlayPipelines.Spec("name_tag/vertex.vert.spv", "name_tag/fragment.frag.spv")
                 .vertex(RtOverlayPipelines.VertexFormat.POSITION_TEX_COLOR)
                 .blend(RtOverlayPipelines.Blend.ALPHA)
                 .attachment(RtWorldOverlay.TARGET_FORMAT)
@@ -273,6 +275,8 @@ final class RtNameTagFeature implements RtOverlayFeature {
         public VertexConsumer setUv1(int u, int v) {
             return this; // overlay coords unused (no damage-tint pass here)
         }
+
+        @Override public VertexConsumer setUv3(float u, float v) { return this; }
 
         @Override
         public VertexConsumer setUv2(int lightU, int lightV) {

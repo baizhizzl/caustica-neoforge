@@ -1,8 +1,8 @@
 package dev.comfyfluffy.caustica.rt.entity;
 
-import com.mojang.blaze3d.PrimitiveTopology;
-import com.mojang.blaze3d.pipeline.ColorTargetState;
-import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.CausticaConfig;
@@ -37,6 +37,8 @@ import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import net.minecraft.client.renderer.texture.UvMapping;
+import net.minecraft.client.resources.model.geometry.ItemQuads;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
 import net.minecraft.core.Direction;
 import net.minecraft.core.BlockPos;
@@ -70,6 +72,9 @@ import java.util.function.Predicate;
  * EntityRenderDispatcher.submit} fans out into {@code submitModel} here. Reused across entities.
  */
 public final class RtEntityCollector implements SubmitNodeCollector {
+    private final VanillaModelQuads.Emitter modelQuads = new VanillaModelQuads.Emitter();
+    private final VanillaModelQuads.QuadSink blockQuadSink = this::addEmittedBlockQuad;
+
     private static final Direction[] DIRECTIONS = Direction.values();
     private static final Predicate<Direction> NEVER_CULL = direction -> false;
     // Vanilla leash constants (LeashFeatureRenderer.LEASH_RENDER_STEPS / LEASH_WIDTH).
@@ -132,8 +137,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     @Override
     public <S> void submitModel(Model<? super S> model, S state, PoseStack poseStack, RenderType renderType,
-                                int lightCoords, int overlayCoords, int tintedColor, TextureAtlasSprite sprite,
-                                int outlineColor, ModelFeatureRenderer.CrumblingOverlay crumblingOverlay) {
+                                int lightCoords, int overlayCoords, int tintedColor, UvMapping uvMapping,
+                                int outlineColor) {
+        TextureAtlasSprite sprite = uvMapping instanceof TextureAtlasSprite atlasSprite ? atlasSprite : null;
         if (capture == null) {
             return;
         }
@@ -176,7 +182,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 // pages during resource-pack load, so capture stores only the stable material ID.
                 capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
                 capture.currentMaterialId = RtEntityTextures.INSTANCE.materialIdFor(renderType, stochasticAlpha);
-                capture.clearUvRemap();
+                if (uvMapping == null) {
+                    capture.clearUvRemap();
+                } else {
+                    capture.setUvRemap(uvMapping.getU(0), uvMapping.getV(0), uvMapping.getU(1), uvMapping.getV(1));
+                }
             }
         } finally {
             RtFrameStats.FRAME.endStage("entity.capture.submit.material", materialStart);
@@ -332,6 +342,30 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
      *  function. Cutout/solid have none. Drives stochastic entity transparency in world.rahit. */
+    private static ColorTargetState firstColorTarget(RenderPipeline pipeline) {
+        var targets = pipeline.getColorTargetStates();
+        return targets.isEmpty() ? null : targets.getFirst();
+    }
+
+    @Override
+    public <S> void submitCrumblingOverlay(Model<? super S> model, S state, PoseStack poseStack,
+            RenderType renderType, int lightCoords, int overlayCoords, int tintedColor,
+            ModelFeatureRenderer.CrumblingOverlay crumblingOverlay) {
+        // Damage overlays are applied by the RT world shader, not added as coplanar entity geometry.
+    }
+
+    @Override
+    public void submitTextBackground(PoseStack poseStack, float x0, float y0, float x1, float y1,
+            int color, Font.DisplayMode displayMode, int lightCoords) {
+        if (capture == null) {
+            return;
+        }
+        textGlyphVisitor.pose = poseStack.last().pose();
+        textGlyphVisitor.lightCoords = lightCoords;
+        textGlyphVisitor.displayMode = displayMode;
+        textGlyphVisitor.acceptRenderable(Minecraft.getInstance().font.prepareBackground(x0, y0, x1, y1, color));
+    }
+
     private static boolean isTranslucent(RenderType renderType) {
         if (renderType == null) {
             return false;
@@ -340,7 +374,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // runtime), mirroring RtEntityTextures#textureLocation.
         Object setup = ((RenderTypeAccessor) renderType).caustica$state();
         RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
-        ColorTargetState cts = pipeline.getColorTargetState();
+        ColorTargetState cts = firstColorTarget(pipeline);
         return cts != null && cts.blendFunction().isPresent();
     }
 
@@ -351,7 +385,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
         Object setup = ((RenderTypeAccessor) renderType).caustica$state();
         RenderPipeline pipeline = ((RenderSetupAccessor) setup).caustica$pipeline();
-        ColorTargetState cts = pipeline.getColorTargetState();
+        ColorTargetState cts = firstColorTarget(pipeline);
         if (cts != null && cts.blendFunction().isPresent()) {
             return RtAccel.ENTITY_BUCKET_ANY_HIT;
         }
@@ -526,6 +560,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             return this; // overlay unused by the capture
         }
 
+        @Override public VertexConsumer setUv3(float u, float v) { return this; }
+
         @Override
         public VertexConsumer setUv2(int lightU, int lightV) {
             // Inverts VertexConsumer#setLight's default packing; light itself is unused by the capture
@@ -665,7 +701,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             // Extended collectParts(level, pos, ...) so NeoForge model mods (NeoContinuity CTM) can emit
             // their UV-remapped quads for dynamic blocks too; vanilla models fall back to the deprecated
             // vanilla collectParts internally (see VanillaModelQuads).
-            VanillaModelQuads.emit(model, view, pos, state, emittedBlockRandom, NEVER_CULL, this::addEmittedBlockQuad);
+            modelQuads.emit(model, view, pos, state, emittedBlockRandom, NEVER_CULL, blockQuadSink);
         } finally {
             emittedBlockPose = null;
             emittedBlockView = null;
@@ -714,11 +750,11 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     // quads on the block atlas. Capture them block-atlas textured (slot 0).
     @Override
     public void submitItem(PoseStack poseStack, ItemDisplayContext displayContext, int lightCoords, int overlayCoords,
-                           int outlineColor, int[] tintLayers, List<BakedQuad> quads, ItemStackRenderState.FoilType foilType) {
+                           int outlineColor, int[] tintLayers, ItemQuads quads, ItemStackRenderState.FoilType foilType) {
         if (capture == null) {
             return;
         }
-        addQuads(poseStack.last().pose(), quads, tintLayers);
+        addQuads(poseStack.last().pose(), quads.all(), tintLayers);
     }
 
     /** Capture one baked quad (block model / item) with its effective chunk layer, state-dependent
@@ -792,7 +828,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     }
 
     @Override
-    public void submitBreakingBlockModel(PoseStack poseStack, List<BlockStateModelPart> parts, int progress) {
+    public void submitBreakingBlockModel(PoseStack poseStack, List<BlockStateModelPart> parts, int progress, boolean isBlockTranslucent) {
     }
 
     @Override
@@ -900,6 +936,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
 
         @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv3(float u, float v) { return this; }
         @Override public VertexConsumer setUv2(int u, int v) { return this; }
 
         @Override
@@ -1026,6 +1063,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         @Override public VertexConsumer setColor(int color) { this.color = color; return this; }
         @Override public VertexConsumer setUv(float u, float v) { return this; }
         @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv3(float u, float v) { return this; }
         @Override public VertexConsumer setUv2(int u, int v) { return this; }
         @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
         @Override public VertexConsumer setLineWidth(float width) { this.width = width; return this; }

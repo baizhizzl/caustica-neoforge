@@ -1,130 +1,120 @@
-# Caustica — NeoForge 移植版
+# Caustica — NeoForge 26.3 移植版
 
-> **本仓库是 [Caustica](https://github.com/ComfyFluffy/Caustica) 的非官方 NeoForge 移植版，
-> 原作者是 [ComfyFluffy](https://github.com/ComfyFluffy)。**
-> 渲染器的全部设计、着色器和几乎所有代码均为原作者的成果，本仓库仅包含
-> Fabric → NeoForge 的适配工作。
-> **本移植版的问题请提到本仓库，不要打扰原作者。**
+> **这是 [ComfyFluffy/Caustica](https://github.com/ComfyFluffy/Caustica) 的非官方 NeoForge 移植。**
+> 上游渲染器的设计、着色器和主要实现属于原作者及其贡献者。本仓库维护 NeoForge 适配、
+> 26.3 图形接口迁移以及移植层的性能优化。请将移植版的问题提交到本仓库。
 
-Caustica 是一个实验性的光线追踪渲染器，面向 Minecraft 26.2 的 Vulkan 渲染后端。
-它用硬件光线追踪替换原版世界画面，并支持 NVIDIA DLSS 特性，同时保留
-Minecraft 原有的界面与玩法体验。
-
-Caustica 仍处于早期阶段。在渲染器持续完善的过程中，可能会遇到 bug、
-部分视觉场景缺失以及频繁的变动。
+Caustica 用 Vulkan 硬件路径追踪替换 Minecraft 的世界渲染，并保留原版界面与玩法。
+这是实验性渲染器；当前构建是 **26.3 测试候选版**，不应当把编译成功视为全部硬件场景已验证。
 
 ![Caustica 光追 Minecraft 场景](docs/gallery/2026-07-09_21.25.14.jpg)
 
-## 致谢
+## 当前版本与验证范围
 
-- **[ComfyFluffy](https://github.com/ComfyFluffy)** —— Caustica 原作者。
-  如果你喜欢这个模组，请去给[原仓库](https://github.com/ComfyFluffy/Caustica)
-  和它的 [Modrinth 页面](https://modrinth.com/mod/caustica) 点 Star 支持。
-  渲染器本身的全部荣誉属于原作者。
-- **[FabricMC](https://github.com/FabricMC/fabric)** —— Fabric Rendering API，
-  其语义为本移植的部分实现提供了参考（见下方「借鉴组件」）。
-- **[Argon4W](https://github.com/Argon4W/NeoContinuity)** —— NeoContinuity
-  （Continuity 的 NeoForge 原生分支）的作者，本移植版的连接纹理捕获与其兼容。
+| 项目 | 当前目标 |
+|---|---|
+| 模组版本 | `0.1.1-neoforge.2` |
+| Minecraft | `26.3`，版本范围 `[26.3,26.4)` |
+| NeoForge | 构建基线 `26.3.0.39-beta`，版本范围 `[26.3.0.39-beta,26.4)` |
+| Java | 25 |
+| 上游正式版本 | `0.1.1`，发布于 2026-07-28 |
+| 实际同步的上游 main | [`330acd2d743bb6b2e27b53a4adb4a3c852b9e141`](https://github.com/ComfyFluffy/Caustica/commit/330acd2d743bb6b2e27b53a4adb4a3c852b9e141) |
 
-## 移植说明（相对 Fabric 原版的改动）
+上游 main 包含正式版之后的改动；这里同步的是上述固定提交，而不是只改版本号。
+完整来源与适配边界见 [UPSTREAM.md](UPSTREAM.md)。构建产物的清单也记录了上游提交和目标平台。
 
-本移植基于 Caustica **0.1.1**，目标平台从 Fabric 改为 NeoForge：
+当前自动验证包括：64 个 CPU 单元测试、26 个客户端 Mixin 的 277 项目标字节码契约，
+以及全部构建期 Slang 着色器的 SPIR-V 编译和验证。**尚未完成真实世界渲染、HDR 显示器、
+DLSS RR/帧生成、Linux Wayland 或 NeoContinuity 的游戏内回归测试。**
+静态 Mixin 检查不能替代真实启动时的注入和渲染测试。
 
-- Fabric Loader 入口点 → `@Mod` 入口（`CausticaMod`，以及
-  `dist = Dist.CLIENT` 的 `CausticaClient`）。
-- Fabric API 事件 → NeoForge 事件总线（`ClientTickEvent.Pre`、
-  `GameShuttingDownEvent`）；`InvalidateRenderStateCallback` →
-  对 `LevelExtractor.allChanged()` 的 mixin 注入。
-- `FabricLoader` 的路径/环境接口 → `FMLPaths` / `FMLEnvironment` / `ModList`。
-- **完全移除了 Fabric Rendering API（FRAPI）依赖**——NeoForge 没有 FRAPI：
-  - `compat/VanillaModelQuads` 基于 vanilla `BakedQuad` 迭代复现了 FRAPI
-    `FabricBlockStateModel.emitQuads` 的默认语义，并调用 NeoForge 扩展版
-    `collectParts(level, pos, state, random, parts)`，使 NeoForge 模型模组
-    （如 NeoContinuity）输出的 quad 能被正确捕获。
-  - `compat/AtlasSpriteFinder` 以四叉树反查恢复了上游的 UV→sprite 反向查找
-    （用于 UV 重映射的连接纹理 quad），vanilla quad 走声明 sprite 快路径。
-  - FRAPI 的 mesh / `SubmitRenderPhase` 支持代码已删除（NeoForge 上不存在
-    FRAPI 模组）；保留 NeoForge `submitSpecial` 的默认行为。
-- NightConfig 改用 NeoForge JarJar 打包（替代 Fabric 的 `include`）。
-- 构建：Fabric Loom → ModDevGradle；着色器在构建期由 Slang/GLSL 源码编译为
-  SPIR-V（需要 `slangc`、`glslangValidator`、`spirv-val`）；NVIDIA NGX/DLSS
-  原生库原样打包，未做修改。
+## 本次同步与重写
 
-### 已知移植限制
+### 保留并同步上游渲染器
 
-- 不支持依赖 FRAPI 输出几何体的 Fabric 模组（如 Fabric 版 Continuity）——
-  请改用对应的 NeoForge 模组（如 NeoContinuity）。
-- 本移植已对全部 26 个 mixin 做了针对 NeoForge 补丁后源码的静态审计，
-  并通过了上游单元测试，但真实硬件上的渲染表现仍可能与 Fabric 版存在差异。
+- 新的光源采集、光源网格和层次结构，材质发光数据及 NEE 相关路径。
+- Bloom、天空 LUT、ACES 2.0 SDR/HDR 颜色变换、曝光调试和 OpenEXR 截图。
+- Slang 管线目录、通过反射生成的 Java 着色器结构和描述符绑定。
+- GPU 提交、资源生命周期和同步方面的上游修复。
 
-## 功能特性
+### 重写 NeoForge 适配热路径
 
-- Vulkan 硬件路径追踪世界渲染
-- DLSS 光线重建（Ray Reconstruction）支持
-- DLSS 帧生成（Frame Generation）支持（实验性）
-- HDR 输出
-- 光追场景中的动态实体渲染
-- LabPBR 风格 PBR 材质支持
-- OMM（不透明度微贴图）+ SER（着色器执行重排序）优化
-- 连接纹理捕获兼容 NeoForge 模型模组
-  （例如 [NeoContinuity](https://github.com/Argon4W/NeoContinuity)）
+- 区块和实体模型收集使用调用方拥有的、支持嵌套回调的临时列表；释放时清除引用，
+  超大列表不长驻缓存。仍使用带世界位置的 NeoForge `collectParts`，不牺牲动态模型语义。
+- UV → sprite 查询使用不可变、查询时不分配对象的索引；限制树深和节点数，
+  对重叠、重复或极小 UV 矩形保留有界终止路径。
+- 纹理缓存以 atlas 为键；资源重载和关闭时在区块工作线程排空之后清理。
+- 捕获器复用 quad 回调，避免每个方块创建新的回调对象。
 
-## 运行要求
+模型零件列表的独立分配基准，在此处的 JDK 25 上从 **80 B/方块降至预热后的 0 B/方块**。
+这只衡量列表存储的分配，**不是整个模型或整帧零分配，也不是 FPS 提升承诺**。
+复现方式与边界见 [PERFORMANCE.md](PERFORMANCE.md)。
 
-- Minecraft `26.2` + **NeoForge `26.2.0.57` 或更高版本**
-- **启用 Vulkan 图形后端**
-- 支持 Vulkan 光线追踪的显卡与驱动
-- DLSS 特性需要 NVIDIA RTX 显卡及受支持的驱动
-- HDR 输出需要 HDR 显示器并在系统开启 HDR
-- Linux 下 HDR 输出需要支持 HDR 的 Wayland 合成器及原生 Wayland 会话
-- 推荐搭配 LabPBR 资源包（如 [SPBR](https://modrinth.com/resourcepack/spbr)）以获得更好画质
+### 26.3 平台适配
 
-## 安装方法
+- 使用 Renderpearl 图形 API、Vulkan feature 集合和新版命令/管线接口。
+- SDL3 后端初始化；Linux Wayland 会话优先使用原生 Wayland，同时尊重显式用户设置。
+- 更新世界渲染、手持物品、屏幕效果及 GUI 的注入点，使用共享透明 UI 合成目标。
+- 适配实体提交、`UvMapping`、物品 quad 集合、文字背景与顶点 `Uv3` 接口。
+- 曝光调试项通过 NeoForge 事件注册；配置库通过 JarJar 内嵌。
+- 不依赖 Fabric Loader/API/FRAPI。Fabric-only 几何体接口没有直接兼容保证。
 
-1. 为 Minecraft `26.2` 安装 NeoForge `26.2.0.57` 或更高版本。
-2. 把 Caustica 的 jar 放进 Minecraft 的 `mods` 文件夹。
-3. 以 Vulkan 图形后端启动游戏。
-4. 打开「视频设置」调整 Caustica 的渲染器选项。
-5. （可选）安装 [NeoContinuity](https://github.com/Argon4W/NeoContinuity)
-   以使用连接纹理资源包。
+## 使用要求
 
-## 使用须知
+- Minecraft **26.3**、Java **25** 和上述 NeoForge 版本范围。
+- 启用 **Vulkan** 图形后端，使用支持 Vulkan 光线追踪的显卡和驱动。
+- DLSS 功能需要受支持的 NVIDIA RTX 显卡与驱动。
+- HDR 需要 HDR 显示器、系统 HDR 配置，以及支持所需交换链格式的窗口环境。
+- 建议使用 LabPBR 资源包，例如 [SPBR](https://modrinth.com/resourcepack/spbr)。
+- 本模组仅客户端有效。与深度修改世界渲染、后处理或 Vulkan 的模组可能冲突。
 
-- Caustica 仅客户端有效。
-- DLSS 光线重建与帧生成需要受支持的 NVIDIA 硬件与驱动。
-- Linux 下若启动时因栈溢出崩溃，尝试在 Java 参数中加 `-Xss2M` 增大线程栈。
-- 可通过 Java 参数改善性能，Minecraft 启动器默认：
-  `-XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC`
-- 帧生成为实验性功能，需要修改配置文件开启。
-- HDR 输出需要 HDR 交换链和正确配置的 HDR 显示器。
-- Linux 下启用 HDR 时，Caustica 会自动选择 GLFW 的原生 Wayland 后端；
-  X11/XWayland 表面通常不提供所需的 HDR10/PQ 格式。
-- 若 Minecraft 在崩溃后回退到了 OpenGL，请重新启用 Vulkan 后端再使用 Caustica。
+把构建得到的 jar 放入对应 26.3 实例的 `mods` 目录，以 Vulkan 后端启动，再到视频设置中调整。
+不要把旧的 26.2 成品混入同一实例。测试时建议备份存档并先使用单独的测试实例。
+如果 NGX 初始化发生线程栈溢出，可参考开发运行配置使用 `-Xss16m`；
+不建议未经测量直接叠加 JVM 性能参数。
 
-## 兼容性
+## 构建与测试
 
-Caustica 接管了世界渲染器，因此任何深度修改世界渲染、着色器管线、
-后处理或 Vulkan 后端的模组都可能冲突。纯 UI 类模组大概率兼容。
+依赖：JDK 25、Slang `slangc`（本次验证为 **2026.19**）、支持 Vulkan 1.4 的 `spirv-val`。
+着色器已经统一为 Slang，构建不再需要 `glslangValidator`。
 
-## 借鉴组件（出处声明）
+将工具加入 `PATH`，或设置 `VULKAN_SDK`。也可以显式设置 `CAUSTICA_SLANGC`、
+`CAUSTICA_SPIRV_VAL` 覆盖工具位置；显式覆盖优先于 SDK 和 `PATH`。
 
-除上游 Caustica 代码库本身外，本移植参考或适配了以下第三方组件：
+```powershell
+.\gradlew.bat build
+.\gradlew.bat :core-tests:test :core-tests:benchmarkAllocations
+.\gradlew.bat verifyMixinTargets
+.\gradlew.bat runClient
+```
 
-| 组件 | 来源 | 许可证 | 用途 |
-|---|---|---|---|
-| Caustica（全部渲染器代码、着色器、原生库胶水） | [ComfyFluffy/Caustica](https://github.com/ComfyFluffy/Caustica) | LGPL-3.0-or-later | 模组本体；本仓库是其衍生作品 |
-| `FabricBlockStateModel.emitQuads` 默认实现语义 | [FabricMC/fabric](https://github.com/FabricMC/fabric)（fabric-renderer-api-v1） | Apache-2.0 | `compat/VanillaModelQuads` 的行为参照 |
-| `SpriteFinderImpl` 算法 | [FabricMC/fabric](https://github.com/FabricMC/fabric)（fabric-renderer-api-v1） | Apache-2.0 | `compat/AtlasSpriteFinder` 的算法蓝本 |
-| NVIDIA DLSS/NGX 二进制（`nvngx_dlssd`、`nvngx_dlssg`） | NVIDIA RTX SDK，由上游打包 | NVIDIA 专有（见 `THIRD_PARTY_NOTICES.md`） | DLSS 光线重建 / 帧生成 |
-| NightConfig | [TheElectronWill/night-config](https://github.com/TheElectronWill/night-config) | LGPL-3.0 | TOML 配置（经 JarJar 内嵌） |
+Linux 对应使用 `bash ./gradlew ...`。成品在 `build/libs/`；不要安装 `-sources.jar`。
+`build` 包含完整单元测试和 Mixin 静态审计，不需要为 CPU 测试下载游戏纹理或音效。
+`runClient` 才是需要游戏资源、窗口及图形硬件的实际客户端运行。
+Windows 构建使用 `file.encoding=COMPAT` 避免含中文路径的启动参数文件与本机编码不一致；
+Java 源文件仍明确按 UTF-8 编译。
 
-## 许可证
+本地默认打包仓库中现有的 Windows/Linux x64 原生库，无需本地安装 DLSS SDK。
+CI 重新编译两个平台的 NGX shim，并显式选择平台以替换原生库：
 
-与上游一致：Caustica 项目自有的源代码与文档采用
-**GNU Lesser General Public License v3.0 或更高版本**授权。详见
-[LICENSE.md](LICENSE.md)、[COPYING](COPYING) 与
-[COPYING.LESSER](COPYING.LESSER)。本移植版作为原作的衍生作品，
-同样以 LGPL-3.0-or-later 发布。
+```sh
+DLSS_SDK=/path/to/DLSS bash ./gradlew build \
+  -PngxPlatforms=windows-x64,linux-x64 -PngxVendorConfig=rel -PngxShimConfig=release
+```
 
-发布的成品中可能包含按 NVIDIA 自有许可条款授权的 DLSS/NGX SDK 组件，
-详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+此模式需要 `build/native/ngx_shim/release/` 中的 shim 和所选 SDK 库；缺失时构建失败，
+不会悄悄回退到旧 shim。CI 固定并校验 Slang 下载文件的 SHA-256。
+
+## 致谢与许可证
+
+- **[ComfyFluffy](https://github.com/ComfyFluffy)** 和 Caustica 贡献者：上游渲染器及着色器。
+  欢迎支持[原仓库](https://github.com/ComfyFluffy/Caustica)和 [Modrinth](https://modrinth.com/mod/caustica)。
+- **[FabricMC](https://github.com/FabricMC/fabric)**：FRAPI 默认 quad 发射语义及 sprite 查找算法参考，Apache-2.0。
+- **[Argon4W/NeoContinuity](https://github.com/Argon4W/NeoContinuity)**：NeoForge 连接纹理实现；
+  移植层保留其所需世界模型收集接口，但当前 26.3 组合尚未游戏内实测。
+- **NVIDIA DLSS/NGX**：专有 SDK 与二进制，适用其自身许可。
+- **[NightConfig](https://github.com/TheElectronWill/night-config)**：LGPL-3.0，JarJar 打包的 TOML 配置库。
+
+本项目自身源代码与文档采用 **LGPL-3.0-or-later**，保留上游版权和第三方来源。
+详见 [LICENSE.md](LICENSE.md)、[COPYING](COPYING)、[COPYING.LESSER](COPYING.LESSER)
+和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

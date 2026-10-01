@@ -31,10 +31,12 @@ import java.nio.LongBuffer;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
+import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_PIPELINE_CREATE_RAY_TRACING_OPACITY_MICROMAP_BIT_EXT;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR;
@@ -60,80 +62,79 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
  * supported by passing an array; {@code traceRayEXT}'s {@code missIndex} selects among them.
  */
 public final class RtPipeline {
-    private static final String SHADER_DIR = "/caustica/rt/";
-    /** Set 1: entity albedo plus three independently indexed canonical material-page arrays. */
-    private static final int BINDLESS_BINDINGS = 4;
-    private static final int ENTITY_ALBEDO_BINDING = 0;
-    private static final int MATERIAL_SURFACE0_BINDING = 1;
-    private static final int MATERIAL_NORMAL_AO_BINDING = 2;
-    private static final int MATERIAL_SURFACE1_BINDING = 3;
-    // A ring of descriptor sets: setTlas writes the next slot (long-unused) rather than mutating the
-    // slot in-flight frames are still reading, so the TLAS can be swapped without a device drain.
-    // The TLAS is rebuilt + rebound every frame (dynamic content), so a slot is reused every RING
-    // frames; RING must exceed the max frames-in-flight (vanilla MC ≤ 3) for the reused slot to be off
-    // all queues. 6 gives margin and matches the KEEP_FRAMES-style horizon used for resource frees.
+    private static final String SHADER_DIR = "/caustica/shaders/pipelines/world/";
+    // A ring of descriptor sets: setTlas waits for the selected slot's exact prior graphics use before
+    // rewriting it. Ring depth is only a performance choice that avoids routine host waits.
     private static final int RING = 6;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
     private final long descriptorPool;
     private final long[] descriptorSets;
+    private final RtGpuExecutor.TrackedGraphicsUse[] descriptorSetUses;
     private int currentSet;
     private final long pipelineLayout;
     private final long pipeline;
     private final RtBuffer sbt;
     private final long sbtStride;
+    private final int raygenCount;
     private final int missCount;
     private final int hitGroupCount;
     private final int pushConstantSize;
     private final int pushConstantStages;
-    private final int firstExtraBinding;
     // Optional second descriptor set (set 1) holding entity albedo and canonical material-page arrays.
     // Only entity albedo is update-after-bind: its RenderType→slot registry is append-only. Material
     // pages are populated once at the resource-epoch boundary. 0 when created without bindless textures.
     private final long bindlessLayout;
     private final long bindlessPool;
     private final long bindlessSet;
-    private final int skyAtlasBinding;
     private boolean destroyed;
 
-    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline, RtBuffer sbt, long stride, int missCount, int hitGroupCount, int pushConstantSize, int pushConstantStages, int firstExtraBinding,
-                       long bindlessLayout, long bindlessPool, long bindlessSet, int skyAtlasBinding) {
+    private RtPipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline,
+                       RtBuffer sbt, long stride, int raygenCount, int missCount, int hitGroupCount,
+                       int pushConstantSize, int pushConstantStages, long bindlessLayout,
+                       long bindlessPool, long bindlessSet) {
         this.ctx = ctx;
         this.descriptorSetLayout = dsl;
         this.descriptorPool = pool;
         this.descriptorSets = sets;
+        this.descriptorSetUses = new RtGpuExecutor.TrackedGraphicsUse[sets.length];
+        for (int i = 0; i < descriptorSetUses.length; i++) {
+            descriptorSetUses[i] = new RtGpuExecutor.TrackedGraphicsUse();
+        }
         this.currentSet = 0;
         this.pipelineLayout = layout;
         this.pipeline = pipeline;
         this.sbt = sbt;
         this.sbtStride = stride;
+        this.raygenCount = raygenCount;
         this.missCount = missCount;
         this.hitGroupCount = hitGroupCount;
         this.pushConstantSize = pushConstantSize;
         this.pushConstantStages = pushConstantStages;
-        this.firstExtraBinding = firstExtraBinding;
         this.bindlessLayout = bindlessLayout;
         this.bindlessPool = bindlessPool;
         this.bindlessSet = bindlessSet;
-        this.skyAtlasBinding = skyAtlasBinding;
     }
 
     /**
      * Builds the RT pipeline. {@code rahit} (nullable) adds any-hit-capable triangle hit records. With the
      * world pipeline, the hit SBT region is laid out to match {@link RtAccel}'s terrain bucket/ray-type
-     * constants: radiance records first, shadow records second, then entity records. {@code extraStorageImages}
-     * adds that many raygen-visible storage images at bindings 3.. (the DLSS-RR guide buffers);
-     * write them with {@link #setExtraStorageImage}.
+     * constants: radiance records first, shadow records second, then entity records. The fixed world
+     * descriptor layout is declared in {@code shaders/rt_bindings.slang}.
+     *
+     * <p>{@code rgen} may hold several raygen shaders. They share this pipeline's descriptor set, miss
+     * table and hit table; {@link #trace(VkCommandBuffer, int, int, ByteBuffer, int)} picks one per
+     * dispatch by index.
      */
-    public static RtPipeline create(RtContext ctx, String rgen, String[] rmiss, String rchit, String rahit, int pushConstantSize, boolean withBlockAlbedoAtlas, int extraStorageImages, int bindlessTextures, boolean skyAtlas) {
+    public static RtPipeline create(RtContext ctx, String[] rgen, String[] rmiss, String rchit,
+                                    String rahit, int pushConstantSize, int bindlessTextures) {
         VkDevice vk = ctx.vk();
         boolean hasAhit = rahit != null;
         String label = "world RT pipeline";
         if (bindlessTextures > 0) {
             long requiredCombinedSamplers = Math.addExact(
-                    Math.multiplyExact((long) bindlessTextures, BINDLESS_BINDINGS),
-                    withBlockAlbedoAtlas ? 1L : 0L);
+                    Math.multiplyExact((long) bindlessTextures, WORLD_BINDLESS_COUNT), 1L);
             long deviceLimit = ctx.updateAfterBindCombinedImageSamplerLimit();
             if (requiredCombinedSamplers > deviceLimit) {
                 throw new UnsupportedOperationException("Configured bindless texture capacity " + bindlessTextures
@@ -142,46 +143,43 @@ public final class RtPipeline {
             }
         }
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            int firstExtraBinding = withBlockAlbedoAtlas ? 3 : 2;
-            int materialBase = firstExtraBinding + extraStorageImages;
-            // Sky rewrite: the vanilla celestials atlas (sun + moon phases), sampled by world.rmiss to
-            // draw the sun/moon discs. Canonical material pages live in the bindless set, not set 0.
-            int skyBinding = skyAtlas ? materialBase : -1;
-            int skySamplers = skyAtlas ? 1 : 0;
-            int bindingCount = firstExtraBinding + extraStorageImages + skySamplers;
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(bindingCount, stack);
-            binds.get(0).binding(0).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(
+                    WORLD_SET_BINDING_COUNT, stack);
+            binds.get(WORLD_TLAS).binding(WORLD_TLAS).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
-            binds.get(1).binding(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            binds.get(WORLD_OUTPUT).binding(WORLD_OUTPUT).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
-            if (withBlockAlbedoAtlas) {
-                int atlasStages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
-                binds.get(2).binding(2).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                        .descriptorCount(1).stageFlags(atlasStages);
-            }
-            for (int e = 0; e < extraStorageImages; e++) {
-                binds.get(firstExtraBinding + e).binding(firstExtraBinding + e).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            int atlasStages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR
+                    | (hasAhit ? VK_SHADER_STAGE_ANY_HIT_BIT_KHR : 0);
+            binds.get(WORLD_BLOCK_ALBEDO).binding(WORLD_BLOCK_ALBEDO)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(atlasStages);
+            for (int binding = WORLD_G_NORMAL; binding <= WORLD_G_SPEC_MOTION; binding++) {
+                binds.get(binding).binding(binding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                         .descriptorCount(1).stageFlags(VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             }
-            if (skyAtlas) {
-                binds.get(skyBinding).binding(skyBinding).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
-                        .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
-            }
+            binds.get(WORLD_CELESTIALS).binding(WORLD_CELESTIALS)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
+            binds.get(WORLD_SKY_VIEW).binding(WORLD_SKY_VIEW)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1).stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR);
+            binds.get(WORLD_TRANSMITTANCE).binding(WORLD_TRANSMITTANCE)
+                    .descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(1)
+                    .stageFlags(VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_RAYGEN_BIT_KHR);
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
             LongBuffer p = stack.mallocLong(1);
             check(VK10.vkCreateDescriptorSetLayout(vk, dslci, null, p), "vkCreateDescriptorSetLayout");
             long dsl = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
-            int combinedSamplers = (withBlockAlbedoAtlas ? 1 : 0) + skySamplers;
-            int poolSizeCount = 2 + (combinedSamplers > 0 ? 1 : 0);
-            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(poolSizeCount, stack);
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(3, stack);
             poolSizes.get(0).type(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR).descriptorCount(RING);
-            // output image (binding 1) + the extra guide images share the storage-image type.
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(RING * (1 + extraStorageImages));
-            if (combinedSamplers > 0) {
-                poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(RING * combinedSamplers);
-            }
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                    .descriptorCount(RING * WORLD_SET_STORAGE_IMAGE_COUNT);
+            poolSizes.get(2).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+                    .descriptorCount(RING * WORLD_SET_SAMPLER_COUNT);
             VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(RING).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool");
             long pool = p.get(0);
@@ -205,16 +203,16 @@ public final class RtPipeline {
             if (bindlessTextures > 0) {
                 // Entity albedo and canonical material pages have independent index spaces. All arrays
                 // use the configured capacity here; material pages occupy compact indices from zero.
-                int nb = BINDLESS_BINDINGS;
+                int nb = WORLD_BINDLESS_COUNT;
                 VkDescriptorSetLayoutBinding.Buffer bl = VkDescriptorSetLayoutBinding.calloc(nb, stack);
                 java.nio.IntBuffer bindFlags = stack.mallocInt(nb);
                 for (int b = 0; b < nb; b++) {
                     int stages = VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR;
-                    if (b == ENTITY_ALBEDO_BINDING && hasAhit) stages |= VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
+                    if (b == WORLD_ENTITY_ALBEDO && hasAhit) stages |= VK_SHADER_STAGE_ANY_HIT_BIT_KHR;
                     bl.get(b).binding(b).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                             .descriptorCount(bindlessTextures).stageFlags(stages);
                     int flags = VK12.VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-                    if (b == ENTITY_ALBEDO_BINDING) flags |= VK12.VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+                    if (b == WORLD_ENTITY_ALBEDO) flags |= VK12.VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
                     bindFlags.put(b, flags);
                 }
                 VkDescriptorSetLayoutBindingFlagsCreateInfo bf = VkDescriptorSetLayoutBindingFlagsCreateInfo.calloc(stack).sType$Default()
@@ -257,17 +255,24 @@ public final class RtPipeline {
             long layout = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, layout, label + " pipeline layout");
 
-            // Stages: raygen, one miss per rmiss entry, the closest-hit, then (optionally) the any-hit.
-            // Groups are raygen + N miss + the hit records selected by traceRayEXT's SBT offset/stride.
+            // Stages: one per rgen entry, one miss per rmiss entry, the closest-hit, then (optionally)
+            // the any-hit. Groups are N raygen + M miss + the hit records selected by traceRayEXT's SBT
+            // offset/stride. Multiple raygens share one pipeline and are selected at dispatch by pointing
+            // the raygen SBT region at a different record — that is how the primary/guide pass and the
+            // indirect pass coexist without duplicating the hit and miss tables.
+            int raygenCount = rgen.length;
             int missCount = rmiss.length;
             int hitGroupCount = hasAhit ? RtAccel.SBT_HIT_GROUP_COUNT : 1;
-            int groupCount = 1 + missCount + hitGroupCount;
-            int hitGroupIdx = 1 + missCount;
-            int chitStage = 1 + missCount;
+            int groupCount = raygenCount + missCount + hitGroupCount;
+            int hitGroupIdx = raygenCount + missCount;
+            int chitStage = raygenCount + missCount;
             int ahitStage = chitStage + 1;
-            int stageCount = 1 + missCount + 1 + (hasAhit ? 1 : 0);
-            long mGen = loadModule(vk, stack, rgen);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mGen, label + " " + rgen);
+            int stageCount = raygenCount + missCount + 1 + (hasAhit ? 1 : 0);
+            long[] mGen = new long[raygenCount];
+            for (int g = 0; g < raygenCount; g++) {
+                mGen[g] = loadModule(vk, stack, rgen[g]);
+                RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, mGen[g], label + " " + rgen[g]);
+            }
             long[] mMiss = new long[missCount];
             for (int m = 0; m < missCount; m++) {
                 mMiss[m] = loadModule(vk, stack, rmiss[m]);
@@ -281,9 +286,11 @@ public final class RtPipeline {
             }
             ByteBuffer entry = stack.UTF8("main");
             VkPipelineShaderStageCreateInfo.Buffer stages = VkPipelineShaderStageCreateInfo.calloc(stageCount, stack);
-            stages.get(0).sType$Default().stage(VK_SHADER_STAGE_RAYGEN_BIT_KHR).module(mGen).pName(entry);
+            for (int g = 0; g < raygenCount; g++) {
+                stages.get(g).sType$Default().stage(VK_SHADER_STAGE_RAYGEN_BIT_KHR).module(mGen[g]).pName(entry);
+            }
             for (int m = 0; m < missCount; m++) {
-                stages.get(1 + m).sType$Default().stage(VK_SHADER_STAGE_MISS_BIT_KHR).module(mMiss[m]).pName(entry);
+                stages.get(raygenCount + m).sType$Default().stage(VK_SHADER_STAGE_MISS_BIT_KHR).module(mMiss[m]).pName(entry);
             }
             stages.get(chitStage).sType$Default().stage(VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR).module(mHit).pName(entry);
             if (hasAhit) {
@@ -291,11 +298,13 @@ public final class RtPipeline {
             }
 
             VkRayTracingShaderGroupCreateInfoKHR.Buffer groups = VkRayTracingShaderGroupCreateInfoKHR.calloc(groupCount, stack);
-            groups.get(0).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
-                    .generalShader(0).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+            for (int g = 0; g < raygenCount; g++) {
+                groups.get(g).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+                        .generalShader(g).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+            }
             for (int m = 0; m < missCount; m++) {
-                groups.get(1 + m).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
-                        .generalShader(1 + m).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
+                groups.get(raygenCount + m).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR)
+                        .generalShader(raygenCount + m).closestHitShader(VK_SHADER_UNUSED_KHR).anyHitShader(VK_SHADER_UNUSED_KHR).intersectionShader(VK_SHADER_UNUSED_KHR);
             }
             for (int h = 0; h < hitGroupCount; h++) {
                 groups.get(hitGroupIdx + h).sType$Default().type(VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR)
@@ -317,7 +326,9 @@ public final class RtPipeline {
             long pipeline = pPipeline.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE, pipeline, label);
 
-            VK10.vkDestroyShaderModule(vk, mGen, null);
+            for (int g = 0; g < raygenCount; g++) {
+                VK10.vkDestroyShaderModule(vk, mGen[g], null);
+            }
             for (int m = 0; m < missCount; m++) {
                 VK10.vkDestroyShaderModule(vk, mMiss[m], null);
             }
@@ -344,8 +355,9 @@ public final class RtPipeline {
                 MemoryUtil.memCopy(MemoryUtil.memAddress(handles) + (long) g * handleSize, sbt.mapped + g * stride, handleSize);
             }
             sbt.flush();
-            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride, missCount, hitGroupCount, pushConstantSize, pcStages, firstExtraBinding,
-                    bindlessLayout, bindlessPool, bindlessSet, skyBinding);
+            return new RtPipeline(ctx, dsl, pool, sets, layout, pipeline, sbt, stride,
+                    raygenCount, missCount, hitGroupCount, pushConstantSize, pcStages,
+                    bindlessLayout, bindlessPool, bindlessSet);
         }
     }
 
@@ -362,20 +374,22 @@ public final class RtPipeline {
         return entityBucket == RtAccel.ENTITY_BUCKET_ANY_HIT;
     }
 
-    /**
-     * Bind a new TLAS into the next ring slot (which in-flight frames are no longer reading, since
-     * swaps are many frames apart) and make it current, so the binding can change without a drain.
-     */
-    public void setTlas(long tlas) {
+    /** Bind a new TLAS after the selected descriptor slot's exact prior graphics use completes. */
+    public void setTlas(long tlas, RtGpuExecutor.GraphicsUse graphicsUse,
+                        RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
         currentSet = (currentSet + 1) % RING;
+        RtGpuExecutor.TrackedGraphicsUse slotUse = descriptorSetUses[currentSet];
+        graphicsUseWaiter.await(slotUse);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas));
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet]).dstBinding(0)
+            write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet])
+                    .dstBinding(WORLD_TLAS)
                     .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
+        slotUse.mark(graphicsUse);
     }
 
     /** Write the storage image into every ring slot (set once at init / on resize, when idle). */
@@ -385,21 +399,24 @@ public final class RtPipeline {
             imgInfo.get(0).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
             for (int i = 0; i < RING; i++) {
-                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(1)
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(WORLD_OUTPUT)
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(imgInfo);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
         }
     }
 
-    /** Write an extra storage image (DLSS-RR guide buffer) into binding {@code firstExtraBinding + slot} across every ring slot. */
+    /** Write one DLSS-RR guide image into its canonical world binding across every ring slot. */
     public void setExtraStorageImage(int slot, long imageView) {
+        if (slot < 0 || slot >= WORLD_GUIDE_COUNT) {
+            throw new IllegalArgumentException("Guide slot out of range: " + slot);
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer imgInfo = VkDescriptorImageInfo.calloc(1, stack);
             imgInfo.get(0).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
             for (int i = 0; i < RING; i++) {
-                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(firstExtraBinding + slot)
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(WORLD_G_NORMAL + slot)
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(imgInfo);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
@@ -413,7 +430,7 @@ public final class RtPipeline {
             info.get(0).sampler(sampler).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
             VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(RING, stack);
             for (int i = 0; i < RING; i++) {
-                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(2)
+                write.get(i).sType$Default().dstSet(descriptorSets[i]).dstBinding(WORLD_BLOCK_ALBEDO)
                         .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(info);
             }
             VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
@@ -422,17 +439,20 @@ public final class RtPipeline {
 
     /** Bind the vanilla celestials atlas (sun + moon phases), sampled by world.rmiss for the discs. */
     public void setSkyAtlas(long imageView, long sampler) {
-        writeAtlasBinding(skyAtlasBinding, imageView, sampler);
+        writeAtlasBinding(WORLD_CELESTIALS, imageView, sampler);
     }
 
     public boolean hasSkyAtlas() {
-        return skyAtlasBinding >= 0;
+        return true;
+    }
+
+    /** Bind this frame's atmosphere LUTs (see {@link RtSkyLut}); both share the LUT's own sampler. */
+    public void setSkyLuts(long skyViewImageView, long transmittanceImageView, long sampler) {
+        writeAtlasBinding(WORLD_SKY_VIEW, skyViewImageView, sampler);
+        writeAtlasBinding(WORLD_TRANSMITTANCE, transmittanceImageView, sampler);
     }
 
     private void writeAtlasBinding(int binding, long imageView, long sampler) {
-        if (binding < 0) {
-            return;
-        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer info = VkDescriptorImageInfo.calloc(1, stack);
             info.get(0).sampler(sampler).imageView(imageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
@@ -447,15 +467,15 @@ public final class RtPipeline {
 
     /** Append or initialize one entity-albedo slot. Existing slots never change while frames are in flight. */
     public void setEntityAlbedoTexture(int slot, long imageView, long sampler) {
-        setBindlessTexture(ENTITY_ALBEDO_BINDING, slot, imageView, sampler);
+        setBindlessTexture(WORLD_ENTITY_ALBEDO, slot, imageView, sampler);
     }
 
     /** Bind one compact canonical page bundle at a resource-epoch boundary. */
     public void setMaterialPage(int page, long surface0View, long normalAoView, long surface1View,
                                 long sampler) {
-        setBindlessTexture(MATERIAL_SURFACE0_BINDING, page, surface0View, sampler);
-        setBindlessTexture(MATERIAL_NORMAL_AO_BINDING, page, normalAoView, sampler);
-        setBindlessTexture(MATERIAL_SURFACE1_BINDING, page, surface1View, sampler);
+        setBindlessTexture(WORLD_MATERIAL_SURFACE0, page, surface0View, sampler);
+        setBindlessTexture(WORLD_MATERIAL_NORMAL_AO, page, normalAoView, sampler);
+        setBindlessTexture(WORLD_MATERIAL_SURFACE1, page, surface1View, sampler);
     }
 
     private void setBindlessTexture(int binding, int slot, long imageView, long sampler) {
@@ -475,11 +495,22 @@ public final class RtPipeline {
     }
 
     public void trace(VkCommandBuffer cmd, int width, int height) {
-        trace(cmd, width, height, null);
+        trace(cmd, width, height, null, 0);
     }
 
-    /** Record bind (+ optional raygen push constants) + trace into the given command buffer. */
     public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants) {
+        trace(cmd, width, height, pushConstants, 0);
+    }
+
+    /**
+     * Record bind (+ optional raygen push constants) + trace into the given command buffer.
+     * {@code raygenIndex} selects which raygen record of the SBT this dispatch launches; the miss and
+     * hit regions are shared, so passes over the same scene differ only in this index.
+     */
+    public void trace(VkCommandBuffer cmd, int width, int height, java.nio.ByteBuffer pushConstants, int raygenIndex) {
+        if (raygenIndex < 0 || raygenIndex >= raygenCount) {
+            throw new IllegalArgumentException("raygen index " + raygenIndex + " out of range [0, " + raygenCount + ")");
+        }
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "trace rays")) {
             VK10.vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, pipeline);
             java.nio.LongBuffer boundSets = bindlessSet != 0L
@@ -489,12 +520,14 @@ public final class RtPipeline {
             if (pushConstants != null && pushConstantSize > 0) {
                 VK10.vkCmdPushConstants(cmd, pipelineLayout, pushConstantStages, 0, pushConstants);
             }
+            // The raygen region must name exactly one record (size == stride), so selecting a pass is a
+            // matter of which record it points at.
             VkStridedDeviceAddressRegionKHR raygen = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress).stride(sbtStride).size(sbtStride);
+                    .deviceAddress(sbt.deviceAddress + (long) raygenIndex * sbtStride).stride(sbtStride).size(sbtStride);
             VkStridedDeviceAddressRegionKHR miss = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress + sbtStride).stride(sbtStride).size((long) missCount * sbtStride);
+                    .deviceAddress(sbt.deviceAddress + (long) raygenCount * sbtStride).stride(sbtStride).size((long) missCount * sbtStride);
             VkStridedDeviceAddressRegionKHR hit = VkStridedDeviceAddressRegionKHR.calloc(stack)
-                    .deviceAddress(sbt.deviceAddress + (1L + missCount) * sbtStride).stride(sbtStride).size((long) hitGroupCount * sbtStride);
+                    .deviceAddress(sbt.deviceAddress + (long) (raygenCount + missCount) * sbtStride).stride(sbtStride).size((long) hitGroupCount * sbtStride);
             VkStridedDeviceAddressRegionKHR callable = VkStridedDeviceAddressRegionKHR.calloc(stack);
             vkCmdTraceRaysKHR(cmd, raygen, miss, hit, callable, width, height, 1);
         }

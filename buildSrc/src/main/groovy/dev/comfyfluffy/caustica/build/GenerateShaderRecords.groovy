@@ -20,7 +20,7 @@ import javax.inject.Inject
 abstract class GenerateShaderRecords extends DefaultTask {
     @InputDirectory
     @PathSensitive(PathSensitivity.RELATIVE)
-    abstract DirectoryProperty getWorldSourceDir()
+    abstract DirectoryProperty getShaderRoot()
 
     @InputFile
     @PathSensitive(PathSensitivity.RELATIVE)
@@ -134,7 +134,20 @@ abstract class GenerateShaderRecords extends DefaultTask {
         }
     }
 
-    private static String generateJava(Map rootType, int byteSize, String className) {
+    private static String emitReadExpression(Map type, Map binding, String base) {
+        def address = at(base, (binding.offset ?: 0) as int)
+        if (type.kind != "scalar") {
+            throw new GradleException("generated readers currently support scalar fields only: ${type}")
+        }
+        def method = type.scalarType == "float32" ? "getFloat"
+                : (type.scalarType in ["int32", "uint32"] ? "getInt"
+                : (type.scalarType in ["int64", "uint64"] ? "getLong" : null))
+        if (method == null) throw new GradleException("unsupported scalar reader: ${type.scalarType}")
+        "src.${method}(${address})"
+    }
+
+    // NOT private: see the comment on extractPushConstantType -- same closure-dispatch issue.
+    static String generateJava(Map rootType, int byteSize, String className, boolean emitReader = false) {
         def fields = rootType.fields as List<Map>
         def arrays = fields.findAll { it.type.kind == "array" }
         def vectors = new LinkedHashSet<String>()
@@ -183,6 +196,19 @@ abstract class GenerateShaderRecords extends DefaultTask {
         }
         sb << "    }\n\n"
 
+        if (emitReader) {
+            sb << "    public static ${className} read(ByteBuffer src) {\n"
+            sb << "        Objects.requireNonNull(src, \"src\");\n"
+            sb << "        if (src.capacity() < BYTE_SIZE) throw new IllegalArgumentException(\"${className} buffer is too small: \" + src.capacity());\n"
+            sb << "        return new ${className}(\n"
+            fields.eachWithIndex { field, i ->
+                sb << "                ${emitReadExpression(field.type as Map, field.binding as Map, '0')}"
+                sb << (i + 1 == fields.size() ? "\n" : ",\n")
+            }
+            sb << "        );\n"
+            sb << "    }\n\n"
+        }
+
         vectors.sort().each { name ->
             def count = Integer.parseInt(name.substring(name.length() - 1))
             def primitive = name.startsWith("Float") ? "float" : "int"
@@ -199,15 +225,48 @@ abstract class GenerateShaderRecords extends DefaultTask {
         sb.toString()
     }
 
+    // (reflection parameter name, expected Slang struct name, generated Java class name) for every
+    // plain push-constant struct probed directly (no structured-buffer array wrapper needed, unlike
+    // WorldPush/MaterialHeader -- see the two probeXxx blocks below main() in the probe file).
+    private static final List<List<String>> PUSH_CONSTANT_PROBES = [
+            ["pushConstantsLayoutProbe", "WorldPushConstants", "WorldPushConstantsData"],
+            ["exposureHistPushProbe", "ExposureHistPush", "ExposureHistPushData"],
+            ["exposureResolvePushProbe", "ExposureResolvePush", "ExposureResolvePushData"],
+            ["displayPushProbe", "DisplayPush", "DisplayPushData"],
+            ["debugPresentPushProbe", "DebugPresentPush", "DebugPresentPushData"],
+            ["bloomPushProbe", "BloomPush", "BloomPushData"],
+            ["pushAddrLayoutProbe", "PushAddr", "PushAddrData"],
+    ]
+
+    // NOT private: Gradle decorates this abstract task with a generated subclass, and Groovy's
+    // dynamic method dispatch from inside the PUSH_CONSTANT_PROBES.each {} closure below fails to
+    // resolve private static methods through that generated subclass.
+    static Map extractPushConstantType(Object reflection, String probeName, String structName) {
+        def pushParameter = reflection.parameters.find { it.name == probeName }
+        if (pushParameter?.type?.elementType?.name != structName) {
+            throw new GradleException("Slang reflection omitted or misshaped ${probeName} (expected ${structName})")
+        }
+        pushParameter.type.elementType as Map
+    }
+
+    static int extractPushConstantByteSize(Object reflection, String probeName) {
+        def pushParameter = reflection.parameters.find { it.name == probeName }
+        pushParameter.type.elementVarLayout.binding.size as int
+    }
+
     @TaskAction
     void generate() {
         def reflectionFile = new File(temporaryDir, "shader-records-reflection.json")
         def probeSpv = new File(temporaryDir, "shader-layout-probe.spv")
+        def includeArgs = shaderRoot.get().asFileTree.matching { include "**/*.slang" }.files
+                .collect { it.parentFile }.unique().sort { it.absolutePath }
+                .collectMany { ["-I", it.absolutePath] }
         execOps.exec {
-            commandLine slangc.get(), probeSource.get().asFile.absolutePath,
+            commandLine([slangc.get(), probeSource.get().asFile.absolutePath] + includeArgs +
+                    [
                     "-target", "spirv", "-profile", "spirv_1_5", "-matrix-layout-column-major",
                     "-warnings-as-errors", "all", "-warnings-disable", "41012",
-                    "-reflection-json", reflectionFile.absolutePath, "-o", probeSpv.absolutePath
+                    "-reflection-json", reflectionFile.absolutePath, "-o", probeSpv.absolutePath])
         }
         execOps.exec {
             commandLine spirvVal.get(), "--target-env", "vulkan1.2", probeSpv.absolutePath
@@ -230,12 +289,13 @@ abstract class GenerateShaderRecords extends DefaultTask {
         Map materialHeaderType = materialProbeArray.type.elementType as Map
         int materialHeaderByteSize = materialProbeArray.type.uniformStride as int
 
-        def pushParameter = reflection.parameters.find { it.name == "pushConstantsLayoutProbe" }
-        if (pushParameter?.type?.elementType?.name != "WorldPushConstants") {
-            throw new GradleException("Slang reflection omitted pushConstantsLayoutProbe")
+        def exposureStateParameter = reflection.parameters.find { it.name == "exposureStateLayoutProbe" }
+        def exposureStateProbeArray = exposureStateParameter?.type?.resultType?.fields?.find { it.name == "values" }
+        if (exposureStateProbeArray?.type?.kind != "array" || exposureStateProbeArray.type.elementType?.name != "ExposureState") {
+            throw new GradleException("unexpected ExposureState reflection probe shape")
         }
-        Map pushConstantsType = pushParameter.type.elementType as Map
-        int pushConstantsByteSize = pushParameter.type.elementVarLayout.binding.size as int
+        Map exposureStateType = exposureStateProbeArray.type.elementType as Map
+        int exposureStateByteSize = exposureStateProbeArray.type.uniformStride as int
 
         def generatedRoot = outDir.get().asFile
         if (generatedRoot.exists() && !generatedRoot.deleteDir()) {
@@ -245,9 +305,16 @@ abstract class GenerateShaderRecords extends DefaultTask {
         packageDir.mkdirs()
         new File(packageDir, "WorldPushData.java").setText(
                 generateJava(worldType, worldByteSize, "WorldPushData"), "UTF-8")
-        new File(packageDir, "WorldPushConstantsData.java").setText(
-                generateJava(pushConstantsType, pushConstantsByteSize, "WorldPushConstantsData"), "UTF-8")
         new File(packageDir, "MaterialHeaderData.java").setText(
                 generateJava(materialHeaderType, materialHeaderByteSize, "MaterialHeaderData"), "UTF-8")
+        new File(packageDir, "ExposureStateData.java").setText(
+                generateJava(exposureStateType, exposureStateByteSize, "ExposureStateData", true), "UTF-8")
+
+        PUSH_CONSTANT_PROBES.each { probeName, structName, className ->
+            Map type = extractPushConstantType(reflection, probeName, structName)
+            int byteSize = extractPushConstantByteSize(reflection, probeName)
+            new File(packageDir, "${className}.java").setText(
+                    generateJava(type, byteSize, className), "UTF-8")
+        }
     }
 }

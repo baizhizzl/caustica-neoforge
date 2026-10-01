@@ -1,26 +1,29 @@
 package dev.comfyfluffy.caustica.rt;
 
 import java.nio.IntBuffer;
+import java.util.List;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.EXTHdrMetadata;
 import org.lwjgl.vulkan.KHRSurface;
+import org.lwjgl.vulkan.VkDevice;
+import org.lwjgl.vulkan.VkHdrMetadataEXT;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
 
+import com.mojang.renderpearl.backend.vulkan.VulkanPhysicalDevice;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 
 /**
- * HDR display support — capability detection/logging. This class does not change any rendering behavior; it
- * only enumerates and logs what the swapchain surface can present so the swapchain-ownership code knows
- * whether HDR10 (PQ) is actually available on this driver, window system, compositor, and monitor.
+ * HDR display support — capability detection/logging plus static mastering metadata for PQ swapchains.
+ * Surface enumeration tells the swapchain-ownership code whether HDR10 is available on the current driver,
+ * window system, compositor, and monitor; {@code VK_EXT_hdr_metadata}, when supported, describes the
+ * Rec.2020/D65 ACES virtual mastering display to that presentation stack.
  *
- * <p>Important: extended color spaces (scRGB linear, HDR10 PQ, …) are only reported by
- * {@code vkGetPhysicalDeviceSurfaceFormatsKHR} when the instance was created with
- * {@code VK_EXT_swapchain_colorspace} enabled. Minecraft's instance does not enable it, so on a stock
- * instance this enumeration is expected to show only {@code SRGB_NONLINEAR} (color space 0). Seeing only
- * color space 0 here is the concrete signal that the later phase must add an instance-extension hook before
- * any HDR swapchain is possible — that is exactly the gap this Phase 0 logging is meant to surface.
+ * <p>Extended color spaces are reported only when the instance enables
+ * {@code VK_EXT_swapchain_colorspace}. {@code VulkanInstanceMixin} enables it when available; this class
+ * then reports the surface formats and selects HDR10/PQ capability from the advertised pairs.
  */
 public final class RtHdr {
     // VK_EXT_swapchain_colorspace color-space enum values (not all are in the LWJGL VK10 constants).
@@ -41,18 +44,102 @@ public final class RtHdr {
     private static final int CS_EXTENDED_SRGB_NONLINEAR = 1000104014;
 
     private static volatile boolean surfaceLogged;
+    private static volatile boolean hdrMetadataExtensionEnabled;
 
     private RtHdr() {
+    }
+
+    /**
+     * Opportunistically enables {@code VK_EXT_hdr_metadata}. It is a function-only device extension, so
+     * there is no feature struct to chain into device creation. HDR presentation still works when it is
+     * absent; only the mastering hints to the presentation engine are unavailable.
+     */
+    public static void addDeviceExtension(List<String> augmentedExtensions, VulkanPhysicalDevice physicalDevice) {
+        hdrMetadataExtensionEnabled = false;
+        String extension = EXTHdrMetadata.VK_EXT_HDR_METADATA_EXTENSION_NAME;
+        if (!physicalDevice.hasDeviceExtension(extension)) {
+            CausticaMod.LOGGER.warn("HDR: device [{}] does not support {}; static mastering metadata disabled",
+                    physicalDevice.deviceName(), extension);
+            return;
+        }
+        if (!augmentedExtensions.contains(extension)) {
+            augmentedExtensions.add(extension);
+        }
+        hdrMetadataExtensionEnabled = true;
+        CausticaMod.LOGGER.info("HDR: enabling {} for PQ swapchain mastering metadata", extension);
+    }
+
+    /** Whether {@code VK_EXT_hdr_metadata} was included in the device extension list. */
+    public static boolean metadataExtensionEnabled() {
+        return hdrMetadataExtensionEnabled;
+    }
+
+    /**
+     * Assigns SMPTE ST 2086 / CTA-861.3 static metadata to one PQ swapchain.
+     *
+     * <p>The ACES HDR output LUT is a Rec.2020/D65 virtual master capped at one of the baked mastering
+     * peaks, so that peak is both the mastering-display maximum and MaxCLL. MaxFALL cannot be known without
+     * analysing every rendered frame; Vulkan explicitly permits unknown fields to be zero, which is more
+     * truthful than inventing a scene-average value.
+     */
+    public static boolean applyMasteringMetadata(VkDevice device, long swapchain, int masteringPeakNits) {
+        if (!hdrMetadataExtensionEnabled || swapchain == 0L) {
+            return false;
+        }
+        MasteringMetadata values = masteringMetadata(masteringPeakNits);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkHdrMetadataEXT.Buffer metadata = VkHdrMetadataEXT.calloc(1, stack);
+            VkHdrMetadataEXT entry = metadata.get(0).sType$Default();
+            entry.displayPrimaryRed().set(values.red().x(), values.red().y());
+            entry.displayPrimaryGreen().set(values.green().x(), values.green().y());
+            entry.displayPrimaryBlue().set(values.blue().x(), values.blue().y());
+            entry.whitePoint().set(values.white().x(), values.white().y());
+            entry.maxLuminance(values.maxLuminance());
+            entry.minLuminance(values.minLuminance());
+            entry.maxContentLightLevel(values.maxContentLightLevel());
+            entry.maxFrameAverageLightLevel(values.maxFrameAverageLightLevel());
+            EXTHdrMetadata.vkSetHdrMetadataEXT(device, stack.longs(swapchain), metadata);
+        }
+        CausticaMod.LOGGER.info(
+                "HDR: set swapchain mastering metadata: Rec.2020/D65, min={} nits, peak/MaxCLL={} nits, MaxFALL=unknown",
+                values.minLuminance(), values.maxLuminance());
+        return true;
+    }
+
+    static MasteringMetadata masteringMetadata(int masteringPeakNits) {
+        if (masteringPeakNits <= 0) {
+            throw new IllegalArgumentException("masteringPeakNits must be positive");
+        }
+        float peak = masteringPeakNits;
+        return new MasteringMetadata(
+                new Chromaticity(0.708f, 0.292f),
+                new Chromaticity(0.170f, 0.797f),
+                new Chromaticity(0.131f, 0.046f),
+                new Chromaticity(0.3127f, 0.3290f),
+                peak, 0.0001f, peak, 0.0f);
+    }
+
+    record Chromaticity(float x, float y) {
+    }
+
+    record MasteringMetadata(
+            Chromaticity red,
+            Chromaticity green,
+            Chromaticity blue,
+            Chromaticity white,
+            float maxLuminance,
+            float minLuminance,
+            float maxContentLightLevel,
+            float maxFrameAverageLightLevel) {
     }
 
     /** Logs the resolved HDR config once (cheap; safe to call repeatedly — guarded by the surface log). */
     public static void logConfig() {
         CausticaMod.LOGGER.info(
-                "HDR config: enabled={} paperWhite={}nits peak={}nits -> {} (headroom={})",
+                "HDR config: enabled={} ui={}nits peak={}nits -> {}",
                 CausticaConfig.Rt.Hdr.enabled(),
-                CausticaConfig.Rt.Hdr.PAPER_WHITE_NITS.value(), CausticaConfig.Rt.Hdr.PEAK_NITS.value(),
-                CausticaConfig.Rt.Hdr.enabled() ? "HDR display path active" : "SDR display path",
-                CausticaConfig.Rt.Hdr.headroom());
+                CausticaConfig.Rt.Hdr.UI_NITS.value(), CausticaConfig.Rt.Hdr.PEAK_NITS.value(),
+                CausticaConfig.Rt.Hdr.enabled() ? "HDR display path active" : "SDR display path");
     }
 
     /**

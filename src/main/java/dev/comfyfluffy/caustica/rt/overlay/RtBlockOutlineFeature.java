@@ -10,7 +10,7 @@ import java.nio.ByteBuffer;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.level.BlockOutlineRenderState;
@@ -29,6 +29,7 @@ import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
@@ -37,7 +38,7 @@ import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 /**
  * The targeted block's wireframe outline: a real {@link VoxelShape} edge list (not just a full-cube
  * approximation), raster full-res post-upscale, occluded per-fragment via an inline {@code rayQueryEXT}
- * test against the world TLAS (see {@code block_outline.frag}) instead of a depth buffer — RT's own
+ * test against the world TLAS (see {@code block_outline/fragment.frag.slang}) instead of a depth buffer — RT's own
  * {@code gDepth} is at DLSS-RR's internal render resolution, not this pass's full display resolution, and
  * outline pixels need to sit exactly on the depth surface.
  *
@@ -50,18 +51,14 @@ import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
  * <p>A native {@code LINE_LIST} draw, real width via the device's {@code wideLines} feature +
  * {@code vkCmdSetLineWidth} (see {@link RtDeviceBringup#wideLinesEnabled()}/{@link
  * RtDeviceBringup#maxLineWidth()}) — clamped to whatever the device actually supports (Vulkan mandates
- * exactly 1.0 without the feature, so this degrades gracefully rather than failing). A two-pass screen-space
- * quad + coverage-mask approach was tried first (real geometry, no device-feature dependency, correct
- * mitred joints) but was reverted as unnecessary complexity for what a native wide line already solves;
- * revisit that approach only if wideLines turns out inadequate (unsupported hardware, joint artifacts at
- * large widths, etc.) — see the memory note for what was tried.
+ * exactly 1.0 without the feature, so this degrades gracefully rather than failing).
  *
  * <p>Edge AA follows {@link RtGlowOutlineFeature}'s mask/composite split rather than drawing straight onto
  * {@code main}: the line list rasterizes at {@link RtDeviceBringup#overlayMsaaSamples()} into a transient
  * MSAA scratch attachment that dynamic rendering resolve-averages into a single-sample mask, then a tiny
  * composite pass alpha-blends that mask onto {@code main}. Since every line pixel is the same flat colour
  * (rgb = 0,0,0), per-sample coverage averages straight into a fractional alpha with no colour-bleed risk —
- * the occlusion {@code discard} in {@code block_outline.frag} still runs once per fragment (not per sample,
+ * the occlusion {@code discard} in {@code block_outline/fragment.frag.slang} still runs once per fragment (not per sample,
  * no {@code sampleShading}), so occlusion itself stays pixel-rate; only the silhouette edges get antialiased.
  */
 final class RtBlockOutlineFeature implements RtOverlayFeature {
@@ -79,7 +76,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     private RtOverlayPipelines.Pipeline pipeline;
     private RtOverlayPipelines.AccelStructureSet accelSet;
     private RtOverlayPipelines.Pipeline compositePipeline;
-    private RtOverlayPipelines.StorageImageSet compositeSet;
+    private RtOverlayPipelines.ReadOnlyImageSet compositeSet;
     private RtImage msaaImage;
     private RtImage resolvedMask;
 
@@ -89,7 +86,8 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     private long boundSet;
 
     @Override
-    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, int width, int height) {
+    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, RtGpuExecutor.GraphicsUse graphicsUse,
+                           int width, int height) {
         if (!CausticaConfig.Rt.Overlay.BLOCK_OUTLINE_ENABLED.value()) {
             return false;
         }
@@ -145,7 +143,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         vbo.flush(0L, (long) data.length * Float.BYTES);
 
         viewProj.set(RtComposite.INSTANCE.currentViewProjection());
-        boundSet = accelSet.bind(ctx, tlas);
+        boundSet = accelSet.bind(ctx, tlas, graphicsUse);
         return true;
     }
 
@@ -184,7 +182,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         this.ctxRef = ctx;
         if (pipeline == null) {
             accelSet = RtOverlayPipelines.accelStructureSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline");
-            pipeline = new RtOverlayPipelines.Spec("block_outline.vert.spv", "block_outline.frag.spv")
+            pipeline = new RtOverlayPipelines.Spec("block_outline/vertex.vert.spv", "block_outline/fragment.frag.spv")
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .topology(VK10.VK_PRIMITIVE_TOPOLOGY_LINE_LIST)
                     // NONE (straight write), not ALPHA: ALPHA's blend factors (srcAlpha=ZERO, dstAlpha=ONE)
@@ -198,8 +196,8 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     .push(PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
                     .descriptorSetLayout(accelSet.layout)
                     .build(ctx, "block outline");
-            compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline composite");
-            compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "overlay_passthrough_composite.frag.spv")
+            compositeSet = RtOverlayPipelines.readOnlyImageSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "block outline composite");
+            compositePipeline = new RtOverlayPipelines.Spec("overlay_composite/vertex.vert.spv", "overlay_composite/passthrough.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .descriptorSetLayout(compositeSet.layout)
@@ -219,7 +217,7 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
             resolvedMask = ctx.createStorageImage(width, height, RtWorldOverlay.TARGET_FORMAT,
                     "block outline resolved mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         }
-        compositeSet.bind(ctx, 0, resolvedMask.view);
+        compositeSet.bind(ctx, resolvedMask.view);
     }
 
     @Override

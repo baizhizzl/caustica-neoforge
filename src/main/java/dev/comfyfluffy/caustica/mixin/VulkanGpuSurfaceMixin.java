@@ -1,11 +1,11 @@
 package dev.comfyfluffy.caustica.mixin;
 
-import com.mojang.blaze3d.systems.CommandEncoderBackend;
-import com.mojang.blaze3d.systems.GpuSurface;
-import com.mojang.blaze3d.textures.GpuTextureView;
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
-import com.mojang.blaze3d.vulkan.VulkanGpuSurface;
+import com.mojang.renderpearl.backend.api.CommandEncoderBackend;
+import com.mojang.renderpearl.api.device.GpuSurface;
+import com.mojang.renderpearl.api.textures.GpuTextureView;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanGpuSurface;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtComposite;
@@ -15,7 +15,9 @@ import dev.comfyfluffy.caustica.rt.RtHdr;
 import dev.comfyfluffy.caustica.rt.RtReflex;
 import it.unimi.dsi.fastutil.longs.LongList;
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.KHRSurface;
 import org.lwjgl.vulkan.KHRSwapchain;
+import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkAllocationCallbacks;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkPresentIdKHR;
@@ -26,6 +28,7 @@ import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR;
 import org.lwjgl.vulkan.VkSwapchainLatencyCreateInfoNV;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.Mutable;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -35,20 +38,19 @@ import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
+import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
 /**
- * HDR Phase 0 capability logging + PQ swapchain selection.
+ * HDR capability logging and PQ swapchain selection.
  *
  * <p>The {@link VulkanGpuSurface} constructor holds both the live {@code VkSurfaceKHR} and the physical
  * device, so we enumerate the surface's formats/color spaces there (once) for diagnostics.
  *
- * <p>When {@code caustica.rt.hdr.pqSwapchain} is on and the surface advertises HDR10_ST2084 (ST.2084/PQ,
- * paired with whatever pixel format the surface offers for it — commonly a 10-bit UNORM, but this is
- * discovered by scanning the surface's advertised formats rather than assumed), we steer Minecraft's
- * swapchain to it: vanilla {@code pickSwapchainSurfaceFormat} only accepts SDR (color space 0, format 37/44)
- * and {@code configure} hardcodes {@code imageColorSpace(0)}. We override the picked format and the
- * color-space arg. Falls back to the vanilla SDR path when the flag is off or PQ is unavailable; default off.
+ * <p>When HDR is enabled and the surface advertises HDR10_ST2084 (paired with whatever pixel format the
+ * surface offers for it), we steer Minecraft's swapchain to it. When HDR is disabled, configure selects
+ * vanilla's native SDR pair. The options callback invalidates the surface configuration, so toggling HDR
+ * reuses the same swapchain recreation path as resize.
  */
 @Mixin(VulkanGpuSurface.class)
 public abstract class VulkanGpuSurfaceMixin {
@@ -71,6 +73,7 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	@Shadow
 	@Final
+	@Mutable
 	private int swapchainImageFormat;
 
 	@Shadow
@@ -99,7 +102,13 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Unique
 	private int caustica$colorSpace = 0;
 
-	@Inject(method = "<init>(Lcom/mojang/blaze3d/vulkan/VulkanDevice;J)V", at = @At("TAIL"))
+	@Unique
+	private long caustica$metadataSwapchain;
+
+	@Unique
+	private int caustica$metadataPeakNits = -1;
+
+	@Inject(method = "<init>(Lcom/mojang/renderpearl/backend/vulkan/VulkanDevice;J)V", at = @At("TAIL"))
 	private void caustica$logHdrCapabilities(VulkanDevice device, long windowHandle, CallbackInfo ci) {
 		try {
 			RtHdr.logSurfaceCapabilities(this.device.vkDevice().getPhysicalDevice(), this.surface, this.swapchainImageFormat);
@@ -108,28 +117,97 @@ public abstract class VulkanGpuSurfaceMixin {
 		}
 	}
 
-	/**
-	 * Pick a PQ (HDR10_ST2084) surface format when requested + available, before vanilla's SDR-only selection
-	 * runs. Scans for any format the surface pairs with that color space rather than assuming a specific one
-	 * (IHVs commonly pair it with a 10-bit UNORM like A2R10G10B10, but this must not be hardcoded). Sets
-	 * {@link #caustica$colorSpace} so {@code configure} can pass the matching color space.
-	 */
+	/** Discover PQ capability during construction and select PQ only when HDR starts enabled. */
 	@Inject(method = "pickSwapchainSurfaceFormat", at = @At("HEAD"), cancellable = true)
 	private void caustica$pickPqFormat(VkSurfaceFormatKHR.Buffer formats, CallbackInfoReturnable<VkSurfaceFormatKHR> cir) {
-		if (!CausticaConfig.Rt.Hdr.enabled()) {
-			return;
+		VkSurfaceFormatKHR pq = caustica$findPq(formats);
+		CausticaConfig.Rt.Hdr.setSwapchainPqAvailable(pq != null);
+		this.caustica$colorSpace = 0;
+		CausticaConfig.Rt.Hdr.setSwapchainPqActive(false);
+		if (CausticaConfig.Rt.Hdr.ENABLED.value() && pq != null) {
+			this.caustica$colorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+			CausticaConfig.Rt.Hdr.setSwapchainPqActive(true);
+			CausticaMod.LOGGER.info("HDR: surface supports PQ (format={}, colorSpace=HDR10_ST2084); "
+					+ "creating the initial swapchain in PQ", pq.format());
+			cir.setReturnValue(pq);
 		}
+	}
+
+	/**
+	 * A framebuffer resize already recreates the swapchain through {@code configure}. Refresh the chosen
+	 * (format,colorSpace) pair at that same boundary so the HDR option can use the identical path without
+	 * recreating the window or Vulkan surface. Vanilla made swapchainImageFormat final because resize
+	 * normally keeps it fixed; the mixin marks that field mutable specifically for this re-selection.
+	 */
+	@Inject(method = "configure", at = @At("HEAD"))
+	private void caustica$refreshFormatForConfigure(GpuSurface.Configuration config, CallbackInfo ci) {
+		try (MemoryStack stack = MemoryStack.stackPush()) {
+			IntBuffer count = stack.callocInt(1);
+			int countResult = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(
+					this.device.vkDevice().getPhysicalDevice(), this.surface, count, null);
+			if (countResult != VK10.VK_SUCCESS || count.get(0) <= 0) {
+				CausticaMod.LOGGER.warn("HDR: failed to enumerate swapchain formats during recreation: {}",
+						countResult);
+				return;
+			}
+			VkSurfaceFormatKHR.Buffer formats = VkSurfaceFormatKHR.calloc(count.get(0), stack);
+			int formatsResult = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(
+					this.device.vkDevice().getPhysicalDevice(), this.surface, count, formats);
+			if (formatsResult != VK10.VK_SUCCESS) {
+				CausticaMod.LOGGER.warn("HDR: failed to read swapchain formats during recreation: {}",
+						formatsResult);
+				return;
+			}
+			formats.limit(Math.min(formats.capacity(), count.get(0)));
+
+			VkSurfaceFormatKHR pq = caustica$findPq(formats);
+			VkSurfaceFormatKHR sdr = caustica$findSdr(formats);
+			CausticaConfig.Rt.Hdr.setSwapchainPqAvailable(pq != null);
+			boolean usePq = CausticaConfig.Rt.Hdr.ENABLED.value() && pq != null;
+			if (!usePq && sdr == null && pq != null) {
+				// Extremely unusual, but safer than destroying the only viable presentation path.
+				CausticaMod.LOGGER.warn("HDR: surface exposes PQ but no compatible native-SDR format; "
+						+ "keeping the PQ swapchain and embedding SDR content");
+				usePq = true;
+			}
+			if (usePq) {
+				this.swapchainImageFormat = pq.format();
+				this.caustica$colorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
+			} else {
+				if (sdr == null) {
+					CausticaMod.LOGGER.warn("HDR: surface exposes no compatible SDR or PQ format during recreation");
+					return;
+				}
+				this.swapchainImageFormat = sdr.format();
+				this.caustica$colorSpace = 0;
+			}
+			CausticaConfig.Rt.Hdr.setSwapchainPqActive(usePq);
+			CausticaMod.LOGGER.info("HDR: recreating swapchain as {} (format={}, colorSpace={})",
+					usePq ? "PQ" : "native SDR", this.swapchainImageFormat,
+					usePq ? "HDR10_ST2084" : "SRGB_NONLINEAR");
+		}
+	}
+
+	@Unique
+	private static VkSurfaceFormatKHR caustica$findPq(VkSurfaceFormatKHR.Buffer formats) {
 		for (int i = 0; i < formats.capacity(); i++) {
 			VkSurfaceFormatKHR f = formats.get(i);
 			if (f.colorSpace() == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
-				this.caustica$colorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
-				CausticaMod.LOGGER.info("HDR: selecting PQ swapchain (format={}, colorSpace=HDR10_ST2084)", f.format());
-				cir.setReturnValue(f);
-				return;
+				return f;
 			}
 		}
-		CausticaMod.LOGGER.warn("HDR: PQ swapchain requested but HDR10_ST2084 was not advertised by the surface; "
-				+ "using SDR (enable OS/display HDR; on Linux use a native Wayland session with HDR enabled in the compositor)");
+		return null;
+	}
+
+	@Unique
+	private static VkSurfaceFormatKHR caustica$findSdr(VkSurfaceFormatKHR.Buffer formats) {
+		for (int i = 0; i < formats.capacity(); i++) {
+			VkSurfaceFormatKHR f = formats.get(i);
+			if (f.colorSpace() == 0 && (f.format() == 37 || f.format() == 44)) {
+				return f;
+			}
+		}
+		return null;
 	}
 
 	/** Replace the hardcoded {@code imageColorSpace(0)} with the PQ color space when one was selected. */
@@ -142,9 +220,9 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Reflex Phase 1a: chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the
-	 * swapchain's pNext at creation. Per spec {@code vkSetLatencySleepModeNV} (not called yet — lands with
-	 * the sleep loop) only takes effect on a swapchain created with this flag, so it has to be set here,
+	 * Chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the swapchain's pNext at
+	 * creation. {@code vkSetLatencySleepModeNV} only takes effect on a swapchain created with this flag,
+	 * so it has to be set here,
 	 * before there's any other reason to touch swapchain creation. Preserves whatever pNext was already
 	 * there (currently nothing else chains one). The extra struct is stack-allocated and only needs to
 	 * survive this call — Vulkan reads pNext chains synchronously during {@code vkCreateSwapchainKHR}, it
@@ -170,13 +248,14 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Reflex Phase 1b: (re)apply the sleep-mode config for the just-(re)configured swapchain. Per spec this
+	 * Reapply the Reflex sleep-mode config for the configured swapchain. The configuration
 	 * is scoped to a specific swapchain object, so it must be re-called whenever {@code configure()} builds a
 	 * new one (e.g. resize) — {@link RtReflex#applySleepMode} is idempotent (no-op if unchanged), so calling
 	 * it unconditionally here is cheap. No-op when Reflex isn't enabled + device-supported.
 	 */
 	@Inject(method = "configure", at = @At("TAIL"))
-	private void caustica$applyReflexSleepMode(GpuSurface.Configuration config, CallbackInfo ci) {
+	private void caustica$applySwapchainExtensionState(GpuSurface.Configuration config, CallbackInfo ci) {
+		caustica$applyHdrMetadataIfNeeded();
 		if (RtDeviceBringup.reflexEnabled()) {
 			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
 		}
@@ -193,7 +272,7 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Reflex Phase 1b: PRESENT_START/END markers around the real frame's present, plus (when
+	 * Emit PRESENT_START/END markers around the real frame's present and, when
 	 * {@code VK_KHR_present_id} is enabled) chaining a {@code VkPresentIdKHR} onto it so the marker's
 	 * {@code presentID} correlates with this exact present call. The FG-generated extra presents
 	 * ({@link RtFramePresenter}) are deliberately NOT marked/present-id'd — Reflex paces/measures the real
@@ -233,9 +312,8 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Step C — world-only HDR present. When the RT renderer has a fresh PQ HDR image and the swapchain is
-	 * PQ, blit that image straight into the swapchain instead of Minecraft's SDR main target. Replaces the
-	 * vanilla blit entirely (the SDR target + its UI are bypassed for now; UI compositing is a later step).
+	 * HDR present path. When the RT renderer has a fresh PQ image and the swapchain is PQ, composite the
+	 * SDR-authored UI and blit the result directly into the swapchain instead of Minecraft's SDR main target.
 	 *
 	 * <p>Because this cancels {@code blitFromTexture} at HEAD, the normal {@code caustica$presentGeneratedFrames}
 	 * TAIL inject below never runs on HDR frames — so DLSS-FG's extra-present step is invoked explicitly here,
@@ -244,6 +322,9 @@ public abstract class VulkanGpuSurfaceMixin {
 	 */
 	@Inject(method = "blitFromTexture", at = @At("HEAD"), cancellable = true)
 	private void caustica$presentHdr(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {
+		// The mastering peak is a live option and selects a different baked ACES output LUT without forcing
+		// swapchain recreation. Refresh the metadata once when that selected LUT changes.
+		caustica$applyHdrMetadataIfNeeded();
 		if (this.currentImageIndex < 0) {
 			return;
 		}
@@ -271,8 +352,25 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	@Unique
+	private void caustica$applyHdrMetadataIfNeeded() {
+		if (this.caustica$colorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT
+				|| !RtHdr.metadataExtensionEnabled() || this.swapchain == 0L) {
+			return;
+		}
+		int peakNits = CausticaConfig.Rt.Hdr.PEAK_NITS.value();
+		if (this.caustica$metadataSwapchain == this.swapchain
+				&& this.caustica$metadataPeakNits == peakNits) {
+			return;
+		}
+		if (RtHdr.applyMasteringMetadata(this.device.vkDevice(), this.swapchain, peakNits)) {
+			this.caustica$metadataSwapchain = this.swapchain;
+			this.caustica$metadataPeakNits = peakNits;
+		}
+	}
+
+	@Unique
 	private static long caustica$vkImageView(GpuTextureView view) {
-		return view instanceof com.mojang.blaze3d.vulkan.VulkanGpuTextureView v ? v.vkImageView() : 0L;
+		return view instanceof com.mojang.renderpearl.backend.vulkan.VulkanGpuTextureView v ? v.vkImageView() : 0L;
 	}
 
 	/**
@@ -287,7 +385,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (this.currentImageIndex < 0 || !RtFramePresenter.INSTANCE.isActive()) {
 			return;
 		}
-		long srcImage = textureView.texture() instanceof com.mojang.blaze3d.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
+		long srcImage = textureView.texture() instanceof com.mojang.renderpearl.backend.vulkan.VulkanGpuTexture t ? t.vkImage() : 0L;
 		long srcView = caustica$vkImageView(textureView);
 		if (srcImage == 0L) {
 			return;

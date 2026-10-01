@@ -25,5 +25,6 @@ public class MinecraftReloadMixin {
     @Inject(method = "reloadResourcePacks()Ljava/util/concurrent/CompletableFuture;", at = @At("HEAD"))
     private void caustica$rtReloadStart(CallbackInfoReturnable<CompletableFuture<Void>> cir) {
         RtComposite.INSTANCE.onResourceReloadStart();
+        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
     }
 }

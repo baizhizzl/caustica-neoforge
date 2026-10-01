@@ -9,11 +9,12 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import java.nio.ByteBuffer;
 import java.util.List;
 
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
 
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
@@ -40,7 +41,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private RtContext ctx;
     private RtOverlayPipelines.Pipeline maskPipeline;
     private RtOverlayPipelines.Pipeline compositePipeline;
-    private RtOverlayPipelines.StorageImageSet compositeSet;
+    private RtOverlayPipelines.ReadOnlyImageSet compositeSet;
     private RtImage maskImage;
 
     // This frame's prepared draw data (valid between prepare() returning true and record()).
@@ -54,7 +55,8 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private int drawCount;
 
     @Override
-    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, int width, int height) {
+    public boolean prepare(RtContext ctx, RtOverlayFramePool pool, RtGpuExecutor.GraphicsUse graphicsUse,
+                           int width, int height) {
         if (!RtEntities.glowEnabled()) {
             return false;
         }
@@ -118,13 +120,13 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
     private void ensureResources(RtContext ctx, int width, int height) {
         this.ctx = ctx;
         if (maskPipeline == null) {
-            maskPipeline = new RtOverlayPipelines.Spec("entity_glow.vert.spv", "entity_glow.frag.spv")
+            maskPipeline = new RtOverlayPipelines.Spec("entity_glow/vertex.vert.spv", "entity_glow/fragment.frag.spv")
                     .vertex(RtOverlayPipelines.VertexFormat.POSITION)
                     .attachment(MASK_FORMAT)
                     .push(MASK_PUSH_BYTES, VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT)
                     .build(ctx, "glow mask");
-            compositeSet = RtOverlayPipelines.storageImageSet(ctx, 1, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "glow composite");
-            compositePipeline = new RtOverlayPipelines.Spec("overlay_fullscreen_triangle.vert.spv", "entity_glow_composite.frag.spv")
+            compositeSet = RtOverlayPipelines.readOnlyImageSet(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, "glow composite");
+            compositePipeline = new RtOverlayPipelines.Spec("overlay_composite/vertex.vert.spv", "overlay_composite/glow.frag.spv")
                     .blend(RtOverlayPipelines.Blend.ALPHA)
                     .attachment(RtWorldOverlay.TARGET_FORMAT)
                     .descriptorSetLayout(compositeSet.layout)
@@ -137,7 +139,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
             maskImage = ctx.createStorageImage(width, height, MASK_FORMAT,
                     "glow outline mask " + width + "x" + height, VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
         }
-        compositeSet.bind(ctx, 0, maskImage.view);
+        compositeSet.bind(ctx, maskImage.view);
     }
 
     @Override

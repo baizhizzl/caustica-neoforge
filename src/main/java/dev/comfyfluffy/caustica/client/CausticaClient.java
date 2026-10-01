@@ -12,6 +12,8 @@ import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.IEventBus;
+import net.neoforged.neoforge.client.event.RegisterDebugEntriesEvent;
 import net.neoforged.fml.common.Mod;
 import net.neoforged.neoforge.client.event.ClientTickEvent;
 import net.neoforged.neoforge.common.NeoForge;
@@ -19,22 +21,17 @@ import net.neoforged.neoforge.event.GameShuttingDownEvent;
 
 @Mod(value = CausticaMod.MOD_ID, dist = Dist.CLIENT)
 public final class CausticaClient {
-	private static boolean rtInitDone = false;
+    private static boolean rtInitDone;
 
-	public CausticaClient() {
-		CausticaMod.LOGGER.info("Caustica client initialized");
+    public CausticaClient(IEventBus modBus) {
+        CausticaMod.LOGGER.info("Caustica client initialized");
+        modBus.addListener((RegisterDebugEntriesEvent event) ->
+                event.register(RtExposureDebugEntry.ID, new RtExposureDebugEntry()));
+        NeoForge.EVENT_BUS.addListener(CausticaClient::onClientTick);
+        NeoForge.EVENT_BUS.addListener(CausticaClient::onGameShuttingDown);
+    }
 
-		// The GpuDevice exists well before the first tick, so a one-shot at tick start
-		// runs on the render thread with the device idle between frames.
-		NeoForge.EVENT_BUS.addListener(CausticaClient::onClientTick);
-
-		// The renderer is torn down on game shutdown (GL context still valid), mirroring Fabric's
-		// CLIENT_STOPPING. The full render-state invalidation hook (dimension change, render-distance
-		// change, F3+A) now lives in LevelExtractorMixin.caustica$rtAllChanged.
-		NeoForge.EVENT_BUS.addListener(CausticaClient::onGameShuttingDown);
-	}
-
-	private static void onClientTick(ClientTickEvent.Pre event) {
+    private static void onClientTick(ClientTickEvent.Pre event) {
 		if (!VanillaRenderController.rtRuntimeWorkRequested()) {
 			if (rtInitDone) {
 				shutdownRt();
@@ -50,7 +47,7 @@ public final class CausticaClient {
 			}
 		}
 
-		// P2: once RT is up, keep section residency synced to vanilla's loaded chunks around
+		// Once RT is up, keep section residency synced to vanilla's loaded chunks around
 		// the player — builds newly-in-range sections, frees out-of-range ones, per tick.
 		if (rtInitDone) {
 			RtContext ctx = RtContext.currentOrNull();
@@ -68,17 +65,18 @@ public final class CausticaClient {
 				}
 			}
 		}
-	}
+    }
 
-	private static void onGameShuttingDown(GameShuttingDownEvent event) {
-		shutdownRt();
-	}
+    private static void onGameShuttingDown(GameShuttingDownEvent event) {
+        shutdownRt();
+    }
 
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
 		if (!rtInitDone) {
 			RtWorkerPool.INSTANCE.shutdown();
+        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
 			return;
 		}
 
@@ -89,6 +87,7 @@ public final class CausticaClient {
 			RtTerrain.shutdown(ctx);
 		}
 		RtWorkerPool.INSTANCE.shutdown();
+        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
 		if (ctx != null) {
 			RtEntities.INSTANCE.shutdown();
 		}

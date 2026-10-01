@@ -6,8 +6,10 @@ import dev.comfyfluffy.caustica.CausticaConfig.BooleanSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.FloatSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.IntSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.StringSetting;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
 import net.minecraft.network.chat.Component;
@@ -29,23 +31,33 @@ public final class RtVideoOptions {
     private RtVideoOptions() {
     }
 
-    /** Runtime-tunable RT options, in display order. Paired two-per-row by {@code OptionsList.addSmall}. */
+    /**
+     * Runtime-tunable RT options, in display order. Paired two-per-row by {@code OptionsList.addSmall}.
+     * The HDR entries are omitted entirely (not just disabled) when this session's swapchain isn't
+     * PQ-capable ({@code CausticaConfig.Rt.Hdr.swapchainPqAvailable()}) — offering a toggle/sliders that
+     * can never do anything is worse than not showing them, and unlike most settings here this one is
+     * fixed by hardware/OS/compositor at surface-creation time. The current swapchain may still be native
+     * SDR; changing the toggle invalidates its configuration and recreates it in the selected format.
+     */
     public static OptionInstance<?>[] runtimeOptions() {
-        return new OptionInstance<?>[] {
+        List<OptionInstance<?>> options = new ArrayList<>(List.of(
             exposureMode(),
             manualEv(),
+            gamma(),
             spp(),
             maxBounces(),
-            sunSize(),
             entities(),
             particles(),
             waterWaves(),
-            dlssQuality(),
-            hdrEnabled(),
-            hdrPaperWhite(),
-            hdrPeak(),
-            debugView(),
-        };
+            dlssQuality()
+        ));
+        if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
+            options.add(hdrEnabled());
+            options.add(hdrUiBrightness());
+            options.add(hdrPeak());
+        }
+        options.add(debugView());
+        return options.toArray(OptionInstance<?>[]::new);
     }
 
     private static OptionInstance<String> exposureMode() {
@@ -72,9 +84,21 @@ public final class RtVideoOptions {
                 return Options.genericValueLabel(caption,
                         Component.literal(sign + String.format(Locale.ROOT, "%.1f EV", ev)));
             },
-            new OptionInstance.IntRange(-50, 50),
-            Math.clamp(Math.round(setting.value() * 10.0f), -50, 50),
+            new OptionInstance.IntRange(-150, 150),
+            Math.clamp(Math.round(setting.value() * 10.0f), -150, 150),
             tenths -> setting.set(tenths / 10.0f));
+    }
+
+    private static OptionInstance<Integer> gamma() {
+        FloatSetting setting = CausticaConfig.Rt.Tonemap.GAMMA;
+        return new OptionInstance<>(
+            "caustica.options.rt.gamma",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.gamma.tooltip")),
+            (caption, hundredths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.2f", hundredths / 100.0f))),
+            new OptionInstance.IntRange(50, 150),
+            Math.clamp(Math.round(setting.value() * 100.0f), 50, 150),
+            hundredths -> setting.set(hundredths / 100.0f));
     }
 
     private static OptionInstance<Integer> spp() {
@@ -99,19 +123,6 @@ public final class RtVideoOptions {
             setting::set);
     }
 
-    private static OptionInstance<Integer> sunSize() {
-        // Stored in radians via the degrees->radians sanitizer; the slider works in tenths of a degree.
-        FloatSetting setting = CausticaConfig.Rt.Composite.SUN_ANGULAR_RADIUS;
-        int initialTenths = Math.clamp(Math.round((float) Math.toDegrees(setting.value()) * 10.0f), 1, 50);
-        return new OptionInstance<>(
-            "caustica.options.rt.sunSize",
-            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.sunSize.tooltip")),
-            (caption, tenths) -> Options.genericValueLabel(caption, Component.literal(String.format("%.1f°", tenths / 10.0))),
-            new OptionInstance.IntRange(1, 50),
-            initialTenths,
-            tenths -> setting.set(tenths / 10.0f));
-    }
-
     private static OptionInstance<Boolean> entities() {
         return bool("caustica.options.rt.entities", CausticaConfig.Rt.Entities.ENABLED);
     }
@@ -124,50 +135,61 @@ public final class RtVideoOptions {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
     }
 
-    // NVSDK_NGX_PerfQuality_Value, ordered performance -> quality for the slider. Per NVIDIA's DLSS-RR
-    // programming guide, Ray Reconstruction only supports Performance(0), Balanced(1), Quality(2),
-    // Ultra-Performance(3), and DLAA(5) — Ultra Quality(4) is not a valid PerfQualityValue for RR (its
-    // optimal-settings query returns a zeroed render size for it) and is deliberately excluded here.
-    private static final List<Integer> DLSS_QUALITY_ORDER = List.of(3, 0, 1, 2, 5);
-
     private static OptionInstance<Integer> dlssQuality() {
         IntSetting setting = CausticaConfig.Rt.DlssRr.QUALITY;
-        int initialQuality = DLSS_QUALITY_ORDER.contains(setting.value()) ? setting.value() : 0;
-        int initialPosition = DLSS_QUALITY_ORDER.indexOf(initialQuality);
+        List<Integer> steps = CausticaConfig.Rt.DlssRr.QUALITY_STEPS;
+        int initialQuality = steps.contains(setting.value()) ? setting.value() : 0;
+        int initialPosition = steps.indexOf(initialQuality);
         return new OptionInstance<>(
             "caustica.options.rt.dlssQuality",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.dlssQuality.tooltip")),
             (caption, position) -> Options.genericValueLabel(caption,
-                    Component.translatable("caustica.options.rt.dlssQuality." + DLSS_QUALITY_ORDER.get(position))),
-            new OptionInstance.IntRange(0, DLSS_QUALITY_ORDER.size() - 1),
+                    Component.translatable("caustica.options.rt.dlssQuality." + steps.get(position))),
+            new OptionInstance.IntRange(0, steps.size() - 1),
             initialPosition,
-            position -> setting.set(DLSS_QUALITY_ORDER.get(position)));
+            position -> setting.set(steps.get(position)));
     }
 
     private static OptionInstance<Boolean> hdrEnabled() {
-        return bool("caustica.options.rt.hdr", CausticaConfig.Rt.Hdr.ENABLED);
+        BooleanSetting setting = CausticaConfig.Rt.Hdr.ENABLED;
+        return OptionInstance.createBoolean(
+            "caustica.options.rt.hdr",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.hdr.tooltip")),
+            setting.value(),
+            enabled -> {
+                if (setting.value() != enabled) {
+                    setting.set(enabled);
+                    // Reuse the framebuffer-resize path at the next safe frame boundary. GpuSurface
+                    // refuses configure() while an image is acquired, so doing it directly here is unsafe.
+                    Minecraft.getInstance().invalidateSurfaceConfiguration();
+                }
+            });
     }
 
-    private static OptionInstance<Integer> hdrPaperWhite() {
-        FloatSetting setting = CausticaConfig.Rt.Hdr.PAPER_WHITE_NITS;
+    private static OptionInstance<Integer> hdrUiBrightness() {
+        FloatSetting setting = CausticaConfig.Rt.Hdr.UI_NITS;
         return new OptionInstance<>(
-            "caustica.options.rt.hdrPaperWhite",
-            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.hdrPaperWhite.tooltip")),
+            "caustica.options.rt.hdrUiBrightness",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.hdrUiBrightness.tooltip")),
             (caption, nits) -> Options.genericValueLabel(caption, Component.literal(nits + " nits")),
-            new OptionInstance.IntRange(80, 1000),
-            Math.clamp(Math.round(setting.value()), 80, 1000),
+            new OptionInstance.IntRange(80, 500),
+            Math.clamp(Math.round(setting.value()), 80, 500),
             nits -> setting.set(nits.floatValue()));
     }
 
+    // Each step selects a baked ACES HDR mastering target. Changes take effect on the next frame.
     private static OptionInstance<Integer> hdrPeak() {
-        FloatSetting setting = CausticaConfig.Rt.Hdr.PEAK_NITS;
+        IntSetting setting = CausticaConfig.Rt.Hdr.PEAK_NITS;
+        List<Integer> steps = CausticaConfig.Rt.Hdr.PEAK_NITS_STEPS;
+        int initialPeak = steps.contains(setting.value()) ? setting.value() : 1000;
+        int initialPosition = steps.indexOf(initialPeak);
         return new OptionInstance<>(
             "caustica.options.rt.hdrPeak",
             OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.hdrPeak.tooltip")),
-            (caption, nits) -> Options.genericValueLabel(caption, Component.literal(nits + " nits")),
-            new OptionInstance.IntRange(80, 10000),
-            Math.clamp(Math.round(setting.value()), 80, 10000),
-            nits -> setting.set(nits.floatValue()));
+            (caption, position) -> Options.genericValueLabel(caption, Component.literal(steps.get(position) + " nits")),
+            new OptionInstance.IntRange(0, steps.size() - 1),
+            Math.max(initialPosition, 0),
+            position -> setting.set(steps.get(position)));
     }
 
     private static OptionInstance<Integer> debugView() {

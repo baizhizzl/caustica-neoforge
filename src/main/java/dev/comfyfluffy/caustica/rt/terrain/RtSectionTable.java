@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
- * Mutable GPU section-table state owned by the render thread. M0 centralizes the table buffer, slot
+ * Mutable GPU section-table state owned by the render thread. This class centralizes the table buffer, slot
  * registry, and published static-instance list here while {@link RtTerrain} retains publication order.
  */
 final class RtSectionTable {
@@ -114,7 +114,7 @@ final class RtSectionTable {
             if (generation.capacity >= minCapacity) {
                 return generation;
             }
-            ctx.gpuExecutor().enqueueDestroyUnpublished(generation.buffer::destroy);
+            ctx.gpuExecutor().retireUnpublished(generation.buffer::destroy);
         }
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         RtBuffer buffer = ctx.createBuffer((long) minCapacity * SECTION_ENTRY_BYTES, storage, true,
@@ -203,11 +203,13 @@ final class RtSectionTable {
         final int sx;
         final int sy;
         final int sz;
+        /** Packed section-local RIS light records (possibly empty); flattened at publish. */
+        final float[] lights;
         int slot = -1;
         int instanceIndex = -1;
 
         SectionGeom(long key, RtBuffer uvs, RtBuffer material,
-                    RtAccel blas, int[] triBase, int sx, int sy, int sz) {
+                    RtAccel blas, int[] triBase, int sx, int sy, int sz, float[] lights) {
             this.key = key;
             this.uvs = uvs;
             this.material = material;
@@ -216,6 +218,7 @@ final class RtSectionTable {
             this.sx = sx;
             this.sy = sy;
             this.sz = sz;
+            this.lights = lights;
         }
 
         void destroy() {

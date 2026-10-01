@@ -9,9 +9,8 @@ import dev.comfyfluffy.caustica.rt.RtComposite;
  * {@link RtComposite}) runs once at the before-hand seam, before vanilla's pre-GUI depth clear, so the
  * hand and HUD draw at native resolution on top.
  *
- * <p>This used to host the FSR/DLSS-SR low-res render-scale path; that has been removed — the RT
- * renderer owns reconstruction via DLSS Ray Reconstruction. With {@code -Dcaustica.rt=false} this is an
- * inert passthrough.
+ * <p>The RT renderer owns reconstruction through DLSS Ray Reconstruction. With
+ * {@code -Dcaustica.rt=false} this is an inert passthrough.
  */
 public final class WorldRenderScaler {
 	public static final WorldRenderScaler INSTANCE = new WorldRenderScaler();
