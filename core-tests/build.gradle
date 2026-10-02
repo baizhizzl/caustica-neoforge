@@ -5,6 +5,7 @@ sourceSets.main.java {
     srcDir(rootProject.file("src/main/java"))
     include("dev/comfyfluffy/caustica/compat/ScratchLists.java")
     include("dev/comfyfluffy/caustica/compat/UvRectIndex.java")
+    include("dev/comfyfluffy/caustica/ngx/DlssSettings.java")
 }
 dependencies {
     testImplementation platform("org.junit:junit-bom:5.12.2")

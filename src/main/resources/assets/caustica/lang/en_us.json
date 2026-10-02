@@ -39,6 +39,23 @@
 	"caustica.options.rt.hdrPeak": "HDR Peak Brightness",
 	"caustica.options.rt.hdrPeak.tooltip": "Absolute brightness (in nits) highlights roll off toward. Set to your display's peak HDR brightness.",
 
+	"caustica.options.rt.dlssRr": "DLSS Ray Reconstruction",
+	"caustica.options.rt.dlssRr.tooltip": "Denoise and upscale the ray-traced image using DLSS Ray Reconstruction. Requires a supported NVIDIA RTX GPU.",
+
+	"caustica.options.rt.dlssModel": "Ray Reconstruction Model",
+	"caustica.options.rt.dlssModel.tooltip": "Auto follows NVIDIA's model defaults. F selects the RR2 transformer model. Changes apply on the next frame; NVIDIA App overrides may take precedence. This selects an RR model, not an SR L/M preset.",
+	"caustica.options.rt.dlssModel.0": "Auto",
+	"caustica.options.rt.dlssModel.4": "D (Transformer)",
+	"caustica.options.rt.dlssModel.5": "E (Transformer)",
+	"caustica.options.rt.dlssModel.6": "F (RR2)",
+
+	"caustica.options.rt.frameGeneration": "DLSS Frame Generation",
+	"caustica.options.rt.frameGeneration.unavailableValue": "Unavailable",
+	"caustica.options.rt.frameGeneration.tooltip": "Insert generated frames between rendered frames. Requires a compatible GPU and driver. Enable V-Sync so the display presents every generated frame. Changes apply without restarting.",
+	"caustica.options.rt.frameGeneration.unavailable": "Frame Generation is unavailable with the current GPU, driver or graphics backend. Check the game log for NGX details; these controls are disabled for this session.",
+	"caustica.options.rt.frameGenerationMultiplier": "Frame Generation Multiplier",
+	"caustica.options.rt.frameGenerationMultiplier.tooltip": "2x is one generated frame plus one rendered frame; 6x is five generated frames plus one rendered frame. Only GPU/driver-supported multipliers are offered, up to 6x. This does not increase the game's simulation rate.",
+
 	"caustica.options.rt.dlssQuality": "DLSS Quality",
 	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction quality mode. Lower-quality modes render fewer pixels and upscale more aggressively for higher framerates; higher-quality modes render more pixels for a sharper image. Only affects the image when DLSS Ray Reconstruction is enabled.",
 	"caustica.options.rt.dlssQuality.3": "Ultra Performance",

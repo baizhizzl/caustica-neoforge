@@ -68,7 +68,7 @@ public abstract class VideoSettingsScreenMixin {
             return;
         }
         list.addHeader(CAUSTICA$RT_HEADER);
-        list.addSmall(RtVideoOptions.runtimeOptions());
+        RtVideoOptions.addTo(list);
     }
 
     @Inject(method = "removed", at = @At("TAIL"))

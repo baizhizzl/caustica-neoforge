@@ -6,12 +6,17 @@ import dev.comfyfluffy.caustica.CausticaConfig.BooleanSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.FloatSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.IntSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.StringSetting;
+import dev.comfyfluffy.caustica.ngx.DlssSettings;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Options;
+import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.components.OptionsList;
 import net.minecraft.network.chat.Component;
 
 /**
@@ -22,10 +27,8 @@ import net.minecraft.network.chat.Component;
  *
  * <p>Only settings the renderer re-reads per-frame are exposed here — toggles that would require a device or
  * buffer-pool rebuild (worker threads, OMM, max-entity capacities, PBR material flags) are intentionally
- * left to the {@code -Dcaustica.*} startup surface. DLSS-RR quality is the exception: the render resolution
- * is queried from NGX for the chosen quality mode on every resize (see
- * {@code RtDlssRr.queryOptimalRenderSize}), and the RR feature itself is recreated live whenever
- * {@code quality} changes (see {@code RtDlssRr.ensureFeature}), so it is safe to expose here.
+ * left to the {@code -Dcaustica.*} startup surface. RR quality and model changes recreate the NGX feature
+ * at a safe frame boundary. FG multipliers are limited to the current driver capability.
  */
 public final class RtVideoOptions {
     private RtVideoOptions() {
@@ -39,7 +42,28 @@ public final class RtVideoOptions {
      * fixed by hardware/OS/compositor at surface-creation time. The current swapchain may still be native
      * SDR; changing the toggle invalidates its configuration and recreates it in the selected format.
      */
-    public static OptionInstance<?>[] runtimeOptions() {
+    public static void addTo(OptionsList list) {
+        RtDlssFg fg = RtDlssFg.INSTANCE;
+        // Query even when FG is off, so the user can enable it without a restart or a JVM property.
+        fg.probeAvailabilityOnce();
+        boolean available = fg.isAvailable();
+        OptionInstance<Boolean> fgEnabled = frameGenerationEnabled(available);
+        List<Integer> counts = DlssSettings.generatedFrameChoices(fg.multiFrameCountMax());
+        OptionInstance<Integer> fgMultiplier = frameGenerationMultiplier(counts, available);
+        list.addSmall(runtimeOptions(fgEnabled, fgMultiplier));
+        setActive(list, fgEnabled, available);
+        setActive(list, fgMultiplier, available && counts.size() > 1);
+    }
+
+    private static void setActive(OptionsList list, OptionInstance<?> option, boolean active) {
+        AbstractWidget widget = list.findOption(option);
+        if (widget != null) {
+            widget.active = active;
+        }
+    }
+
+    private static OptionInstance<?>[] runtimeOptions(OptionInstance<Boolean> fgEnabled,
+            OptionInstance<Integer> fgMultiplier) {
         List<OptionInstance<?>> options = new ArrayList<>(List.of(
             exposureMode(),
             manualEv(),
@@ -49,7 +73,11 @@ public final class RtVideoOptions {
             entities(),
             particles(),
             waterWaves(),
-            dlssQuality()
+            dlssEnabled(),
+            dlssQuality(),
+            dlssModel(),
+            fgEnabled,
+            fgMultiplier
         ));
         if (CausticaConfig.Rt.Hdr.swapchainPqAvailable()) {
             options.add(hdrEnabled());
@@ -133,6 +161,66 @@ public final class RtVideoOptions {
 
     private static OptionInstance<Boolean> waterWaves() {
         return bool("caustica.options.rt.waterWaves", CausticaConfig.Rt.Composite.WATER_WAVES);
+    }
+
+    private static OptionInstance<Boolean> dlssEnabled() {
+        BooleanSetting setting = CausticaConfig.Rt.DlssRr.ENABLED;
+        return OptionInstance.createBoolean(
+            "caustica.options.rt.dlssRr",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.dlssRr.tooltip")),
+            setting.value(),
+            enabled -> {
+                setting.set(enabled);
+                RtDlssRr.INSTANCE.requestHistoryReset();
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            });
+    }
+
+    private static OptionInstance<Integer> dlssModel() {
+        IntSetting setting = CausticaConfig.Rt.DlssRr.PRESET;
+        return new OptionInstance<>(
+            "caustica.options.rt.dlssModel",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.dlssModel.tooltip")),
+            (caption, preset) -> Component.translatable("caustica.options.rt.dlssModel." + preset),
+            new OptionInstance.Enum<>(CausticaConfig.Rt.DlssRr.PRESET_STEPS, Codec.INT),
+            setting.value(),
+            preset -> {
+                setting.set(preset);
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            });
+    }
+
+    private static OptionInstance<Boolean> frameGenerationEnabled(boolean available) {
+        BooleanSetting setting = CausticaConfig.Rt.Fg.ENABLED;
+        String tooltip = available ? "caustica.options.rt.frameGeneration.tooltip"
+                : "caustica.options.rt.frameGeneration.unavailable";
+        return OptionInstance.createBoolean(
+            "caustica.options.rt.frameGeneration",
+            OptionInstance.cachedConstantTooltip(Component.translatable(tooltip)),
+            (caption, enabled) -> Component.translatable(available
+                    ? (enabled ? "options.on" : "options.off")
+                    : "caustica.options.rt.frameGeneration.unavailableValue"),
+            setting.value(),
+            enabled -> {
+                setting.set(enabled);
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            });
+    }
+
+    private static OptionInstance<Integer> frameGenerationMultiplier(List<Integer> counts, boolean available) {
+        IntSetting setting = CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT;
+        String tooltip = available ? "caustica.options.rt.frameGenerationMultiplier.tooltip"
+                : "caustica.options.rt.frameGeneration.unavailable";
+        return new OptionInstance<>(
+            "caustica.options.rt.frameGenerationMultiplier",
+            OptionInstance.cachedConstantTooltip(Component.translatable(tooltip)),
+            (caption, count) -> Component.literal((count + 1) + "x"),
+            new OptionInstance.Enum<>(counts, Codec.INT),
+            DlssSettings.generatedFrameCount(setting.value(), counts.getLast()),
+            count -> {
+                setting.set(count);
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            });
     }
 
     private static OptionInstance<Integer> dlssQuality() {
