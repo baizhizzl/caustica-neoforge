@@ -4,6 +4,7 @@ import com.electronwill.nightconfig.core.CommentedConfig;
 import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.electronwill.nightconfig.core.file.FileNotFoundAction;
 import com.electronwill.nightconfig.toml.TomlFormat;
+import dev.comfyfluffy.caustica.ngx.DlssSettings;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -88,7 +89,9 @@ public final class CausticaConfig {
                 " Controls terrain loading. Higher limits can load terrain faster but use more CPU and GPU time.");
         FILE.setComment("frame-generation",
                 " DLSS Frame Generation. Requires supported NVIDIA hardware and drivers.\n"
-                        + " multi-frame-count sets generated frames per rendered frame (1 = 2x, 2 = 3x, ...).");
+                        + " multi-frame-count sets generated frames per rendered frame (1 = 2x, 5 = 6x), limited by the driver.");
+        FILE.setComment("dlss-rr", "DLSS Ray Reconstruction: preset 0 = Auto, 4 = D, 5 = E, 6 = F (RR2)."
+                + " NVIDIA App overrides may take precedence.");
         FILE.setComment("reflex",
                 " NVIDIA Reflex. Requires supported NVIDIA hardware and drivers.\n"
                         + " minimum-interval-us controls frame limiting; 0 disables the limit.");
@@ -654,7 +657,9 @@ public final class CausticaConfig {
 
         public static final class DlssRr {
             public static final BooleanSetting ENABLED = bool("caustica.rt.dlssRr", "dlss-rr.enabled", true);
-            public static final IntSetting PRESET = intValue("caustica.rt.dlssRr.preset", "dlss-rr.preset", 0);
+            public static final List<Integer> PRESET_STEPS = DlssSettings.RR_PRESETS;
+            public static final IntSetting PRESET =
+                    intChoice("caustica.rt.dlssRr.preset", "dlss-rr.preset", 0, PRESET_STEPS);
 
             // NVSDK_NGX_PerfQuality_Value. Per NVIDIA's DLSS-RR programming guide, Ray Reconstruction only
             // supports Performance(0), Balanced(1), Quality(2), Ultra-Performance(3), and DLAA(5) —
@@ -672,7 +677,8 @@ public final class CausticaConfig {
         public static final class Fg {
             public static final BooleanSetting ENABLED = bool("caustica.rt.fg", "frame-generation.enabled", false);
             public static final IntSetting MULTI_FRAME_COUNT =
-                    intAtLeast("caustica.rt.fg.multiFrameCount", "frame-generation.multi-frame-count", 1, 1);
+                    clampedInt("caustica.rt.fg.multiFrameCount", "frame-generation.multi-frame-count",
+                            1, 1, DlssSettings.MAX_GENERATED_FRAMES);
 
             private Fg() {
             }

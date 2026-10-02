@@ -67,6 +67,12 @@ public final class RtDlssRr {
     private RtDlssRr() {
     }
 
+    /** Invalidate temporal history after a live enable/disable without blocking the settings UI. */
+    public void requestHistoryReset() {
+        resetHistory = true;
+        lastFrameNanos = 0;
+    }
+
     public boolean isReady() {
         return initialized && !failed && !isNull(feature);
     }
@@ -237,6 +243,9 @@ public final class RtDlssRr {
         }
         initialized = false;
         lib = null;
+        failed = false;
+        loggedAvailable = false;
+        requestHistoryReset();
     }
 
     private void releaseFeature(VulkanDevice device) {

@@ -9,6 +9,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "rr_model.h"
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_vk.h"
 #include "nvsdk_ngx_helpers.h"
@@ -367,14 +368,13 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     }
     NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
 
-    if (renderPreset != 0) {
-        unsigned int preset = (unsigned int) renderPreset;
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, preset);
-        NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, preset);
+    // Zero clears old hints in the shared capability block when switching back to Auto.
+    if (!caustica::setRayReconstructionPreset(renderPreset,
+            [params](const char* key, unsigned int preset) {
+                NVSDK_NGX_Parameter_SetUI(params, key, preset);
+            })) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        return nullptr;
     }
 
     NVSDK_NGX_DLSSD_Create_Params createParams;

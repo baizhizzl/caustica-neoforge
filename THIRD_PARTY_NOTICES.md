@@ -11,9 +11,13 @@ SDK runtime components, including DLSS Ray Reconstruction and Frame Generation
 libraries. These NVIDIA components are proprietary third-party software and are
 not licensed under the LGPL.
 
+Bundled SDK version: **310.9.1**, source revision
+`374959484e79a640feaba44c93ac8cfb0a03f5b5`. The SDK license is also included in
+`META-INF/licenses/NVIDIA-DLSS.txt` inside the mod JAR.
+
 The NVIDIA SDK components remain subject to the NVIDIA RTX SDKs license:
 
-<https://github.com/NVIDIA/DLSS/blob/main/LICENSE.txt>
+<https://github.com/NVIDIA/DLSS/blob/374959484e79a640feaba44c93ac8cfb0a03f5b5/LICENSE.txt>
 
 The LGPL license grant for Caustica does not grant rights to NVIDIA SDK
 components. Redistribution and use of those components must comply with

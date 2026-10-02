@@ -1,7 +1,7 @@
 # Caustica — NeoForge 版
 
 Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft，支持 DLSS、Bloom、HDR 和 LabPBR 材质。
-当前版本适配 Minecraft **26.3**，已由维护者完成实机测试。
+适配 Minecraft **26.3**。已发布的 **0.1.1-neoforge.2** 已由维护者完成实机测试。
 
 这是 [ComfyFluffy/Caustica](https://github.com/ComfyFluffy/Caustica) 的非官方移植。
 渲染器和着色器来自上游，本仓库负责 NeoForge 适配与移植层优化。
@@ -25,6 +25,15 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 
 发布的 JAR 已包含 Windows x64 和 Linux x64 原生库，不用另装 DLSS SDK。
 遇到问题，请带上游戏日志、显卡型号和驱动版本，到[本仓库的 Issues](https://github.com/baizhizzl/caustica-neoforge/issues)反馈。
+
+## 开发版 DLSS 选项
+
+本分支的 `0.1.1-neoforge.3` 在「视频设置 → Ray Tracing」中加入帧生成开关和倍数调节。
+可选倍数由显卡、驱动和窗口系统决定，最高 6x；需要开启垂直同步，才能让生成帧逐帧显示。
+
+光线重建可选择 Auto、D、E 或 **F（RR2）**，切换后无需重启。
+随包的 DLSS SDK 已更新到 **310.9.1**。F 是新的光线重建模型，不是超分辨率的 L/M 预设。
+这些改动尚未包含在上面的 `.2` 正式版中。
 
 ## 26.3 更新
 

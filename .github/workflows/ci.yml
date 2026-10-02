@@ -42,7 +42,8 @@ concurrency:
 env:
   SLANG_VERSION: "2026.19"
   SLANG_LINUX_SHA256: bd6cfc47b7353b2cffa36a866b1584749f76f4b2dbebf6dda26bc3fb40dc3c0e
-  DLSS_SDK_REF: v310.7.0
+  # NVIDIA DLSS SDK 310.9.1 (RR2 / Preset F). Pin the immutable source revision.
+  DLSS_SDK_REF: 374959484e79a640feaba44c93ac8cfb0a03f5b5
   DLSS_SDK_PATH: third_party/DLSS
   NGX_SHIM_CONFIG: release
   NGX_VENDOR_CONFIG: rel
@@ -106,6 +107,10 @@ jobs:
         shell: pwsh
         run: cmake --build build/cmake/ngx_shim --config Release
 
+      - name: Test RR model selection
+        shell: pwsh
+        run: ctest --test-dir build/cmake/ngx_shim -C Release --output-on-failure
+
       - name: Upload Windows NGX shim
         uses: actions/upload-artifact@v4
         with:
@@ -145,6 +150,9 @@ jobs:
 
       - name: Build NGX shim
         run: cmake --build build/cmake/ngx_shim --config Release
+
+      - name: Test RR model selection
+        run: ctest --test-dir build/cmake/ngx_shim -C Release --output-on-failure
 
       - name: Upload Linux NGX shim
         uses: actions/upload-artifact@v4

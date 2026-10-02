@@ -7,9 +7,11 @@ import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
+import dev.comfyfluffy.caustica.ngx.DlssSettings;
 import dev.comfyfluffy.caustica.ngx.NgxLibrary;
 import dev.comfyfluffy.caustica.ngx.NgxRuntime;
 
+import net.minecraft.client.Minecraft;
 import org.joml.Matrix4fc;
 import org.lwjgl.vulkan.VK10;
 
@@ -19,9 +21,8 @@ import java.lang.foreign.ValueLayout;
 
 /**
  * DLSS Frame Generation (DLSSG) backend. Shares the NGX instance with DLSS-RR via {@link NgxRuntime};
- * owns only the DLSSG feature handle. This turn provides availability detection and the feature
- * create/destroy lifecycle — the per-frame {@code evaluate} + the multi-present loop that consumes it land
- * with the present-path refactor. Gated by {@code caustica.rt.fg} (default off) and hardware/driver support.
+ * owns the DLSSG feature and records interpolated frames for the multi-present loop. Runtime changes
+ * reset temporal history on the next evaluation. Gated by the FG setting and hardware/driver support.
  */
 public final class RtDlssFg {
     public static final RtDlssFg INSTANCE = new RtDlssFg();
@@ -37,6 +38,9 @@ public final class RtDlssFg {
     private boolean probed;
     private boolean available;
     private int multiFrameCountMax;
+    private boolean resetHistory = true;
+    private int surfaceFrameLimit = DlssSettings.MAX_GENERATED_FRAMES;
+    private int swapchainFrameLimit;
 
     private int featureWidth = -1;
     private int featureHeight = -1;
@@ -48,18 +52,38 @@ public final class RtDlssFg {
     }
 
     public boolean isAvailable() {
-        return available;
+        return available && !failed && surfaceFrameLimit > 0;
     }
 
-    /** Driver-reported maximum multi-frame-generation count (1 = 2x only); 0 until probed. */
+    /** Selectable generated-frame count, limited by both the driver and the surface's maximum image count. */
     public int multiFrameCountMax() {
-        return multiFrameCountMax;
+        return Math.min(DlssSettings.generatedFrameLimit(multiFrameCountMax), surfaceFrameLimit);
     }
 
-    /** Requested generated-frame count clamped to the driver maximum (>=1 once available). */
+    /** Requested count for the next swapchain; an absent driver MFG capability means standard 2x. */
+    public int plannedMultiFrameCount() {
+        return surfaceFrameLimit == 0 ? 0
+                : DlssSettings.generatedFrameCount(CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value(), multiFrameCountMax());
+    }
+
+    /** Only acquire as many extra images as the current swapchain can supply before Minecraft submits. */
     public int effectiveMultiFrameCount() {
-        int requested = CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value();
-        return multiFrameCountMax > 0 ? Math.clamp(requested, 1, multiFrameCountMax) : requested;
+        return Math.min(plannedMultiFrameCount(), swapchainFrameLimit);
+    }
+
+    public void setSurfaceFrameLimits(int minimumImages, int maximumImages) {
+        surfaceFrameLimit = DlssSettings.surfaceGeneratedFrameLimit(minimumImages, maximumImages);
+        swapchainFrameLimit = 0;
+    }
+
+    public void setSwapchainFrameLimit(int imageCount, int surfaceMinimum) {
+        swapchainFrameLimit = DlssSettings.swapchainGeneratedFrameLimit(imageCount, surfaceMinimum);
+        requestHistoryReset();
+    }
+
+    /** Discard history across enable/multiplier changes without releasing in-flight GPU resources. */
+    public void requestHistoryReset() {
+        resetHistory = true;
     }
 
     public boolean isReady() {
@@ -74,30 +98,42 @@ public final class RtDlssFg {
     }
 
     /**
-     * Probe DLSSG availability once (after NGX is up) and log the result + MFG cap. Safe to call every tick
-     * when FG is enabled; no-op after the first successful probe. Needs no command buffer (capability query).
+     * Probe DLSSG availability once after NGX is up. Used by both the render tick and options screen;
+     * needs no command buffer and does not create an FG feature.
      */
     public void probeAvailabilityOnce() {
         if (probed || failed) {
             return;
         }
-        if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
-            return;
+        try {
+            if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
+                return;
+            }
+            NgxLibrary l = NgxRuntime.INSTANCE.acquire(device);
+            if (l == null) {
+                return;
+            }
+            probed = true;
+            lib = l;
+            if (!l.hasDlssg()) {
+                CausticaMod.LOGGER.warn("DLSS-FG: loaded NGX shim has no DLSSG ABI");
+                return;
+            }
+            available = l.dlssgAvailable();
+            multiFrameCountMax = l.dlssgMultiFrameCountMax();
+            CausticaMod.LOGGER.info("DLSS Frame Generation available: {} (multi-frame max {})", available, multiFrameCountMax);
+            if (enabled() && isAvailable() && plannedMultiFrameCount() > swapchainFrameLimit) {
+                // Startup may create the surface before the driver capability is known.
+                Minecraft minecraft = Minecraft.getInstance();
+                if (minecraft != null) {
+                    minecraft.invalidateSurfaceConfiguration();
+                }
+            }
+        } catch (Throwable t) {
+            failed = true;
+            available = false;
+            CausticaMod.LOGGER.error("DLSS-FG capability query failed; frame generation unavailable", t);
         }
-        NgxLibrary l = NgxRuntime.INSTANCE.acquire(device);
-        if (l == null) {
-            return; // NGX not up yet; try again next tick
-        }
-        probed = true;
-        lib = l;
-        if (!l.hasDlssg()) {
-            CausticaMod.LOGGER.warn("DLSS-FG: loaded ngxshim.dll has no DLSSG ABI — rebuild the shim "
-                    + "(cmake --build native/ngx_shim/build --config Release)");
-            return;
-        }
-        available = l.dlssgAvailable();
-        multiFrameCountMax = l.dlssgMultiFrameCountMax();
-        CausticaMod.LOGGER.info("DLSS Frame Generation available: {} (multi-frame max {})", available, multiFrameCountMax);
     }
 
     /**
@@ -186,12 +222,13 @@ public final class RtDlssFg {
                     0L, 0L, 0, // outputReal (skip; MC presents the real frame itself)
                     width, height, mvecDepthWidth, mvecDepthHeight,
                     multiFrameCount, multiFrameIndex, mvScaleX, mvScaleY,
-                    depthInverted ? 1 : 0, colorBuffersHDR ? 1 : 0, cameraMotionIncluded ? 1 : 0, reset ? 1 : 0,
+                    depthInverted ? 1 : 0, colorBuffersHDR ? 1 : 0, cameraMotionIncluded ? 1 : 0, (reset || resetHistory) ? 1 : 0,
                     MemorySegment.NULL, MemorySegment.NULL, clipToPrev, prevToClip);
             if (NgxRuntime.ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_evaluate_dlssg failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
+            resetHistory = false;
             return true;
         } catch (Throwable t) {
             failed = true;
@@ -232,6 +269,11 @@ public final class RtDlssFg {
         }
         initialized = false;
         lib = null;
+        failed = false;
+        probed = false;
+        available = false;
+        multiFrameCountMax = 0;
+        resetHistory = true;
     }
 
     private void releaseFeature(VulkanDevice device) {
