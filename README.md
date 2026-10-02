@@ -1,7 +1,7 @@
 # Caustica — NeoForge 版
 
 Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft，支持 DLSS、Bloom、HDR 和 LabPBR 材质。
-适配 Minecraft **26.3**。已发布的 **0.1.1-neoforge.2** 已由维护者完成实机测试。
+适配 Minecraft **26.3**。**0.1.1-neoforge.3** 已由维护者完成实机测试。
 
 这是 [ComfyFluffy/Caustica](https://github.com/ComfyFluffy/Caustica) 的非官方移植。
 渲染器和着色器来自上游，本仓库负责 NeoForge 适配与移植层优化。
@@ -10,14 +10,14 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 
 ## 下载与安装
 
-**[下载 0.1.1-neoforge.2](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.2)**
+**[下载 0.1.1-neoforge.3](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.3)**
 
 | Minecraft | NeoForge | Java |
 |---|---|---|
 | 26.3 | 26.3.0.39-beta 起，限 26.3 系列 | 25 |
 
 1. 安装对应版本的 NeoForge。
-2. 下载 `caustica-neoforge-0.1.1-neoforge.2.jar`，放进实例的 `mods` 文件夹；已有旧版时先移除旧 JAR。
+2. 下载 `caustica-neoforge-0.1.1-neoforge.3.jar`，放进实例的 `mods` 文件夹；已有旧版时先移除旧 JAR。
 3. 使用 **Vulkan** 图形后端启动，在视频设置中调整渲染选项。
 
 需要支持 Vulkan 光线追踪的显卡和驱动。DLSS 需要受支持的 NVIDIA RTX 显卡；HDR 需要 HDR 显示器，并开启系统 HDR。
@@ -26,24 +26,27 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 发布的 JAR 已包含 Windows x64 和 Linux x64 原生库，不用另装 DLSS SDK。
 遇到问题，请带上游戏日志、显卡型号和驱动版本，到[本仓库的 Issues](https://github.com/baizhizzl/caustica-neoforge/issues)反馈。
 
-## 开发版 DLSS 选项
+## 更新记录
 
-本分支的 `0.1.1-neoforge.3` 在「视频设置 → Ray Tracing」中加入帧生成开关和倍数调节。
-可选倍数由显卡、驱动和窗口系统决定，最高 6x；需要开启垂直同步，才能让生成帧逐帧显示。
+### [0.1.1-neoforge.3](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.3) · 2026-10-02
 
-光线重建可选择 Auto、D、E 或 **F（RR2）**，切换后无需重启。
-随包的 DLSS SDK 已更新到 **310.9.1**。F 是新的光线重建模型，不是超分辨率的 L/M 预设。
-这些改动尚未包含在上面的 `.2` 正式版中。
+- 在「视频设置 → Ray Tracing」里加入 DLSS 帧生成开关和倍数调节，不用再改启动参数。可选倍数由显卡、驱动和窗口系统决定，最高 6x。
+- 加入光线重建开关和 Auto / D / E / **F（RR2）** 模型选择，切换后无需重启。
+- 更新随包 DLSS 运行库到 **310.9.1**，重新编译 Windows x64 / Linux x64 NGX shim。
+- 切换帧生成倍数时同步调整交换链缓冲数量，避免高倍数下等不到空闲图像。
+- 修复 F 切回 Auto 后仍保留旧模型参数的问题，切换相关设置时重置时序历史。
 
-## 26.3 更新
+本版已由维护者完成实机测试。使用帧生成时需要开启垂直同步，才能让生成帧逐帧显示。
+F 是光线重建模型，不是超分辨率的 L/M 预设。
 
-- 跟进上游 0.1.1 之后的渲染更新，包括光源采集、NEE、Bloom、天空 LUT、ACES 2.0 SDR/HDR 和 OpenEXR 截图。
-- 适配 26.3 的 Renderpearl、Vulkan 和 SDL3 接口，以及世界、手持物品、GUI 和实体渲染。
-- 重写模型采集与纹理查询，减少临时对象分配和重复查找。
-- 合入上游 GPU 同步与资源管理修复，更新资源重载时的纹理缓存处理。
+### [0.1.1-neoforge.2](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.2) · 2026-10-02
+
+- 适配 Minecraft 26.3 的 Renderpearl、Vulkan、SDL3 接口，以及世界、手持物品、GUI 和实体渲染。
+- 跟进上游光源采集、NEE、Bloom、天空 LUT、ACES 2.0 SDR/HDR、OpenEXR 截图及 GPU 同步修复。
+- 重写模型采集与纹理查询，减少临时对象分配和重复查找，修正资源重载时的纹理缓存处理。
 - 修正原生库打包流程，CI 成品使用重新编译的 Windows/Linux NGX shim。
 
-本次同步的上游提交为 [`330acd2`](https://github.com/ComfyFluffy/Caustica/commit/330acd2d743bb6b2e27b53a4adb4a3c852b9e141)。
+该版同步的上游提交为 [`330acd2`](https://github.com/ComfyFluffy/Caustica/commit/330acd2d743bb6b2e27b53a4adb4a3c852b9e141)。
 更多细节见[上游同步记录](UPSTREAM.md)和[性能优化说明](PERFORMANCE.md)。
 
 ## 从源码构建
