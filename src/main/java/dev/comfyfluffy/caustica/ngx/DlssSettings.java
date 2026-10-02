@@ -22,6 +22,24 @@ public final class DlssSettings {
         return Math.clamp(requested, 1, generatedFrameLimit(driverMaximum));
     }
 
+    /** Zero maxImageCount means unbounded; a surface with no spare images cannot batch any FG presents. */
+    public static int surfaceGeneratedFrameLimit(int surfaceMinimum, int surfaceMaximum) {
+        return surfaceMaximum == 0 ? MAX_GENERATED_FRAMES
+                : Math.clamp(surfaceMaximum - Math.max(1, surfaceMinimum), 0, MAX_GENERATED_FRAMES);
+    }
+
+    /** Reserve the surface minimum plus every generated frame to guarantee forward progress before submit. */
+    public static int requiredSwapchainImages(int vanillaCount, int surfaceMinimum, int surfaceMaximum,
+            int generatedCount) {
+        int count = Math.clamp(generatedCount, 0, surfaceGeneratedFrameLimit(surfaceMinimum, surfaceMaximum));
+        return Math.max(vanillaCount, Math.max(1, surfaceMinimum) + count);
+    }
+
+    /** Minecraft already holds the real frame; the remaining guaranteed acquisitions are images - minimum. */
+    public static int swapchainGeneratedFrameLimit(int imageCount, int surfaceMinimum) {
+        return Math.clamp(imageCount - Math.max(1, surfaceMinimum), 0, MAX_GENERATED_FRAMES);
+    }
+
     /** Values stored in TOML/NGX count generated frames, not the multiplier shown in the UI. */
     public static List<Integer> generatedFrameChoices(int driverMaximum) {
         return IntStream.rangeClosed(1, generatedFrameLimit(driverMaximum)).boxed().toList();

@@ -31,6 +31,28 @@ final class DlssSettingsTest {
     }
 
     @Test
+    void swapchainImageBudgetReservesTheSurfaceMinimum() {
+        assertEquals(1, DlssSettings.swapchainGeneratedFrameLimit(3, 2));
+        assertEquals(0, DlssSettings.swapchainGeneratedFrameLimit(3, 3));
+        assertEquals(5, DlssSettings.swapchainGeneratedFrameLimit(7, 2));
+    }
+
+    @Test
+    void highMultipliersGrowTheSwapchainBeforeTheBatchIsAcquired() {
+        assertEquals(5, DlssSettings.requiredSwapchainImages(3, 2, 0, 3));
+        assertEquals(7, DlssSettings.requiredSwapchainImages(3, 2, 0, 5));
+        assertEquals(4, DlssSettings.requiredSwapchainImages(4, 2, 0, 1));
+        assertEquals(3, DlssSettings.requiredSwapchainImages(3, 2, 3, 5));
+    }
+
+    @Test
+    void surfaceMaximumLimitsSelectableMultipliers() {
+        assertEquals(1, DlssSettings.surfaceGeneratedFrameLimit(2, 3));
+        assertEquals(0, DlssSettings.surfaceGeneratedFrameLimit(2, 2));
+        assertEquals(5, DlssSettings.surfaceGeneratedFrameLimit(2, 0));
+    }
+
+    @Test
     void rayReconstructionUsesItsOwnModelEnum() {
         assertEquals(List.of(0, 4, 5, 6), DlssSettings.RR_PRESETS);
         assertFalse(DlssSettings.RR_PRESETS.contains(12));

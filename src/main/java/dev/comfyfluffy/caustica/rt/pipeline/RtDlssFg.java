@@ -11,6 +11,7 @@ import dev.comfyfluffy.caustica.ngx.DlssSettings;
 import dev.comfyfluffy.caustica.ngx.NgxLibrary;
 import dev.comfyfluffy.caustica.ngx.NgxRuntime;
 
+import net.minecraft.client.Minecraft;
 import org.joml.Matrix4fc;
 import org.lwjgl.vulkan.VK10;
 
@@ -38,6 +39,8 @@ public final class RtDlssFg {
     private boolean available;
     private int multiFrameCountMax;
     private boolean resetHistory = true;
+    private int surfaceFrameLimit = DlssSettings.MAX_GENERATED_FRAMES;
+    private int swapchainFrameLimit;
 
     private int featureWidth = -1;
     private int featureHeight = -1;
@@ -49,18 +52,33 @@ public final class RtDlssFg {
     }
 
     public boolean isAvailable() {
-        return available && !failed;
+        return available && !failed && surfaceFrameLimit > 0;
     }
 
-    /** Driver-reported maximum multi-frame-generation count (1 = 2x only); 0 until probed. */
+    /** Selectable generated-frame count, limited by both the driver and the surface's maximum image count. */
     public int multiFrameCountMax() {
-        return multiFrameCountMax;
+        return Math.min(DlssSettings.generatedFrameLimit(multiFrameCountMax), surfaceFrameLimit);
     }
 
-    /** Requested generated-frame count clamped to the driver maximum (>=1 once available). */
+    /** Requested count for the next swapchain; an absent driver MFG capability means standard 2x. */
+    public int plannedMultiFrameCount() {
+        return surfaceFrameLimit == 0 ? 0
+                : DlssSettings.generatedFrameCount(CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value(), multiFrameCountMax());
+    }
+
+    /** Only acquire as many extra images as the current swapchain can supply before Minecraft submits. */
     public int effectiveMultiFrameCount() {
-        int requested = CausticaConfig.Rt.Fg.MULTI_FRAME_COUNT.value();
-        return DlssSettings.generatedFrameCount(requested, multiFrameCountMax);
+        return Math.min(plannedMultiFrameCount(), swapchainFrameLimit);
+    }
+
+    public void setSurfaceFrameLimits(int minimumImages, int maximumImages) {
+        surfaceFrameLimit = DlssSettings.surfaceGeneratedFrameLimit(minimumImages, maximumImages);
+        swapchainFrameLimit = 0;
+    }
+
+    public void setSwapchainFrameLimit(int imageCount, int surfaceMinimum) {
+        swapchainFrameLimit = DlssSettings.swapchainGeneratedFrameLimit(imageCount, surfaceMinimum);
+        requestHistoryReset();
     }
 
     /** Discard history across enable/multiplier changes without releasing in-flight GPU resources. */
@@ -104,6 +122,13 @@ public final class RtDlssFg {
             available = l.dlssgAvailable();
             multiFrameCountMax = l.dlssgMultiFrameCountMax();
             CausticaMod.LOGGER.info("DLSS Frame Generation available: {} (multi-frame max {})", available, multiFrameCountMax);
+            if (enabled() && isAvailable() && plannedMultiFrameCount() > swapchainFrameLimit) {
+                // Startup may create the surface before the driver capability is known.
+                Minecraft minecraft = Minecraft.getInstance();
+                if (minecraft != null) {
+                    minecraft.invalidateSurfaceConfiguration();
+                }
+            }
         } catch (Throwable t) {
             failed = true;
             available = false;

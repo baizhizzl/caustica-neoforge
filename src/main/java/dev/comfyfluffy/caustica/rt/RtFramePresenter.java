@@ -28,15 +28,15 @@ import java.nio.IntBuffer;
 import java.nio.LongBuffer;
 
 /**
- * DLSS Frame Generation present engine (slice 2). Shows more than one image per rendered frame: the
+ * DLSS Frame Generation present engine. Shows more than one image per rendered frame: the
  * generated frame(s), then the real frame.
  *
  * <p>It hooks Minecraft's frame tail (Minecraft.java: {@code blitFromTexture} → {@code encoder.submit()} →
  * {@code present()}). At {@code blitFromTexture} TAIL it acquires extra swapchain image(s) and records a
  * Y-flipped blit into <em>Minecraft's own command encoder</em> (the persistent singleton), so MC's
  * once-per-frame {@code submit()} flushes our work in the same {@code vkQueueSubmit} that signals the real
- * frame — this is what makes our present semaphores actually get signaled (the deferred-submit model is why
- * a self-contained present here failed validation). Then at {@code present()} HEAD we present the extra
+ * frame. Sharing that submit ensures the generated-frame present semaphores are signaled before use.
+ * Then at {@code present()} HEAD we present the extra
  * image(s) before MC presents the real one, giving display order generated-then-real.
  *
  * <p>The generated frame is {@link RtDlssFg}'s real DLSSG-interpolated output (via
@@ -78,7 +78,7 @@ public final class RtFramePresenter {
     /** Whether FG extra-present should run this frame (enabled, available, in a world). */
     public boolean isActive() {
         return !failed && RtDlssFg.enabled() && RtDlssFg.INSTANCE.isAvailable()
-                && Minecraft.getInstance().level != null;
+                && RtDlssFg.INSTANCE.effectiveMultiFrameCount() > 0 && Minecraft.getInstance().level != null;
     }
 
     /**

@@ -8,6 +8,8 @@ import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 import com.mojang.renderpearl.backend.vulkan.VulkanGpuSurface;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.ngx.DlssSettings;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtFramePresenter;
@@ -24,6 +26,7 @@ import org.lwjgl.vulkan.VkPresentIdKHR;
 import org.lwjgl.vulkan.VkPresentInfoKHR;
 import org.lwjgl.vulkan.VkQueue;
 import org.lwjgl.vulkan.VkSurfaceFormatKHR;
+import org.lwjgl.vulkan.VkSurfaceCapabilitiesKHR;
 import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR;
 import org.lwjgl.vulkan.VkSwapchainLatencyCreateInfoNV;
 import org.spongepowered.asm.mixin.Final;
@@ -101,6 +104,9 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	@Unique
 	private int caustica$colorSpace = 0;
+
+	@Unique
+	private int caustica$fgSurfaceMinimumImages;
 
 	@Unique
 	private long caustica$metadataSwapchain;
@@ -220,29 +226,37 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * Chain {@code VkSwapchainLatencyCreateInfoNV{latencyModeEnable=true}} into the swapchain's pNext at
-	 * creation. {@code vkSetLatencySleepModeNV} only takes effect on a swapchain created with this flag,
-	 * so it has to be set here,
-	 * before there's any other reason to touch swapchain creation. Preserves whatever pNext was already
-	 * there (currently nothing else chains one). The extra struct is stack-allocated and only needs to
-	 * survive this call — Vulkan reads pNext chains synchronously during {@code vkCreateSwapchainKHR}, it
-	 * doesn't retain the pointer afterward, so freeing it when this method's stack frame pops is safe even
-	 * though {@code pCreateInfo} isn't touched again after this point in {@code configure()}. No-op (calls
-	 * through unchanged) when Reflex isn't enabled + device-supported.
+	 * Reserve enough swapchain images for the FG batch within surface limits. Chain Reflex latency state
+	 * into pNext without disturbing any existing extension chain; Vulkan consumes this stack data in-call.
 	 */
 	@Redirect(method = "configure",
 			at = @At(value = "INVOKE",
 					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
 	private int caustica$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
 			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
-		if (!RtDeviceBringup.reflexEnabled()) {
-			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
-		}
 		try (MemoryStack stack = MemoryStack.stackPush()) {
-			VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
-			latency.pNext(pCreateInfo.pNext());
-			latency.latencyModeEnable(true);
-			pCreateInfo.pNext(latency.address());
+			if (CausticaConfig.Rt.ENABLED.value()) {
+				VkSurfaceCapabilitiesKHR caps = VkSurfaceCapabilitiesKHR.calloc(stack);
+				int result = KHRSurface.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device.getPhysicalDevice(),
+						pCreateInfo.surface(), caps);
+				if (result != VK10.VK_SUCCESS) {
+					return result;
+				}
+				caustica$fgSurfaceMinimumImages = caps.minImageCount();
+				RtDlssFg.INSTANCE.setSurfaceFrameLimits(caps.minImageCount(), caps.maxImageCount());
+				if (RtDlssFg.enabled()) {
+					// All generated images are acquired before MC submits or presents the real image.
+					// Reserve the surface minimum as well, or a high MFG count can wait on its own batch.
+					pCreateInfo.minImageCount(DlssSettings.requiredSwapchainImages(pCreateInfo.minImageCount(),
+							caps.minImageCount(), caps.maxImageCount(), RtDlssFg.INSTANCE.plannedMultiFrameCount()));
+				}
+			}
+			if (RtDeviceBringup.reflexEnabled()) {
+				VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
+				latency.pNext(pCreateInfo.pNext());
+				latency.latencyModeEnable(true);
+				pCreateInfo.pNext(latency.address());
+			}
 			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
 		}
 	}
@@ -256,6 +270,9 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Inject(method = "configure", at = @At("TAIL"))
 	private void caustica$applySwapchainExtensionState(GpuSurface.Configuration config, CallbackInfo ci) {
 		caustica$applyHdrMetadataIfNeeded();
+		if (CausticaConfig.Rt.ENABLED.value()) {
+			RtDlssFg.INSTANCE.setSwapchainFrameLimit(this.swapchainImages.size(), caustica$fgSurfaceMinimumImages);
+		}
 		if (RtDeviceBringup.reflexEnabled()) {
 			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
 		}

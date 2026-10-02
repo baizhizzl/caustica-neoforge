@@ -52,9 +52,9 @@
 	"caustica.options.rt.frameGeneration": "DLSS Frame Generation",
 	"caustica.options.rt.frameGeneration.unavailableValue": "Unavailable",
 	"caustica.options.rt.frameGeneration.tooltip": "Insert generated frames between rendered frames. Requires a compatible GPU and driver. Enable V-Sync so the display presents every generated frame. Changes apply without restarting.",
-	"caustica.options.rt.frameGeneration.unavailable": "Frame Generation is unavailable with the current GPU, driver or graphics backend. Check the game log for NGX details; these controls are disabled for this session.",
+	"caustica.options.rt.frameGeneration.unavailable": "Frame Generation is unavailable with the current GPU, driver, graphics backend or window system. Check the game log for NGX details; these controls are disabled for this session.",
 	"caustica.options.rt.frameGenerationMultiplier": "Frame Generation Multiplier",
-	"caustica.options.rt.frameGenerationMultiplier.tooltip": "2x is one generated frame plus one rendered frame; 6x is five generated frames plus one rendered frame. Only GPU/driver-supported multipliers are offered, up to 6x. This does not increase the game's simulation rate.",
+	"caustica.options.rt.frameGenerationMultiplier.tooltip": "2x is one generated frame plus one rendered frame; 6x is five generated frames plus one rendered frame. Only GPU/driver-supported multipliers that fit the window system are offered, up to 6x. This does not increase the game's simulation rate.",
 
 	"caustica.options.rt.dlssQuality": "DLSS Quality",
 	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction quality mode. Lower-quality modes render fewer pixels and upscale more aggressively for higher framerates; higher-quality modes render more pixels for a sharper image. Only affects the image when DLSS Ray Reconstruction is enabled.",

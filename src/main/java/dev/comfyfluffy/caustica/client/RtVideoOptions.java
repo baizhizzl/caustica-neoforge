@@ -203,7 +203,7 @@ public final class RtVideoOptions {
             setting.value(),
             enabled -> {
                 setting.set(enabled);
-                RtDlssFg.INSTANCE.requestHistoryReset();
+                applyFrameGenerationChange();
             });
     }
 
@@ -219,8 +219,17 @@ public final class RtVideoOptions {
             DlssSettings.generatedFrameCount(setting.value(), counts.getLast()),
             count -> {
                 setting.set(count);
-                RtDlssFg.INSTANCE.requestHistoryReset();
+                applyFrameGenerationChange();
             });
+    }
+
+    private static void applyFrameGenerationChange() {
+        RtDlssFg.INSTANCE.requestHistoryReset();
+        Minecraft minecraft = Minecraft.getInstance();
+        if (minecraft != null) {
+            // Resize only at the next safe frame boundary, not while an image is acquired.
+            minecraft.invalidateSurfaceConfiguration();
+        }
     }
 
     private static OptionInstance<Integer> dlssQuality() {
