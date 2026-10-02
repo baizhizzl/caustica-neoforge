@@ -27,6 +27,7 @@ import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 
 import static dev.comfyfluffy.caustica.rt.RtContext.check;
+import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 
 /**
  * Compute pass that composites the vanilla UI overlay (premultiplied sRGB rgba8, sampled) over the
@@ -35,8 +36,8 @@ import static dev.comfyfluffy.caustica.rt.RtContext.check;
  * blitted to the PQ swapchain.
  */
 public final class RtHdrCompositePipeline {
-    private static final String SHADER_DIR = "/caustica/rt/";
-    private static final int PUSH_BYTES = Float.BYTES; // float paperWhiteNits
+    private static final String SHADER_DIR = "/caustica/shaders/pipelines/hdr_composite/";
+    private static final int PUSH_BYTES = Float.BYTES; // float uiNits
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
@@ -61,10 +62,10 @@ public final class RtHdrCompositePipeline {
     public static RtHdrCompositePipeline create(RtContext ctx) {
         VkDevice vk = ctx.vk();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(2, stack);
-            binds.get(0).binding(0).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+            VkDescriptorSetLayoutBinding.Buffer binds = VkDescriptorSetLayoutBinding.calloc(PRESENT_BINDING_COUNT, stack);
+            binds.get(PRESENT_OUTPUT).binding(PRESENT_OUTPUT).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
-            binds.get(1).binding(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
+            binds.get(PRESENT_SOURCE).binding(PRESENT_SOURCE).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                     .descriptorCount(1).stageFlags(VK10.VK_SHADER_STAGE_COMPUTE_BIT);
 
             VkDescriptorSetLayoutCreateInfo dslci = VkDescriptorSetLayoutCreateInfo.calloc(stack).sType$Default().pBindings(binds);
@@ -96,7 +97,7 @@ public final class RtHdrCompositePipeline {
             long layout = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_PIPELINE_LAYOUT, layout, "hdr ui composite pipeline layout");
 
-            long module = loadModule(vk, stack, "hdr_ui_composite.comp.spv");
+            long module = loadModule(vk, stack, "main.comp.spv");
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_SHADER_MODULE, module, "hdr ui composite shader module");
             VkPipelineShaderStageCreateInfo stage = VkPipelineShaderStageCreateInfo.calloc(stack).sType$Default()
                     .stage(VK10.VK_SHADER_STAGE_COMPUTE_BIT).module(module).pName(stack.UTF8("main"));
@@ -123,10 +124,10 @@ public final class RtHdrCompositePipeline {
             VkDescriptorImageInfo.Buffer overlayInfo = VkDescriptorImageInfo.calloc(1, stack);
             overlayInfo.get(0).imageView(overlayImageView).sampler(sampler).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
 
-            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(2, stack);
-            writes.get(0).sType$Default().dstSet(descriptorSet).dstBinding(0)
+            VkWriteDescriptorSet.Buffer writes = VkWriteDescriptorSet.calloc(PRESENT_BINDING_COUNT, stack);
+            writes.get(PRESENT_OUTPUT).sType$Default().dstSet(descriptorSet).dstBinding(PRESENT_OUTPUT)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).pImageInfo(hdrInfo);
-            writes.get(1).sType$Default().dstSet(descriptorSet).dstBinding(1)
+            writes.get(PRESENT_SOURCE).sType$Default().dstSet(descriptorSet).dstBinding(PRESENT_SOURCE)
                     .descriptorCount(1).descriptorType(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).pImageInfo(overlayInfo);
             VK10.vkUpdateDescriptorSets(ctx.vk(), writes, null);
         }
@@ -135,12 +136,12 @@ public final class RtHdrCompositePipeline {
         boundSampler = sampler;
     }
 
-    public void dispatch(VkCommandBuffer cmd, int width, int height, float paperWhiteNits) {
+    public void dispatch(VkCommandBuffer cmd, int width, int height, float uiNits) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "hdr ui composite")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
             ByteBuffer push = stack.malloc(PUSH_BYTES);
-            push.putFloat(0, paperWhiteNits);
+            push.putFloat(0, uiNits);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

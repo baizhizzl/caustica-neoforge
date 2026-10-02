@@ -114,7 +114,7 @@ final class RtCuboidEmitter {
         }
     }
 
-    /** A2's verified direct-polygon path retained for nonstandard but valid cube topology. */
+    /** Direct-polygon path for nonstandard but valid cube topology. */
     private void emitGenericCube(ModelPart.Cube cube, PoseStack.Pose pose,
                                  RtEntityCapture capture, int color) {
         Matrix4f matrix = pose.pose();

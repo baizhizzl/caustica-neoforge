@@ -20,7 +20,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
  * Custom fluid mesher used in place of vanilla {@link FluidRenderer} for every fluid in the RT terrain
- * pipeline. Adapted from {@code FluidRenderer.tesselate} (26.2), keeping its corner-height averaging
+ * pipeline. Adapted from {@code FluidRenderer.tesselate}, keeping its corner-height averaging
  * and flow-direction UVs, but fixing three habits that are invisible in a backface-culled rasterizer
  * and actively wrong once every emitted triangle is a real path-traced dielectric interface:
  *

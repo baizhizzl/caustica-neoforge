@@ -10,6 +10,12 @@ public record RtMaterialDesc(
         float ior,
         float transmission,
         EmissionSource emissionSource,
+        /**
+         * Final HDR emitting-surface luminance in cd/m²: the look-package block baseline, replaced by
+         * a resource-pack {@code emission.strength_cd_m2} value when present.
+         * 0 when {@code emissionSource == NONE}. Applied uniformly regardless of source — LabPBR,
+         * heuristic-mask, or state-uniform all get the same baseline unless absolutely overridden.
+         */
         float emissionStrength,
         EmissionSummary emissionSummary
 ) {
@@ -22,7 +28,6 @@ public record RtMaterialDesc(
 
     public enum EmissionSource {
         NONE,
-        OVERRIDE,
         LAB_PBR,
         HEURISTIC_MASK,
         STATE_UNIFORM

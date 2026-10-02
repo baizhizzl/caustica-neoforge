@@ -1,7 +1,8 @@
 package dev.comfyfluffy.caustica.rt;
 
-import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
-import com.mojang.blaze3d.vulkan.VulkanQueue;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+import com.mojang.renderpearl.backend.vulkan.VulkanQueue;
 import org.lwjgl.PointerBuffer;
 import org.lwjgl.system.MemoryStack;
 import org.lwjgl.vulkan.VK10;
@@ -55,6 +56,8 @@ public final class RtGpuExecutor {
     private final AtomicLong nextGraphicsValue = new AtomicLong();
     private final AtomicLong latestGraphicsUseValue = new AtomicLong();
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
+    private final Object submissionLock = new Object();
+    private long submittedBuildValue;
     private final Thread thread;
     private long commandPool;
     private volatile boolean closed;
@@ -96,37 +99,48 @@ public final class RtGpuExecutor {
         return build;
     }
 
-    /** Mark a completed build visible to terrain publication; the next graphics terrain use waits on it. */
+    /** Mark a build visible to publication; the next graphics frame use waits on it. */
     public void markPublished(Build build) {
+        assertRenderThread();
         pendingPublishWaitValue.accumulateAndGet(build.value, Math::max);
     }
 
-    /** Attach the required compute-build wait immediately before the RT command buffer is enqueued. */
-    public long beginGraphicsTerrainUse(VulkanCommandEncoder encoder) {
+    /** Attach published-build waits and reserve the completion token shared by this frame's RT resources. */
+    public GraphicsUse beginGraphicsUse(VulkanCommandEncoder encoder) {
+        assertRenderThread();
         checkExecutorFailure();
         long waitValue = pendingPublishWaitValue.get();
         if (waitValue != 0L) {
+            // vkQueuePresentKHR requires every transitive signal dependency of its binary wait to have
+            // already been submitted. A Build is assigned its timeline value when queued on this Java
+            // executor, so do not expose that future value to the graphics/present chain prematurely.
+            awaitBuildSubmission(waitValue);
             encoder.waitSemaphore(buildTimeline, waitValue, TERRAIN_READ_STAGES);
         }
-        return nextGraphicsValue.incrementAndGet();
+        return new GraphicsUse(nextGraphicsValue.incrementAndGet());
     }
 
-    /** Signal completion after the final terrain/TLAS consumer and commit the value for retirement. */
-    public void endGraphicsTerrainUse(VulkanCommandEncoder encoder, long graphicsValue) {
-        encoder.signalSemaphore(graphicsTimeline, graphicsValue, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
-        latestGraphicsUseValue.accumulateAndGet(graphicsValue, Math::max);
+    /** Signal the frame token after its final terrain, TLAS, entity, and overlay consumer. */
+    public void endGraphicsUse(VulkanCommandEncoder encoder, GraphicsUse graphicsUse) {
+        assertRenderThread();
+        encoder.signalSemaphore(graphicsTimeline, graphicsUse.value, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
+        latestGraphicsUseValue.accumulateAndGet(graphicsUse.value, Math::max);
         if (hasPendingDestroys()) {
             jobs.offer(WAKE);
         }
     }
 
-    public long completedGraphicsValue() {
-        return queryTimeline(graphicsTimeline);
+    /** Create a waiter that shares one completed-value snapshot across several resource reuse checks. */
+    public GraphicsUseWaiter graphicsUseWaiter() {
+        assertRenderThread();
+        checkExecutorFailure();
+        return new GraphicsUseWaiter(queryTimeline(graphicsTimeline));
     }
 
-    /** Latest recorded graphics submission that can reference the currently published terrain state. */
-    public long latestGraphicsUseValue() {
-        return latestGraphicsUseValue.get();
+    /** Latest recorded frame token that can reference currently published RT state. */
+    public GraphicsUse latestGraphicsUse() {
+        assertRenderThread();
+        return new GraphicsUse(latestGraphicsUseValue.get());
     }
 
     /** Rethrow a latched executor failure on the calling thread. */
@@ -134,7 +148,18 @@ public final class RtGpuExecutor {
         checkExecutorFailure();
     }
 
-    public void enqueueDestroyAfterGraphics(long lastUseValue, Runnable destroy) {
+    /** Destroy an owner once the specified frame token has completed. */
+    public void retireAfterGraphics(GraphicsUse lastUse, Runnable destroy) {
+        enqueueDestroyAfterGraphicsValue(lastUse.value, destroy);
+    }
+
+    /** Destroy a tracked owner once its exact last frame use has completed. */
+    public void retireAfterGraphics(TrackedGraphicsUse trackedUse, Runnable destroy) {
+        assertRenderThread();
+        enqueueDestroyAfterGraphicsValue(trackedUse.value, destroy);
+    }
+
+    private void enqueueDestroyAfterGraphicsValue(long lastUseValue, Runnable destroy) {
         checkExecutorFailure();
         synchronized (destroyJobs) {
             destroyJobs.add(new DestroyJob(lastUseValue, destroy));
@@ -143,8 +168,8 @@ public final class RtGpuExecutor {
     }
 
     /** Queue destruction of a completed build result that was never visible to graphics. */
-    public void enqueueDestroyUnpublished(Runnable destroy) {
-        enqueueDestroyAfterGraphics(0L, destroy);
+    public void retireUnpublished(Runnable destroy) {
+        enqueueDestroyAfterGraphicsValue(0L, destroy);
     }
 
     public boolean hasPendingDestroys() {
@@ -314,6 +339,9 @@ public final class RtGpuExecutor {
         } else if (executorFailure != failure) {
             executorFailure.addSuppressed(failure);
         }
+        synchronized (submissionLock) {
+            submissionLock.notifyAll();
+        }
     }
 
     private boolean processDestroyJobsSafely() {
@@ -333,11 +361,15 @@ public final class RtGpuExecutor {
         }
     }
 
+    private static void assertRenderThread() {
+        RenderSystem.assertOnRenderThread();
+    }
+
     private void processDestroyJobs() {
         if (!hasPendingDestroys()) {
             return;
         }
-        long completed = completedGraphicsValue();
+        long completed = queryTimeline(graphicsTimeline);
         synchronized (destroyJobs) {
             Iterator<DestroyJob> it = destroyJobs.iterator();
             while (it.hasNext()) {
@@ -376,7 +408,10 @@ public final class RtGpuExecutor {
                     .sType$Default().commandBuffer(cmd);
             VkSemaphoreSubmitInfo.Buffer signal = VkSemaphoreSubmitInfo.calloc(1, stack)
                     .sType$Default().semaphore(buildTimeline).value(signalValue)
-                    .stageMask(VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR);
+                    // Jobs also contain pure transfer uploads (for example the device-local light
+                    // proposal tables). Signal only after every command in the batch, not merely the
+                    // AS-build stage, so a graphics wait cannot overtake such a copy.
+                    .stageMask(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR);
             VkSubmitInfo2.Buffer submit = VkSubmitInfo2.calloc(1, stack).sType$Default()
                     .pCommandBufferInfos(command).pSignalSemaphoreInfos(signal);
             VulkanDiagnostics.noteQueueSubmission(computeQueue.vkQueue(), "Caustica compute queue");
@@ -385,6 +420,10 @@ public final class RtGpuExecutor {
                         computeQueue.vkQueue(), submit, 0L), "vkQueueSubmit2KHR(RT GPU executor)");
             }
             submitted = true;
+            synchronized (submissionLock) {
+                submittedBuildValue = Math.max(submittedBuildValue, signalValue);
+                submissionLock.notifyAll();
+            }
             VulkanDiagnostics.setInFlight("async-compute",
                     "submitted builds=" + firstValue + ".." + signalValue + " batch=" + batch.size());
             waitTimeline(buildTimeline, signalValue);
@@ -448,6 +487,20 @@ public final class RtGpuExecutor {
         }
     }
 
+    private void awaitBuildSubmission(long value) {
+        synchronized (submissionLock) {
+            while (submittedBuildValue < value && executorFailure == null) {
+                try {
+                    submissionLock.wait();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IllegalStateException("Interrupted waiting for RT GPU build submission " + value, e);
+                }
+            }
+        }
+        checkExecutorFailure();
+    }
+
     public static final class Build {
         private final long value;
 
@@ -457,6 +510,50 @@ public final class RtGpuExecutor {
 
         public long value() {
             return value;
+        }
+    }
+
+    /** Immutable reservation for one graphics frame's completion on the shared RT graphics timeline. */
+    public static final class GraphicsUse {
+        private final long value;
+
+        private GraphicsUse(long value) {
+            this.value = value;
+        }
+    }
+
+    /** Mutable last-use owner embedded in reusable or asynchronously retired GPU resource slots. */
+    public static final class TrackedGraphicsUse {
+        private long value;
+
+        public void mark(GraphicsUse graphicsUse) {
+            assertRenderThread();
+            value = Math.max(value, graphicsUse.value);
+        }
+    }
+
+    /**
+     * Reuses one timeline query while awaiting several tracked owners. Timeline values are monotonic, so
+     * completing a newer value also proves every older value complete.
+     */
+    public final class GraphicsUseWaiter {
+        private long completedValue;
+
+        private GraphicsUseWaiter(long completedValue) {
+            this.completedValue = completedValue;
+        }
+
+        /** Return true only when this call had to issue a host wait. */
+        public boolean await(TrackedGraphicsUse trackedUse) {
+            assertRenderThread();
+            long requiredValue = trackedUse.value;
+            if (requiredValue <= completedValue) {
+                return false;
+            }
+            checkExecutorFailure();
+            waitTimeline(graphicsTimeline, requiredValue);
+            completedValue = requiredValue;
+            return true;
         }
     }
 

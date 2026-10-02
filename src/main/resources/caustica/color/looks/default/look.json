@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 4,
+  "id": "default",
+  "packageVersion": 4,
+  "exposure": {
+    "minEv": -15.0,
+    "maxEv": -2.0,
+    "curve": "-2:-3, 2:-2.0, 8:0.0, 15:1.0"
+  },
+  "lmt": {
+    "resource": "lmt.bin"
+  },
+  "bloom": {
+    "strength": 0.02,
+    "thresholdSceneLinear": 2.0,
+    "softKneeFraction": 0.25,
+    "radius": 1.0,
+    "levels": 6
+  },
+  "lighting": {
+    "sunIlluminanceLux": 128000.0,
+    "moonIlluminanceLux": 5.0,
+    "blockEmissionLuminanceCdM2": 2000.0,
+    "nightAirglowLuminanceCdM2": 0.002,
+    "starLuminanceCdM2": 10.0,
+    "moonPhaseFixedFraction": 0.1
+  },
+  "sky": {
+    "sunNoonSouthTiltDegrees": 30.0,
+    "sunAngularRadiusDegrees": 0.6,
+    "moonAngularRadiusDegrees": 1.5,
+    "sunDiscHalfAngleDegrees": 16.7,
+    "moonDiscHalfAngleDegrees": 11.31,
+    "groundAlbedo": 0.1,
+    "horizonSoftenDegrees": 15.0
+  }
+}

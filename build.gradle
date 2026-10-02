@@ -1,11 +1,12 @@
 import javax.inject.Inject
 import org.gradle.process.ExecOperations
 import dev.comfyfluffy.caustica.build.GenerateShaderRecords
+import dev.comfyfluffy.caustica.build.GenerateRtBindings
 
 plugins {
 	id "java-library"
 	id "maven-publish"
-	id "net.neoforged.moddev" version "2.0.143"
+	id "net.neoforged.moddev" version "2.0.148"
 	id "idea"
 }
 
@@ -17,7 +18,11 @@ base {
 }
 
 repositories {
-	mavenCentral()
+    mavenCentral()
+    exclusiveContent {
+        forRepository { mavenCentral() }
+        filter { includeGroup("org.ow2.asm") }
+    }
 }
 
 neoForge {
@@ -49,12 +54,6 @@ neoForge {
 		}
 	}
 
-	// Wire the NeoForge/Minecraft artifacts into the test source set so unit tests
-	// (src/test/java) can compile against Minecraft classes (Identifier, Gson, fastutil, ...).
-	unitTest {
-		enable()
-		testedMod = mods.caustica
-	}
 }
 
 dependencies {
@@ -76,7 +75,7 @@ processResources {
 	inputs.property "mod_name", project.mod_name
 	inputs.property "mod_license", project.mod_license
 	inputs.property "mod_version", project.mod_version
-	inputs.property "neoforge_version", project.neoforge_version
+	inputs.property "neoforge_version_range", project.neoforge_version_range
 	inputs.property "minecraft_version_range", project.minecraft_version_range
 
 	filesMatching("META-INF/neoforge.mods.toml") {
@@ -84,11 +83,13 @@ processResources {
 	}
 }
 
-// Compile GLSL and Slang sources to SPIR-V at build time instead of tracking binaries. Requires
-// glslangValidator, slangc, and spirv-val from the Vulkan SDK or PATH.
-def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /caustica/rt/*.spv
+// Compile Slang sources to SPIR-V at build time instead of tracking binaries. Requires slangc and
+// spirv-val from the Vulkan SDK or PATH.
+def shaderGenRoot = layout.buildDirectory.dir("generated/shaders") // classpath root -> /caustica/shaders/*.spv
 
 def resolveVulkanTool = { String name ->
+    def override = System.getenv("CAUSTICA_${name.toUpperCase(java.util.Locale.ROOT).replace('-', '_')}")
+    if (override) return override
 	def exe = org.gradle.internal.os.OperatingSystem.current().windows ? ".exe" : ""
 	def sdk = System.getenv("VULKAN_SDK")
 	if (sdk) {
@@ -103,46 +104,40 @@ def resolveVulkanTool = { String name ->
 abstract class CompileShaders extends DefaultTask {
 	@InputDirectory abstract DirectoryProperty getSrcDir()
 	@OutputDirectory abstract DirectoryProperty getOutDir()
-	@Input abstract Property<String> getGlslang()
 	@Input abstract Property<String> getSpirvVal()
 	@Input abstract Property<String> getSlangc()
 
 	@Inject abstract ExecOperations getExecOps()
 
-	// world.rgen.slang → "world.rgen"; world.rahit → "world.rahit" (GLSL names pass through).
-	static String outBase(File src) {
-		return src.name.endsWith(".slang") ? src.name.substring(0, src.name.length() - 6) : src.name
+	// pipelines/display/main.comp.slang -> pipelines/display/main.comp.
+	static String outBase(File root, File src) {
+		def relative = root.toPath().relativize(src.toPath()).toString().replace('\\', '/')
+		return relative.endsWith(".slang") ? relative.substring(0, relative.length() - 6) : relative
 	}
 
 	@TaskAction
 	void compile() {
 		def outDirFile = outDir.get().asFile
-		// Slang stages are named <name>.<stage>.slang (world.rahit.slang → world.rahit.spv); module files
+		// Slang stages are named <name>.<stage>.slang (any_hit.rahit.slang -> any_hit.rahit.spv); module files
 		// like world_common.slang match no stage glob and are picked up only via `import`.
 		def stageIncludes = ["rgen", "rchit", "rahit", "rmiss", "rcall", "comp", "vert", "frag"]
-				.collectMany { stage -> ["**/*.${stage}", "**/*.${stage}.slang"] }
+				.collect { stage -> "**/*.${stage}.slang" }
 		def validate = { File spv ->
 			execOps.exec {
 				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath
 			}
 		}
-		def compileOne = { File src, File spv, List<String> defines ->
-			execOps.exec {
-				// -g (OpLine/OpSource debug info), not -gVS: the NonSemantic.Shader.DebugInfo form (-gVS)
-				// emits OpExtInstWithForwardRefsKHR (SPV_KHR_relaxed_extended_instruction), which trips a
-				// validation error unless the shaderRelaxedExtendedInstruction device feature is enabled.
-				// -g keeps source-level debug info for Nsight/RenderDoc without needing that extension.
-				commandLine([glslang.get(), "-V", "--target-env", "vulkan1.2", "-g"] + defines
-						+ [src.absolutePath, "-o", spv.absolutePath])
-			}
-			validate(spv)
-		}
+		def includeDirs = srcDir.get().asFileTree.matching { include "**/*.slang" }.files
+				.collect { it.parentFile }.unique().sort { it.absolutePath }
 		def compileOneSlang = { File src, File spv, List<String> extra ->
+			spv.parentFile.mkdirs()
+			def includes = [src.parentFile] + includeDirs.findAll { it != src.parentFile }
 			execOps.exec {
 				// Embed Slang source and line mappings in SPIR-V for RenderDoc/Nsight source debugging.
 				commandLine([slangc.get(), src.absolutePath, "-target", "spirv",
 						"-profile", "spirv_1_5", "-matrix-layout-column-major",
-						"-warnings-as-errors", "all", "-warnings-disable", "41012", "-g"] + extra
+						"-warnings-as-errors", "all", "-warnings-disable", "41012", "-g"]
+						+ includes.collectMany { ["-I", it.absolutePath] } + extra
 						+ ["-o", spv.absolutePath])
 			}
 			validate(spv)
@@ -151,7 +146,7 @@ abstract class CompileShaders extends DefaultTask {
 			include stageIncludes
 		}.files.sort { it.absolutePath }
 		def duplicateOutputs = shaderFiles
-				.groupBy { "${outBase(it)}.spv" }
+				.groupBy { "${outBase(srcDir.get().asFile, it)}.spv" }
 				.findAll { entry -> entry.value.size() > 1 }
 		if (!duplicateOutputs.isEmpty()) {
 			throw new GradleException("Duplicate shader output name(s): "
@@ -165,24 +160,29 @@ abstract class CompileShaders extends DefaultTask {
 		}
 		scratchDir.mkdirs()
 		shaderFiles.each { src ->
-			def base = outBase(src)
+			def base = outBase(srcDir.get().asFile, src)
 			def spv = new File(scratchDir, "${base}.spv")
-			if (src.name.endsWith(".slang")) {
-				// Build both SER encodings from one source; RtDeviceBringup selects the supported variant.
-				compileOneSlang(src, spv, base == "world.rgen"
-						? ["-capability", "spvShaderInvocationReorderEXT"] : [])
-				if (base == "world.rgen") {
-					compileOneSlang(src, new File(scratchDir, "world_nv.rgen.spv"),
-							["-capability", "spvShaderInvocationReorderNV"])
-				}
+			def worldIndirectRaygen = base == "pipelines/world/indirect.rgen"
+			if (worldIndirectRaygen) {
+				// Keep a capability-free TraceRay fallback for devices without EXT SER, and
+				// publish the reordered variant separately when the extension is available.
+				compileOneSlang(src, spv, [])
+				compileOneSlang(src, new File(scratchDir, "pipelines/world/indirect_ser.rgen.spv"),
+						["-DCAUSTICA_ENABLE_EXT_SER", "-capability", "spvShaderInvocationReorderEXT"])
 			} else {
-				compileOne(src, spv, [])
+				// Pass A intentionally uses ordinary TraceRay.
+				compileOneSlang(src, spv, [])
 			}
 		}
+		if (outDirFile.exists() && !outDirFile.deleteDir()) {
+			throw new GradleException("failed to clear generated shaders under ${outDirFile}")
+		}
 		outDirFile.mkdirs()
-		outDirFile.listFiles().findAll { it.isFile() && it.name.endsWith(".spv") }.each { it.delete() }
-		scratchDir.listFiles().findAll { it.isFile() }.each { src ->
-			java.nio.file.Files.move(src.toPath(), new File(outDirFile, src.name).toPath(),
+		scratchDir.eachFileRecurse(groovy.io.FileType.FILES) { src ->
+			def relative = scratchDir.toPath().relativize(src.toPath())
+			def destination = outDirFile.toPath().resolve(relative).toFile()
+			destination.parentFile.mkdirs()
+			java.nio.file.Files.move(src.toPath(), destination.toPath(),
 					java.nio.file.StandardCopyOption.REPLACE_EXISTING)
 		}
 	}
@@ -192,8 +192,7 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 	group = "build"
 	description = "Compiles shaders/** shader sources to SPIR-V and validates them."
 	srcDir = file("shaders")
-	outDir = layout.buildDirectory.dir("generated/shaders/caustica/rt")
-	glslang = resolveVulkanTool("glslangValidator")
+	outDir = layout.buildDirectory.dir("generated/shaders/caustica/shaders")
 	spirvVal = resolveVulkanTool("spirv-val")
 	slangc = resolveVulkanTool("slangc")
 }
@@ -201,22 +200,115 @@ def compileShaders = tasks.register("compileShaders", CompileShaders) {
 def generateShaderRecords = tasks.register("generateShaderRecords", GenerateShaderRecords) {
 	group = "build"
 	description = "Generates typed Java shader records and serializers from Slang reflection."
-	worldSourceDir = file("shaders/world")
-	probeSource = file("shaders/world/world_layout_probe.slang")
+	shaderRoot = file("shaders")
+	probeSource = file("shaders/layout/layout_probe.slang")
 	slangc = resolveVulkanTool("slangc")
 	spirvVal = resolveVulkanTool("spirv-val")
 	outDir = layout.buildDirectory.dir("generated/sources/shaderRecords")
 }
 
+def rtBindingsGenRoot = layout.buildDirectory.dir("generated/sources/rtBindings")
+def generateRtBindings = tasks.register("generateRtBindings", GenerateRtBindings) {
+	group = "build"
+	description = "Generates Java descriptor bindings from Slang reflection."
+	shaderRoot = file("shaders")
+	slangc = resolveVulkanTool("slangc")
+	outDir = rtBindingsGenRoot
+}
+
+// These are CPU-side unit tests, not a launched Minecraft integration test. Reuse the target game's
+// classes without creating a client run or downloading textures/sounds that the tests never consume.
+sourceSets.test {
+    compileClasspath += sourceSets.main.compileClasspath
+    runtimeClasspath += sourceSets.main.runtimeClasspath
+}
+
 tasks.named("test", Test) {
-	useJUnitPlatform()
+    useJUnitPlatform()
 }
 
 sourceSets.main.java.srcDir(files(layout.buildDirectory.dir("generated/sources/shaderRecords")).builtBy(generateShaderRecords))
+sourceSets.main.java.srcDir(files(rtBindingsGenRoot).builtBy(generateRtBindings))
 
 // Emit the .spv into the main resources so they land in the jar / on the runClient classpath at the
-// same /caustica/rt/ path the loader (RtPipeline/RtBlendPipeline) reads. builtBy wires the dependency.
+// same /caustica/shaders/ path the pipeline loaders read. builtBy wires the dependency.
 sourceSets.main.resources.srcDir(files(shaderGenRoot).builtBy(compileShaders))
+
+
+// Local builds use the checked-in natives. CI explicitly selects platforms to replace them with
+// freshly built shims and the selected DLSS SDK libraries; missing inputs fail before publishing.
+if (providers.gradleProperty("ngxPlatforms").isPresent()) {
+    def platforms = [
+        "windows-x64": [shim: "ngxshim.dll", vendorDir: "Windows_x86_64",
+                        vendor: ["nvngx_dlssd.dll", "nvngx_dlssg.dll"]],
+        "linux-x64": [shim: "libngxshim.so", vendorDir: "Linux_x86_64",
+                      vendor: ["libnvidia-ngx-dlssd.so*", "libnvidia-ngx-dlssg.so*"]]
+    ]
+    def selected = providers.gradleProperty("ngxPlatforms").get().split(",")
+            .collect { it.trim() }.findAll { !it.isEmpty() }.unique()
+    if (selected == ["all"]) selected = platforms.keySet().toList()
+    if (selected.empty || selected.any { !platforms.containsKey(it) }) {
+        throw new GradleException("ngxPlatforms must select windows-x64, linux-x64 or all")
+    }
+    def shimConfig = providers.gradleProperty("ngxShimConfig").getOrElse("release")
+    def vendorConfig = providers.gradleProperty("ngxVendorConfig").getOrElse("rel")
+    if (!(shimConfig in ["debug", "release"]) || !(vendorConfig in ["dev", "rel"])) {
+        throw new GradleException("Invalid NGX shim/vendor configuration")
+    }
+    def sdkPath = providers.environmentVariable("DLSS_SDK").orNull
+    if (!sdkPath) throw new GradleException("DLSS_SDK is required when ngxPlatforms is set")
+    def shimRoot = layout.buildDirectory.dir("native/ngx_shim/${shimConfig}")
+    def nativeGenRoot = layout.buildDirectory.dir("generated/natives")
+    def inputsByPlatform = selected.collectEntries { name ->
+        def platform = platforms[name]
+        [(name): [shim: shimRoot.get().file(platform.shim).asFile,
+                  vendor: platform.vendor.collect { pattern ->
+                      fileTree(new File(sdkPath, "lib/${platform.vendorDir}/${vendorConfig}")) {
+                          include(pattern)
+                      }
+                  }]]
+    }
+    def bundleNgxNatives = tasks.register("bundleNgxNatives") {
+        group = "build"
+        description = "Bundle explicitly selected NGX shim and DLSS native libraries."
+        inputs.property("selectedPlatforms", selected)
+        inputs.property("shimConfig", shimConfig)
+        inputs.property("vendorConfig", vendorConfig)
+        inputsByPlatform.each { name, nativeInputs ->
+            inputs.files(nativeInputs.shim).withPropertyName("${name}.shim")
+            inputs.files(nativeInputs.vendor).withPropertyName("${name}.vendor")
+        }
+        outputs.dir(nativeGenRoot)
+        doLast {
+            def missing = []
+            inputsByPlatform.each { name, nativeInputs ->
+                if (!nativeInputs.shim.isFile()) missing.add("${name} shim: ${nativeInputs.shim}")
+                nativeInputs.vendor.each { tree ->
+                    if (tree.files.empty) missing.add("${name} DLSS SDK library: ${tree.dir} ${tree.includes}")
+                }
+            }
+            if (!missing.empty) throw new GradleException("Missing NGX inputs:\n - " + missing.join("\n - "))
+            project.sync {
+                inputsByPlatform.each { name, nativeInputs ->
+                    from(nativeInputs.shim) { into("caustica/natives/${name}") }
+                    nativeInputs.vendor.each { tree -> from(tree) { into("caustica/natives/${name}") } }
+                }
+                into(nativeGenRoot)
+            }
+        }
+    }
+    sourceSets.main.resources.srcDir(files(nativeGenRoot).builtBy(bundleNgxNatives))
+    def checkedInNatives = file("src/main/resources/caustica/natives").toPath().toAbsolutePath().normalize()
+    def omitReplacedNative = { details ->
+        def path = details.file.toPath().toAbsolutePath().normalize()
+        selected.any { name -> path.startsWith(checkedInNatives.resolve(name)) }
+    }
+    tasks.named("processResources") { exclude(omitReplacedNative) }
+    tasks.withType(Jar).configureEach {
+        if (name == "sourcesJar") exclude(omitReplacedNative)
+    }
+}
+
 
 java {
 	toolchain {
@@ -231,7 +323,13 @@ tasks.withType(JavaCompile).configureEach {
 }
 
 tasks.named("jar", Jar).configure {
-	from(rootProject.files("LICENSE.md", "COPYING", "COPYING.LESSER", "THIRD_PARTY_NOTICES.md")) {
+	manifest.attributes(
+        "Implementation-Version": project.version,
+        "Caustica-Upstream-Revision": project.upstream_revision,
+        "Caustica-Minecraft-Version": project.minecraft_version,
+        "Caustica-NeoForge-Version": project.neoforge_version
+    )
+    from(rootProject.files("LICENSE.md", "COPYING", "COPYING.LESSER", "THIRD_PARTY_NOTICES.md")) {
 		into "META-INF"
 	}
 }
@@ -243,4 +341,18 @@ publishing {
 			from components.java
 		}
 	}
+}
+
+// These CPU-only invariants do not require a game launcher or GPU.
+tasks.named("check") { dependsOn(":core-tests:test", "verifyMixinTargets") }
+
+configurations { mixinAuditRuntime }
+dependencies { mixinAuditRuntime "org.ow2.asm:asm-tree:9.9" }
+tasks.register("verifyMixinTargets", JavaExec) {
+    group = "verification"
+    description = "Audit mixin selectors, members and callback signatures against target Minecraft bytecode."
+    dependsOn(tasks.named("classes"), ":core-tests:contractsClasses")
+    classpath = sourceSets.main.runtimeClasspath + configurations.mixinAuditRuntime + files("core-tests/build/classes/java/contracts")
+    mainClass = "dev.comfyfluffy.caustica.compat.VerifyMixinContracts"
+    args(file("src/main/resources/caustica.mixins.json").absolutePath)
 }

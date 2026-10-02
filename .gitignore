@@ -1,5 +1,6 @@
 .gradle/
 .idea/
+.DS_Store
 /build/
 /buildSrc/build/
 native/ngx_shim/build/
@@ -7,8 +8,14 @@ run/
 out/
 *.log
 *.class
+__pycache__/
+*.pyc
+.venv/
+.uv-cache/
 third_party/
 bin/
 prebuilt/
 tools/
 .mimosa/
+/logs
+/core-tests/build/

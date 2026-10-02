@@ -1,7 +1,7 @@
 package dev.comfyfluffy.caustica.ngx;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
@@ -200,9 +200,8 @@ public final class NgxRuntime {
 
     private static List<String> bundledFeatureLibraryNames() {
         List<String> names = new ArrayList<>();
-        // FabricLoader.getModContainer(...).getRootPaths() was the source of truth for the bundled
-        // feature libraries in dev (the run directory's resources). NeoForge loads mods from SecureJars,
-        // so enumerate the mod file's own content roots the same way.
+        // Enumerate this mod's SecureJar content roots so versioned native filenames are resolved
+        // from the same resources that provide the bundled shim in development and packaged runs.
         var modFile = ModList.get().getModFileById(CausticaMod.MOD_ID);
         if (modFile != null) {
             String nativeDir = "caustica/natives/" + PLATFORM_NATIVES.platformDir();

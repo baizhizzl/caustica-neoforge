@@ -1,7 +1,7 @@
 package dev.comfyfluffy.caustica.mixin;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.rt.RtReflex;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
@@ -14,7 +14,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
- * Reflex Phase 1b: the per-frame sleep call must run at the very start of the frame, before input
+ * The Reflex per-frame sleep call must run at the very start of the frame, before input
  * sampling/simulation. {@link Minecraft#runTick} is Minecraft's per-loop-iteration entry point (called once
  * per {@code while (running)} iteration in {@link Minecraft#run()}, right after
  * {@code RenderSystem.pollEvents()}), so its HEAD is the earliest hookable point in this codebase for that

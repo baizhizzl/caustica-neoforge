@@ -7,16 +7,7 @@ import net.minecraft.client.gui.render.GuiRenderer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 
-/**
- * Redirect the vanilla GUI/HUD into a transparent overlay target ({@code RtUiOverlay}), regardless of HDR
- * mode — in SDR the composite-back reproduces vanilla exactly, and {@code RtWorldOverlay}'s world-space
- * overlay composite runs at that same seam, so it needs to fire every frame. {@code GuiRenderer.draw} fetches the
- * destination via {@code gameRenderer.mainRenderTarget()} once and uses it for every GUI draw range (and the
- * after-blur depth clear), so redirecting that single expression routes all GUI rendering into the overlay.
- * The overlay is composited back over the world after {@code GuiRenderer.render} returns (see {@code
- * GameRendererMixin}) — its {@code draw} TAIL did not fire on in-game HUD frames. Blur is unaffected —
- * {@code GameRenderer.processBlurEffect} operates on the real main target.
- */
+/** Route GUI draws to the shared premultiplied overlay; world blur still uses the main target. */
 @Mixin(GuiRenderer.class)
 public abstract class GuiRendererMixin {
 	@ModifyExpressionValue(

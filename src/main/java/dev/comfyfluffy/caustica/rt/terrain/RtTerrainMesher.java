@@ -101,14 +101,37 @@ final class RtTerrainMesher {
         if (mesh.isEmpty()) {
             return new CpuSection(null, null);
         }
+        // RIS emitter-NEE light collection — BEFORE packing: it also stamps NEE membership into the prim
+        // records, which packSection then copies out. Only opaque + cutout can emit (glass is shaded
+        // emission-free, water never emits; lava lives in the opaque bucket).
+        float[] lights = EMPTY_LIGHTS;
+        if (CausticaConfig.Rt.Lights.RIS_CANDIDATES.value() > 0) {
+            FloatArrayList collected = new FloatArrayList();
+            float minFill = CausticaConfig.Rt.Lights.MIN_FILL_RATIO.value();
+            collectLights(collected, mesh.opaque, materials, minFill);
+            collectLights(collected, mesh.cutout, materials, minFill);
+            if (!collected.isEmpty()) {
+                lights = collected.toFloatArray();
+            }
+        }
         Geom cutout = mesh.cutoutOrEmpty();
         RtAccel.OpacityMicromapInput ommInput =
                 RtTerrainOmm.buildInput(cutout.triCount(), cutout.cornerUv.elements(),
                         cutout.ommSprites.elements(), cutout.ommSprites.size());
-        return new CpuSection(packSection(mesh), ommInput);
+        return new CpuSection(packSection(mesh, lights), ommInput);
     }
 
-    private static PackedSection packSection(SectionMesh mesh) {
+    private static final float[] EMPTY_LIGHTS = new float[0];
+
+    private static void collectLights(FloatArrayList out, Geom geom,
+                                      RtMaterialRegistry.Snapshot materials, float minFillRatio) {
+        if (geom != null && !geom.idx.isEmpty()) {
+            RtLightCollector.collectBucket(out, geom.verts, geom.prim, geom.cornerUv,
+                    geom.ommSprites.elements(), materials, minFillRatio);
+        }
+    }
+
+    private static PackedSection packSection(SectionMesh mesh, float[] lights) {
         Geom[] buckets = mesh.buckets(); // { solid, cutout, translucent, water }, indexed by RtAccel.BUCKET_*
         int vertFloats = 0, idxCount = 0, uvFloats = 0, primFloats = 0, triCount = 0;
         int[] bucketTris = new int[buckets.length];
@@ -153,7 +176,7 @@ final class RtTerrainMesher {
             vertBase += vertSize / 3;
             triAcc += bucketTris[b];
         }
-        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase);
+        return new PackedSection(positions, indices, uvs, material, bucketTris, triBase, lights);
     }
 
     private static void tessellate(BlockAndTintGetter region, BlockStateModelSet modelSet,
@@ -205,7 +228,7 @@ final class RtTerrainMesher {
                     // The extended collectParts(level, pos, ...) path is used so NeoForge model mods
                     // (NeoContinuity CTM) can emit their UV-remapped quads; vanilla models fall back to
                     // the deprecated vanilla collectParts internally (see VanillaModelQuads).
-                    VanillaModelQuads.emit(model, region, m, state, blockRandom, capture.cullTest, capture::putQuad);
+                    capture.modelQuads.emit(model, region, m, state, blockRandom, capture.cullTest, capture.quadSink);
                     capture.flushBlock(); // resolve coplanar ties (grass overlay / cross faces), then emit
                 }
             }
@@ -217,9 +240,10 @@ final class RtTerrainMesher {
     record CpuSection(PackedSection packed, RtAccel.OpacityMicromapInput opacityMicromap) {
     }
 
-    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays. */
+    /** Worker-packed terrain payload; native preparation allocates buffers and bulk-copies these arrays.
+     *  {@code lights} = packed section-local RIS light records (possibly empty), CPU-side only. */
     record PackedSection(float[] positions, int[] indices, float[] uvs, float[] material,
-                         int[] bucketTris, int[] triBase) {
+                         int[] bucketTris, int[] triBase, float[] lights) {
     }
 
 
@@ -373,6 +397,9 @@ final class RtTerrainMesher {
 
     /** Captures final vanilla model quads into the current section's mesh. */
     private static final class QuadCapture {
+        private final VanillaModelQuads.Emitter modelQuads = new VanillaModelQuads.Emitter();
+        private final VanillaModelQuads.QuadSink quadSink = this::putQuad;
+
         SectionMesh cur; // set before each block model emission
         RtMaterialRegistry.Snapshot materials;
 
@@ -797,6 +824,7 @@ final class RtTerrainMesher {
         @Override public VertexConsumer setColor(int color) { return this; }
         @Override public VertexConsumer setUv(float u, float v) { return this; }
         @Override public VertexConsumer setUv1(int u, int v) { return this; }
+        @Override public VertexConsumer setUv3(float u, float v) { return this; }
         @Override public VertexConsumer setUv2(int u, int v) { return this; }
         @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
         @Override public VertexConsumer setLineWidth(float width) { return this; }

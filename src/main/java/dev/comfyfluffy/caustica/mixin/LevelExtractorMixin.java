@@ -11,7 +11,7 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 /**
  * Forwards vanilla's block-dirty signal to the RT renderer so edited sections (and their boundary
- * neighbours) re-extract. In 26.2 the dirty methods live on {@link LevelExtractor}. We hook the
+ * neighbours) re-extract. Hook {@link LevelExtractor}'s
  * <em>block-change</em> entry points and let {@link RtTerrain#markBlocksDirty} expand to sections:
  *
  * <ul>

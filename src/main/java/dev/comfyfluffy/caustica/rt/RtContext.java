@@ -1,8 +1,8 @@
 package dev.comfyfluffy.caustica.rt;
 
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vulkan.VulkanDevice;
-import com.mojang.blaze3d.vulkan.VulkanQueue;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+import com.mojang.renderpearl.backend.vulkan.VulkanQueue;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import org.lwjgl.PointerBuffer;
@@ -261,6 +261,12 @@ public final class RtContext {
                 Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, 0L);
     }
 
+    /** Create a transient, persistently mapped buffer for synchronous GPU-to-CPU transfers. */
+    public RtBuffer createReadbackBuffer(long size, String label) {
+        return createBuffer(size, VK10.VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, label, false,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT, 0L);
+    }
+
     private RtBuffer createBuffer(long size, int usage, boolean hostVisible, String label, boolean asyncShared,
                                   int hostAccessFlags, long addressAlignment) {
         if (addressAlignment < 0L
@@ -287,10 +293,9 @@ public final class RtContext {
             LongBuffer pBuf = stack.mallocLong(1);
             PointerBuffer pAlloc = stack.mallocPointer(1);
             VmaAllocationInfo info = VmaAllocationInfo.calloc(stack);
-            int createResult = addressAlignment == 0L
-                    ? Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info)
-                    : Vma.vmaCreateBufferWithAlignment(vma, bci, aci, addressAlignment, pBuf, pAlloc, info);
-            check(createResult, addressAlignment == 0L ? "vmaCreateBuffer" : "vmaCreateBufferWithAlignment");
+            aci.minAlignment(addressAlignment);
+            int createResult = Vma.vmaCreateBuffer(vma, bci, aci, pBuf, pAlloc, info);
+            check(createResult, "vmaCreateBuffer");
             handle = pBuf.get(0);
             allocation = pAlloc.get(0);
             RtDebugLabels.nameBuffer(this, handle, label);
