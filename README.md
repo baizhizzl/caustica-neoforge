@@ -1,7 +1,7 @@
 # Caustica — NeoForge 版
 
 Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft，支持 DLSS、Bloom、HDR 和 LabPBR 材质。
-适配 Minecraft **26.3**。**0.1.1-neoforge.3** 已由维护者完成实机测试。
+适配 Minecraft **26.3**。**0.1.1-neoforge.4** 加入静态 TLAS 缓存和共享光照预采样。
 
 这是 [ComfyFluffy/Caustica](https://github.com/ComfyFluffy/Caustica) 的非官方移植。
 渲染器和着色器来自上游，本仓库负责 NeoForge 适配与移植层优化。
@@ -10,14 +10,14 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 
 ## 下载与安装
 
-**[下载 0.1.1-neoforge.3](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.3)**
+**[下载 0.1.1-neoforge.4](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.4)**
 
 | Minecraft | NeoForge | Java |
 |---|---|---|
 | 26.3 | 26.3.0.39-beta 起，限 26.3 系列 | 25 |
 
 1. 安装对应版本的 NeoForge。
-2. 下载 `caustica-neoforge-0.1.1-neoforge.3.jar`，放进实例的 `mods` 文件夹；已有旧版时先移除旧 JAR。
+2. 下载 `caustica-neoforge-0.1.1-neoforge.4.jar`，放进实例的 `mods` 文件夹；已有旧版时先移除旧 JAR。
 3. 使用 **Vulkan** 图形后端启动，在视频设置中调整渲染选项。
 
 需要支持 Vulkan 光线追踪的显卡和驱动。DLSS 需要受支持的 NVIDIA RTX 显卡；HDR 需要 HDR 显示器，并开启系统 HDR。
@@ -27,6 +27,14 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 遇到问题，请带上游戏日志、显卡型号和驱动版本，到[本仓库的 Issues](https://github.com/baizhizzl/caustica-neoforge/issues)反馈。
 
 ## 更新记录
+
+### [0.1.1-neoforge.4](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.4) · 2026-10-05
+
+- 地形没有变化时不再逐帧重写全部静态 TLAS 实例。每个 TLAS 槽位分别缓存地形输入，区块加载、卸载、世界重置和坐标重定位时才刷新；场景完全不变时可以跳过 TLAS 构建。
+- 动态实体仍逐帧比较并更新，BLAS 构建或 refit 会使所有 TLAS 槽位的缓存失效，避免复用过期包围盒。
+- 新增共享光照预采样：每帧预解码一组全局和相机附近的局部光源候选，RIS 查询共用候选池，但仍为每个查询独立取表面采样点和阴影射线。
+- 光照预采样不降低 RIS 候选数、SPP 或反弹次数，也不缓存跨帧可见性。两项优化均可通过 `caustica.rt.tlasCache` 和 `caustica.rt.lightPresampling` 单独关闭。
+- 自动测试、着色器编译和 SPIR-V 验证通过。性能切换、计数器和对照场景见 [PERFORMANCE.md](PERFORMANCE.md)。
 
 ### [0.1.1-neoforge.3](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.3) · 2026-10-02
 
