@@ -60,6 +60,8 @@ import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDebugPresentPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtBloomPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtSkyLut;
+import dev.comfyfluffy.caustica.rt.pipeline.RtLightPresampling;
+import dev.comfyfluffy.caustica.rt.pipeline.RtLightSamplePool;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDisplayPipeline;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
@@ -174,6 +176,7 @@ public final class RtComposite {
     private int pushSlot;
     private RtDisplayPipeline displayPipeline;
     private RtBloomPipeline bloomPipeline;
+    private RtLightPresampling lightPresampling;
     // Atmosphere LUTs (transmittance + multiple scattering + this frame's sky view). Device-lifetime; the
     // two static tables are baked on the first frame that records the pass.
     private RtSkyLut skyLut;
@@ -1034,6 +1037,7 @@ public final class RtComposite {
         exposure.beginFrame(graphicsUseWaiter);
         pendingGraphicsUse = graphicsUse;
         RtEntities.FrameEntities frameEntities = null;
+        RtAccel.PreparedTlas frameTlas;
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "composite command buffer");
         int debugView = debugView();
@@ -1105,11 +1109,9 @@ public final class RtComposite {
             Float4 waterAnchor = new Float4(terrain.blockX & WATER_ANCHOR_MASK,
                     terrain.blockZ & WATER_ANCHOR_MASK, priorWaterWaveTime, 0f);
 
-            // Rebuild the TLAS this frame from static section instances merged with dynamic entity
-            // instances, bind it into the pipeline's descriptor ring, record the build, then barrier so
-            // the trace sees the finished TLAS. Section BLASes are already built (async, by RtTerrain);
-            // only the cheap instance-level TLAS is rebuilt per frame. Retired terrain geometry/table
-            // generations are reclaimed by graphics-timeline completion.
+            // Terrain publications carry a revision; the TLAS ring caches that static range. Dynamic
+            // instances and inline BLAS mutations decide whether this slot needs a full BUILD.
+            // Graphics-timeline completion guards TLAS reuse and retired terrain generations.
             // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
             // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
             RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
@@ -1121,6 +1123,13 @@ public final class RtComposite {
             // resolved slot rides along with the uploadPending() call right below.
             BreakEntry[] breaking = breakingEntries(terrain);
             SkyPush sky = skyPush();
+            RtLightSamplePool.Plan lightPlan = RtLightSamplePool.plan(CausticaConfig.Rt.Lights.PRESAMPLING.value(),
+                    terrain.lightCount(), CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
+                    terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(),
+                    camX - terrain.blockX, camY - terrain.blockY, camZ - terrain.blockZ,
+                    terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16.0);
+            if (lightPlan.active() && lightPresampling == null) lightPresampling = RtLightPresampling.create(ctx);
+            long lightPoolAddress = lightPlan.active() ? lightPresampling.address() : 0L;
             new WorldPushData(
                     frameInvViewProj,
                     new Float3((float) (camX - terrain.blockX), (float) (camY - terrain.blockY),
@@ -1152,6 +1161,9 @@ public final class RtComposite {
                             terrain.lightRebaseOffsetZ(), terrain.lightInvGlobalPowerSum()),
                     new Float4(terrain.lightGridOriginX(), terrain.lightGridOriginY(), terrain.lightGridOriginZ(), 16f),
                     new Int4(terrain.lightGridDimX(), terrain.lightGridDimY(), terrain.lightGridDimZ(), 0),
+                    new Int4(lightPlan.originX(), lightPlan.originY(), lightPlan.originZ(),
+                            lightPlan.active() ? RtLightSamplePool.GLOBAL_SAMPLES : 0),
+                    new Int4(lightPlan.dimX(), lightPlan.dimY(), lightPlan.dimZ(), RtLightSamplePool.LOCAL_SAMPLES),
                     terrain.lightCount(),
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
@@ -1169,10 +1181,9 @@ public final class RtComposite {
                 }
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
             }
-            RtAccel.PreparedTlas frameTlas;
             try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
-                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), fe.dynamicInstances(), tlasRing,
-                        graphicsUse);
+                frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), terrain.staticInstancesRevision(),
+                        fe.dynamicInstances(), tlasRing, !fe.blas().isEmpty(), graphicsUse, graphicsUseWaiter);
             }
             active.setTlas(frameTlas.accel.handle, graphicsUse, graphicsUseWaiter);
             currentTlasHandle = frameTlas.accel.handle;
@@ -1191,8 +1202,16 @@ public final class RtComposite {
                     RtMaterialRegistry.INSTANCE.tableAddress(),
                     terrain.lightBufferAddress(), terrain.lightAliasBufferAddress(),
                     terrain.lightLocalAliasBufferAddress(), terrain.lightGridCellBufferAddress(),
-                    terrain.lightGridSpanBufferAddress(), continuationQueue.deviceAddress,
+                    terrain.lightGridSpanBufferAddress(), lightPoolAddress, continuationQueue.deviceAddress,
                     (int) frameCounter).write(pushConstants);
+            if (lightPlan.active()) {
+                try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.lightPresample")) {
+                    lightPresampling.record(cmd, pushBuf.deviceAddress, terrain.lightBufferAddress(),
+                            terrain.lightAliasBufferAddress(), terrain.lightLocalAliasBufferAddress(),
+                            terrain.lightGridCellBufferAddress(), terrain.lightGridSpanBufferAddress(),
+                            (int) frameCounter, lightPlan.entryCount());
+                }
+            }
             // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
             // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
             // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
@@ -1293,6 +1312,7 @@ public final class RtComposite {
             throw new IllegalStateException("vkEndCommandBuffer(rt composite) failed");
         }
         encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
+        RtAccel.acceptTlasBuild(frameTlas);
         // Do not attach a merely reserved token: failed recording may never signal it. Once execute succeeds,
         // every owner in this frame's manifest is protected through the final overlay consumer.
         RtEntities.INSTANCE.markGraphicsUse(frameEntities, graphicsUse);
@@ -1464,6 +1484,10 @@ public final class RtComposite {
         // Teardown runs after the device is idle (CLIENT_STOPPING waits), so the TLAS ring's slots are no
         // longer in flight and can be freed immediately.
         tlasRing.destroy();
+        if (lightPresampling != null) {
+            lightPresampling.destroy();
+            lightPresampling = null;
+        }
         if (RtDlssRr.enabled()) {
             RtDlssRr.INSTANCE.destroy();
         }

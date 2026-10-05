@@ -62,6 +62,7 @@ public final class RtFrameStats {
                     "entity.particles",
                     "entity.blasRecord",
                     "frame.prepareTlas",
+                    "frame.lightPresample",
                     "frame.recordTlas",
                     "frame.trace",
                     "frame.skyLut",
@@ -76,7 +77,8 @@ public final class RtFrameStats {
                     "frame.debugPresent",
                     "frame.copyOutput"
             },
-            new String[] {"sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
+            new String[] {"tlasStaticInstancesWritten", "tlasDynamicInstancesWritten", "tlasInstanceBytesFlushed",
+                    "tlasBuilds", "tlasBuildsSkipped", "lightPresampledCandidates", "sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
                     "terrainMaterialEpochRejects", "entitiesCaptured", "blockEntitiesCaptured",
                     "particlesCaptured", "refits", "entityReuse", "entityRigidFitSuccesses",
                     "entityRigidFitFailures", "vmaBufferCreates",

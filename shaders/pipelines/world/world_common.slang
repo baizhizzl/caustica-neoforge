@@ -26,6 +26,7 @@ public struct WorldPushConstants {
     public uint64_t lightLocalAliasAddr; // power aliases relative to each section's range
     public uint64_t lightGridCellAddr;   // dense light grid cell headers (0 = global proposals only)
     public uint64_t lightGridSpanAddr;   // packed weighted section spans referenced by cell headers
+    public uint64_t lightPoolAddr;       // decoded per-frame global/local proposals (0 = direct alias sampling)
     public uint64_t pathQueueAddr;       // packed primary -> indirect continuation records
     public uint frameIndex;
 };
@@ -81,6 +82,8 @@ public struct WorldPush {
     public float4   lightRebase;      // xyz hierarchy-to-current rebase, w inverse total light power
     public float4   lightGridOrigin;     // xyz minimum cell origin in rebased blocks, w cell size
     public int4     lightGridDims;       // xyz dense grid dimensions, w reserved
+    public int4     lightPoolOrigin;     // xyz first cached grid cell, w global candidate count
+    public int4     lightPoolDims;       // xyz cached cell dimensions, w candidates per cell
     public uint     lightCount;       // packed Light records in pc.lightBufAddr
     public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
     // Pre-exposure scalar applied to radiance at the outImage write
@@ -107,6 +110,33 @@ public struct Light {
     public uint   halfUzVx; // half2(U.z, V.x)
     public uint   halfVyz;  // half2(V.y, V.z)
     public uint   section;  // 10:10:10 grid-relative section coord + bit 30 normal-flip
+};
+
+// A decoded rectangle proposal. The PDF remains the original emitted-power distribution, not
+// the frequency in the finite pool. Surface points and reservoir replacement use per-query randomness.
+public struct LightCandidate {
+    public float3 pos;
+    public float area;
+    public float3 halfU;
+    public float globalPdf;
+    public float3 halfV;
+    public uint section;
+    public float3 normal;
+    public float power;
+    public float3 radiance;
+    public uint reserved1;
+};
+
+public struct LightPresamplePush {
+    public uint64_t worldPushAddr;
+    public uint64_t lightBufAddr;
+    public uint64_t lightAliasAddr;
+    public uint64_t lightLocalAliasAddr;
+    public uint64_t lightGridCellAddr;
+    public uint64_t lightGridSpanAddr;
+    public uint64_t lightPoolAddr;
+    public uint frameIndex;
+    public uint entryCount;
 };
 
 // Eight-byte Vose alias-table column. PDFs are reconstructed from the selected Light.

@@ -58,7 +58,7 @@ public final class CausticaConfig {
         @SuppressWarnings("unused")
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
-            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
+            Rt.Lights.PRESAMPLING, Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
         };
@@ -85,6 +85,8 @@ public final class CausticaConfig {
     private static void writeComments() {
         FILE.setComment("enabled",
                 " Caustica ray-tracing settings. A matching -Dcaustica.* system property overrides a value here.");
+        FILE.setComment("composite.tlas-cache", " Cache static TLAS inputs and reuse an unchanged slot; disable for comparisons.");
+        FILE.setComment("lights.presampling", " Share fresh light proposals within each frame. Shadow visibility is not cached.");
         FILE.setComment("terrain",
                 " Controls terrain loading. Higher limits can load terrain faster but use more CPU and GPU time.");
         FILE.setComment("frame-generation",
@@ -532,6 +534,8 @@ public final class CausticaConfig {
         }
 
         public static final class Composite {
+            public static final BooleanSetting TLAS_CACHE =
+                    bool("caustica.rt.tlasCache", "composite.tlas-cache", true);
             public static final IntSetting DEBUG_VIEW = intValue("caustica.rt.debugView", "composite.debug-view", 0);
             public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 1, 1);
             public static final IntSetting MAX_BOUNCES =
@@ -573,6 +577,8 @@ public final class CausticaConfig {
 
         /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
         public static final class Lights {
+            public static final BooleanSetting PRESAMPLING =
+                    bool("caustica.rt.lightPresampling", "lights.presampling", true);
             public static final IntSetting RIS_CANDIDATES =
                     intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
             public static final FloatSetting MIN_FILL_RATIO =

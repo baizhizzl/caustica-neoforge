@@ -1,8 +1,10 @@
 package dev.comfyfluffy.caustica;
 
 import org.junit.jupiter.api.Test;
+import com.electronwill.nightconfig.core.CommentedConfig;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class CausticaConfigTest {
     @Test
@@ -55,6 +57,29 @@ final class CausticaConfigTest {
             assertEquals(1000, setting.value());
         } finally {
             setting.set(previous);
+        }
+    }
+
+    @Test
+    void performanceSwitchesRegisterAndRoundTripWithoutChangingCandidateCount() {
+        CausticaConfig.ensureRegistered();
+        var config = CommentedConfig.inMemory();
+        int count = CausticaConfig.Rt.Lights.RIS_CANDIDATES.value();
+        for (var setting : new CausticaConfig.BooleanSetting[] {
+                CausticaConfig.Rt.Composite.TLAS_CACHE, CausticaConfig.Rt.Lights.PRESAMPLING}) {
+            boolean previous = setting.value();
+            try {
+                assertTrue(CausticaConfig.settings().contains(setting));
+                assertTrue(setting.defaultValue());
+                for (boolean enabled : new boolean[] {false, true}) {
+                    setting.set(enabled);
+                    setting.writeToFile(config);
+                    assertEquals(enabled, config.<Boolean>get(setting.tomlPath()));
+                    assertEquals(count, CausticaConfig.Rt.Lights.RIS_CANDIDATES.value());
+                }
+            } finally {
+                setting.set(previous);
+            }
         }
     }
 }

@@ -16,6 +16,11 @@ struct ExposureStateLayoutProbe {
     ExposureState values[2]; // array stride is the complete, tail-padded ExposureState byte size
 };
 
+struct LightCandidateLayoutProbe {
+    LightCandidate values[2];
+};
+
+[[vk::binding(3, 0)]] StructuredBuffer<LightCandidateLayoutProbe, Std430DataLayout> lightCandidateLayoutProbe;
 [[vk::binding(0, 0)]] StructuredBuffer<WorldPushLayoutProbe, Std430DataLayout> worldPushLayoutProbe;
 [[vk::binding(1, 0)]] StructuredBuffer<MaterialHeaderLayoutProbe, Std430DataLayout> materialHeaderLayoutProbe;
 [[vk::binding(2, 0)]] StructuredBuffer<ExposureStateLayoutProbe, Std430DataLayout> exposureStateLayoutProbe;
@@ -29,7 +34,8 @@ void main(uint3 id : SV_DispatchThreadID) {
         float sink = worldPushLayoutProbe[0].values[0].invViewProj[0][0]
                 + materialHeaderLayoutProbe[0].values[0].params.x
                 + exposureStateLayoutProbe[0].values[0].previous
-                + float(pushConstantsLayoutProbe.frameIndex);
+                + float(pushConstantsLayoutProbe.frameIndex)
+                + lightCandidateLayoutProbe[0].values[0].globalPdf;
     }
 }
 
@@ -92,5 +98,14 @@ void probePushAddr(uint3 id : SV_DispatchThreadID) {
 void probeBloomPush(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0xFFFFFFFFu) {
         float sink = float(bloomPushProbe.mode) + bloomPushProbe.radius;
+    }
+}
+
+[[vk::push_constant]] LightPresamplePush lightPresamplePushProbe;
+[shader("compute")]
+[numthreads(1, 1, 1)]
+void probeLightPresample(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0xFFFFFFFFu) {
+        float sink = float(lightPresamplePushProbe.entryCount);
     }
 }

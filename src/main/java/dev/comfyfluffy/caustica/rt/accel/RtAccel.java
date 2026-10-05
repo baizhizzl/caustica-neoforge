@@ -24,9 +24,12 @@ import org.lwjgl.vulkan.VkMicromapTriangleEXT;
 import org.lwjgl.vulkan.VkMicromapUsageEXT;
 import org.lwjgl.vulkan.VkQueryPoolCreateInfo;
 
+import dev.comfyfluffy.caustica.CausticaConfig;
+import dev.comfyfluffy.caustica.rt.RtFrameStats;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDebugLabels;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUse;
+import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUseWaiter;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 
 import java.util.List;
@@ -928,9 +931,23 @@ public final class RtAccel {
         private final RtBuffer scratch;
         private final int instanceCount;
         private final String label;
+        private final TlasRing.Slot slot;
+        private final List<Instance> baseInstances;
+        private final List<Instance> dynamicInstances;
+        private final long staticRevision;
+        private final long blasEpoch;
+        public final boolean buildRequired;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
-                             String label) {
+                             String label, TlasRing.Slot slot, List<Instance> baseInstances,
+                             List<Instance> dynamicInstances, long staticRevision, long blasEpoch,
+                             boolean buildRequired) {
+            this.slot = slot;
+            this.baseInstances = baseInstances;
+            this.dynamicInstances = dynamicInstances;
+            this.staticRevision = staticRevision;
+            this.blasEpoch = blasEpoch;
+            this.buildRequired = buildRequired;
             this.accel = accel;
             this.instanceBuffer = instanceBuffer;
             this.scratch = scratch;
@@ -950,12 +967,15 @@ public final class RtAccel {
         private static final int MIN_CAPACITY = 1024;
         private final Slot[] slots = new Slot[RING];
         private int cursor;
+        // Any inline BLAS build/refit invalidates every slot, including ones revisited several frames later.
+        private long blasEpoch;
 
         private static final class Slot {
             RtAccel accel;
             RtBuffer instanceBuffer;
             RtBuffer scratch;
             int capacity;
+            final RtTlasCache cache = new RtTlasCache();
             final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
             void destroy() {
@@ -976,40 +996,49 @@ public final class RtAccel {
         }
     }
 
-    /**
-     * Fill the next ring slot's instance buffer and return it as a build-ready TLAS (the slot's AS is
-     * rebuilt in place — BUILD mode overwrites). Do NOT call {@link PreparedTlas#destroyAll} on the
-     * result: the ring owns the resources.
-     */
-    /** Pack terrain and dynamic instances as two contiguous ranges without a composite-list get per item. */
-    public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances,
-                                           List<Instance> dynamicInstances, TlasRing ring, GraphicsUse graphicsUse) {
+    /** Pack changed terrain and this frame's dynamic range into a timeline-protected TLAS slot. */
+    public static PreparedTlas prepareTlas(RtContext ctx, List<Instance> baseInstances, long staticRevision,
+                                            List<Instance> dynamicInstances, TlasRing ring,
+                                            boolean dynamicBlasChanged, GraphicsUse graphicsUse,
+                                            GraphicsUseWaiter waiter) {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
+        if (dynamicBlasChanged) ring.blasEpoch++;
         TlasRing.Slot slot = ring.slots[ring.cursor];
-        // Complete the slot's prior graphics use before rewriting, rebuilding, or resizing it.
-        if (slot != null) {
-            ctx.gpuExecutor().graphicsUseWaiter().await(slot.graphicsUse);
-        }
+        if (slot != null) waiter.await(slot.graphicsUse);
         if (slot == null || count > slot.capacity) {
-            // Outgrown (or first use). The slot's previous use is confirmed off all queues by the wait
-            // above, so immediate destroy is safe.
-            if (slot != null) {
-                slot.destroy();
-            }
+            if (slot != null) slot.destroy();
             slot = createTlasSlot(ctx, Math.max(TlasRing.MIN_CAPACITY, (int) (count * TlasRing.GROWTH)));
             ring.slots[ring.cursor] = slot;
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
 
-        writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
-        writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
-        if (count > 0) {
-            slot.instanceBuffer.flush(0L, (long) count * VkAccelerationStructureInstanceKHR.SIZEOF);
+        boolean cacheEnabled = CausticaConfig.Rt.Composite.TLAS_CACHE.value();
+        boolean writeStatic = !cacheEnabled
+                || slot.cache.staticRangeChanged(baseInstances, staticRevision, baseCount);
+        boolean buildRequired = !cacheEnabled
+                || slot.cache.needsBuild(baseInstances, staticRevision, baseCount, dynamicInstances, ring.blasEpoch);
+        if (writeStatic) {
+            writeTlasInstances(baseInstances, slot.instanceBuffer.mapped, 0);
+            RtFrameStats.FRAME.count("tlasStaticInstancesWritten", baseCount);
         }
+        // An identical TLAS input needs neither a dynamic upload nor a build. BLAS epochs protect refit bounds.
+        if (buildRequired) {
+            writeTlasInstances(dynamicInstances, slot.instanceBuffer.mapped, baseCount);
+            RtFrameStats.FRAME.count("tlasDynamicInstancesWritten", dynamicInstances.size());
+        }
+        int first = writeStatic ? 0 : baseCount;
+        int written = writeStatic ? count : (buildRequired ? dynamicInstances.size() : 0);
+        if (written > 0) {
+            long bytes = (long) written * VkAccelerationStructureInstanceKHR.SIZEOF;
+            slot.instanceBuffer.flush((long) first * VkAccelerationStructureInstanceKHR.SIZEOF, bytes);
+            RtFrameStats.FRAME.count("tlasInstanceBytesFlushed", bytes);
+        }
+        if (writeStatic) slot.cache.staticRangeWritten(baseInstances, staticRevision, baseCount);
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
-                "frame TLAS " + count + " instances");
+                "frame TLAS " + count + " instances", slot, baseInstances, dynamicInstances,
+                staticRevision, ring.blasEpoch, buildRequired);
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.
@@ -1125,6 +1154,14 @@ public final class RtAccel {
         compaction.source.accel.destroy();
     }
 
+    /** Commit cache state after the encoder has accepted the complete frame command buffer. */
+    public static void acceptTlasBuild(PreparedTlas tlas) {
+        if (tlas.buildRequired) {
+            tlas.slot.cache.built(tlas.baseInstances, tlas.staticRevision, tlas.baseInstances.size(),
+                    tlas.dynamicInstances, tlas.blasEpoch);
+        }
+    }
+
     private static void recordTlasBuildRaw(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
@@ -1139,8 +1176,13 @@ public final class RtAccel {
 
     /** Record a labelled TLAS build into the command buffer. */
     public static void recordTlasBuild(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
+        if (!tlas.buildRequired) {
+            RtFrameStats.FRAME.count("tlasBuildsSkipped", 1);
+            return;
+        }
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + " build")) {
             recordTlasBuildRaw(ctx, cmd, tlas);
+            RtFrameStats.FRAME.count("tlasBuilds", 1);
         }
     }
 

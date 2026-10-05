@@ -82,3 +82,7 @@ Run the Vulkan RT/DLSS-RR client with:
 ```bash
 JAVA_TOOL_OPTIONS='-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+UseStringDeduplication -XX:+UseZGC' nvidia-offload ./gradlew runClient --args='--renderDebugLabels --graphicsBackend VULKAN'
 ```
+
+## Performance comparisons
+
+See [TLAS caching and light presampling](performance.md) for switches, counters, and A/B scenes.

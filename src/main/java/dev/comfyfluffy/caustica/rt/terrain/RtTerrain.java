@@ -159,6 +159,7 @@ public final class RtTerrain {
     private long buildToken;
     private long dirtyGroupSeq;
     private final RtSectionTable table = new RtSectionTable();
+    private long staticInstancesRevision;
     private boolean ready;
     // Full-residency invalidation requested off the render thread. Wired to Fabric's
     // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
@@ -211,11 +212,14 @@ public final class RtTerrain {
         return INSTANCE.ready && ((INSTANCE.resident.containsKey(key) && INSTANCE.published.contains(key)) || INSTANCE.empty.contains(key));
     }
 
+    /** Monotonic render-thread publication token, including world resets and coordinate rebases. */
+    public long staticInstancesRevision() {
+        return staticInstancesRevision;
+    }
+
     /**
-     * The static section instances to put in this frame's TLAS (BLAS address + sectionOrigin−rebase
-     * transform). {@code instanceCustomIndex} is the list position, which {@link RtAccel#prepareTlas}
-     * assigns and which the hit shaders use to index the section table. The list is stable between
-     * residency rebuilds, so the per-frame TLAS rebuild just re-references the same BLAS each frame.
+     * Static section instances and their section-table custom indices. The mutable list is paired with
+     * {@link #staticInstancesRevision()} so each TLAS slot can cache its packed terrain range.
      */
     public List<RtAccel.Instance> staticInstances() {
         return table.instances;
@@ -1463,6 +1467,7 @@ public final class RtTerrain {
 
     private void applyBuildChanges(RtContext ctx, List<PreparedSection> prepared, List<SectionGeom> removed,
                                    boolean rebase, int rbx, int rby, int rbz) {
+        staticInstancesRevision++;
         GraphicsUse lastGraphicsUse = ctx.gpuExecutor().latestGraphicsUse();
         int baseX = rebase ? rbx : blockX;
         int baseY = rebase ? rby : blockY;
@@ -1660,6 +1665,7 @@ public final class RtTerrain {
 
     /** Full teardown (world exit / shutdown): drain the GPU, then free everything incl. an in-flight build. */
     private void clear(RtContext ctx, boolean shutdown) {
+        staticInstancesRevision++;
         if (!shutdown) {
             clearAsync(ctx);
             return;
@@ -1746,6 +1752,7 @@ public final class RtTerrain {
      * as unpublished resources in {@link #completeTask(SectionResult)}.
      */
     private void clearAsync(RtContext ctx) {
+        staticInstancesRevision++;
         ctx.gpuExecutor().throwIfFailed();
         terrainEpoch++;
 

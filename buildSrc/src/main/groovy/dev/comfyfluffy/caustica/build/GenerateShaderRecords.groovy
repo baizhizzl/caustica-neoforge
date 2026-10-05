@@ -236,6 +236,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
             ["debugPresentPushProbe", "DebugPresentPush", "DebugPresentPushData"],
             ["bloomPushProbe", "BloomPush", "BloomPushData"],
             ["pushAddrLayoutProbe", "PushAddr", "PushAddrData"],
+            ["lightPresamplePushProbe", "LightPresamplePush", "LightPresamplePushData"],
     ]
 
     // NOT private: Gradle decorates this abstract task with a generated subclass, and Groovy's
@@ -297,6 +298,14 @@ abstract class GenerateShaderRecords extends DefaultTask {
         Map exposureStateType = exposureStateProbeArray.type.elementType as Map
         int exposureStateByteSize = exposureStateProbeArray.type.uniformStride as int
 
+        def lightParameter = reflection.parameters.find { it.name == "lightCandidateLayoutProbe" }
+        def lightArray = lightParameter?.type?.resultType?.fields?.find { it.name == "values" }
+        if (lightArray?.type?.kind != "array" || lightArray.type.elementType?.name != "LightCandidate") {
+            throw new GradleException("unexpected LightCandidate reflection probe shape")
+        }
+        Map lightType = lightArray.type.elementType as Map
+        int lightByteSize = lightArray.type.uniformStride as int
+
         def generatedRoot = outDir.get().asFile
         if (generatedRoot.exists() && !generatedRoot.deleteDir()) {
             throw new GradleException("failed to clear generated shader record sources under ${generatedRoot}")
@@ -309,6 +318,9 @@ abstract class GenerateShaderRecords extends DefaultTask {
                 generateJava(materialHeaderType, materialHeaderByteSize, "MaterialHeaderData"), "UTF-8")
         new File(packageDir, "ExposureStateData.java").setText(
                 generateJava(exposureStateType, exposureStateByteSize, "ExposureStateData", true), "UTF-8")
+
+        new File(packageDir, "LightCandidateData.java").setText(
+                generateJava(lightType, lightByteSize, "LightCandidateData"), "UTF-8")
 
         PUSH_CONSTANT_PROBES.each { probeName, structName, className ->
             Map type = extractPushConstantType(reflection, probeName, structName)
