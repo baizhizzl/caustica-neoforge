@@ -1166,6 +1166,7 @@ public final class RtComposite {
                     new Int4(lightPlan.dimX(), lightPlan.dimY(), lightPlan.dimZ(), RtLightSamplePool.LOCAL_SAMPLES),
                     terrain.lightCount(),
                     CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
+                    CausticaConfig.Rt.Lights.indirectRisCandidates(),
                     // Must be the SAME value the exposure resolve divides out this frame (it reads it
                     // from the same RtExposure accessor), or the two stop cancelling.
                     exposure.preExposure()

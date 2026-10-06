@@ -156,10 +156,129 @@ public LightCandidate selectCandidate(LightGridCell cell, int3 cellCoord, bool u
             worldPush.lightRebase.w, pc.lightAliasAddr != 0);
 }
 
+// Direct alias proposals resolved together. Candidates are independent until the reservoir update, so
+// their span -> section alias -> Light chains are issued as three load waves for the whole batch rather
+// than one full chain after another. Each wave only issues loads; results are consumed by the next wave.
+static const uint RIS_LOAD_BATCH = 4u;
+
+struct LightBatch {
+    Light lights[RIS_LOAD_BATCH];
+};
+
+// Proposal draws are taken in candidate order before any load, so the selected lights, and therefore the
+// estimator, match resolving each candidate with selectLightGridLight one at a time.
+LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateCount, bool hasGridCell,
+                          LightGridCell cell, inout uint proposalSeed) {
+    bool active[RIS_LOAD_BATCH];
+    bool local[RIS_LOAD_BATCH];
+    float outerSample[RIS_LOAD_BATCH];
+    float innerSample[RIS_LOAD_BATCH];
+    uint column[RIS_LOAD_BATCH];
+    [unroll]
+    for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
+        uint c = first + k;
+        active[k] = c < candidateCount;
+        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
+        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
+        local[k] = hasGridCell && globalsAfter == globalsBefore;
+        outerSample[k] = 0.0;
+        innerSample[k] = 0.0;
+        if (active[k]) {
+            outerSample[k] = lightProposalRandom(proposalSeed);
+            if (local[k]) innerSample[k] = lightProposalRandom(proposalSeed);
+        }
+        float columns = float(local[k] ? cell.spanCount : worldPush.lightCount);
+        outerSample[k] *= columns;
+        column[k] = min(uint(outerSample[k]), uint(columns) - 1u);
+    }
+
+    // Wave 1: the cell's section-span column, or the global power alias column.
+    LightGridSpan span[RIS_LOAD_BATCH];
+    LightAlias globalAlias[RIS_LOAD_BATCH];
+    [unroll]
+    for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
+        span[k] = {};
+        globalAlias[k] = {};
+        if (active[k] && local[k]) {
+            span[k] = ConstPtr<LightGridSpan>(pc.lightGridSpanAddr)[cell.spanOffset + column[k]];
+        } else if (active[k] && pc.lightAliasAddr != 0) {
+            globalAlias[k] = ConstPtr<LightAlias>(pc.lightAliasAddr)[column[k]];
+        }
+    }
+
+    // Wave 2: the section-local power alias column of each selected section.
+    uint lightIndex[RIS_LOAD_BATCH];
+    uint sectionFirst[RIS_LOAD_BATCH];
+    LightAlias sectionAlias[RIS_LOAD_BATCH];
+    [unroll]
+    for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
+        sectionAlias[k] = {};
+        sectionFirst[k] = 0u;
+        lightIndex[k] = column[k];
+        if (!active[k]) continue;
+        if (local[k]) {
+            bool spanSelf = outerSample[k] - float(column[k]) < span[k].accept;
+            sectionFirst[k] = spanSelf ? span[k].firstLight : span[k].aliasFirstLight;
+            uint sectionCount = spanSelf ? (span[k].packedLightCounts & 0xffffu)
+                    : (span[k].packedLightCounts >> 16u);
+            innerSample[k] *= float(sectionCount);
+            lightIndex[k] = min(uint(innerSample[k]), sectionCount - 1u);
+            sectionAlias[k] = ConstPtr<LightAlias>(pc.lightLocalAliasAddr)[sectionFirst[k] + lightIndex[k]];
+        } else if (pc.lightAliasAddr != 0) {
+            bool self = outerSample[k] - float(column[k]) < globalAlias[k].accept;
+            lightIndex[k] = self ? column[k] : globalAlias[k].aliasIndex;
+        }
+    }
+
+    // Wave 3: the selected Light records.
+    LightBatch batch;
+    [unroll]
+    for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
+        batch.lights[k] = {};
+        if (!active[k]) continue;
+        if (local[k]) {
+            bool self = innerSample[k] - float(lightIndex[k]) < sectionAlias[k].accept;
+            lightIndex[k] = sectionFirst[k] + (self ? lightIndex[k] : sectionAlias[k].aliasIndex);
+        }
+        batch.lights[k] = ConstPtr<Light>(pc.lightBufAddr)[lightIndex[k]];
+    }
+    return batch;
+}
+
+// Fold one decoded proposal into the streaming reservoir. The emitter point and the replacement test use
+// the per-vertex seed; the proposal PDF is the published mixture, whichever path produced the record.
+void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell, int3 gridCellCoord,
+                   float localProbability, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
+                   float3 F0, float rough, bool twoSided, float sss, inout uint seed) {
+    // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
+    float s = rndf(seed) * 2.0 - 1.0;
+    float t = rndf(seed) * 2.0 - 1.0;
+    float3 sp = lg.pos + worldPush.lightRebase.xyz
+            + s * lg.halfU + t * lg.halfV;
+    float phat;
+    evalSampleContrib(sp, lg.normal, lg.radiance, lg.area, hitPos, n, v, rd,
+            diffAlb, F0, rough, twoSided, sss, phat);
+    if (phat <= 0.0) {
+        return;
+    }
+    float sourcePdf = proposalPdf(lg, gridCell, gridCellCoord, localProbability);
+    float w = phat / max(sourcePdf, 1.0e-20);
+    r.wSum += w;
+    if (rndf(seed) * r.wSum < w) { // weighted reservoir update
+        r.pos = sp;
+        r.lnrm = lg.normal;
+        r.le = lg.radiance;
+        r.area = lg.area;
+        r.phat = phat;
+    }
+}
+
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
-// sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones.
+// sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones. The caller picks
+// M per vertex: the primary-terminal hit and later indirect hits use separately configured counts.
 public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool twoSided, float sss, inout uint seed, inout uint proposalSeed) {
+                     float rough, bool twoSided, float sss, uint candidateCount,
+                     inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     LightGridCell gridCell;
     int3 gridCellCoord;
@@ -171,44 +290,36 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
                 * worldPush.lightGridOrigin.w;
     }
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
-    uint candidateCount = worldPush.risCandidates;
     r.M = float(candidateCount);
-    // Deterministically stratify the proposal mixture. At the default M=8 this schedules exactly six
-    // local and two global candidates, with every lane taking the same branch for a given candidate.
-    // Counts that are not divisible by four use the nearest practical split with at least one global
-    // candidate; M=1 is global-only so the estimator retains full support.
+    // Deterministically stratify the proposal mixture. At M=8 this schedules exactly six local and two
+    // global candidates, with every lane taking the same branch for a given candidate. Counts that are
+    // not divisible by four use the nearest practical split with at least one global candidate; M=1 is
+    // global-only so the estimator retains full support.
     uint globalCandidateCount = hasGridCell
             ? max(1u, (candidateCount + 2u) / 4u) : candidateCount;
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
-    for (uint c = 0u; c < candidateCount; c++) {
-        uint globalsBefore = (c * globalCandidateCount) / candidateCount;
-        uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
-        bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-        LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal, proposalSeed);
-        // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
-        float s = rndf(seed) * 2.0 - 1.0;
-        float t = rndf(seed) * 2.0 - 1.0;
-        float3 sp = lg.pos + worldPush.lightRebase.xyz
-                + s * lg.halfU + t * lg.halfV;
-        float3 le = lg.radiance;
-        float3 lightNormal = lg.normal;
-        float area = lg.area;
-        float phat;
-        evalSampleContrib(sp, lightNormal, le, area, hitPos, n, v, rd,
-                diffAlb, F0, rough, twoSided, sss, phat);
-        if (phat <= 0.0) {
-            continue;
+    if (pc.lightPoolAddr != 0) {
+        for (uint c = 0u; c < candidateCount; c++) {
+            uint globalsBefore = (c * globalCandidateCount) / candidateCount;
+            uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
+            bool useLocal = hasGridCell && globalsAfter == globalsBefore;
+            LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal, proposalSeed);
+            risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
+                    diffAlb, F0, rough, twoSided, sss, seed);
         }
-        float sourcePdf = proposalPdf(lg, gridCell, gridCellCoord, localProbability);
-        float w = phat / max(sourcePdf, 1.0e-20);
-        r.wSum += w;
-        if (rndf(seed) * r.wSum < w) { // weighted reservoir update
-            r.pos = sp;
-            r.lnrm = lightNormal;
-            r.le = le;
-            r.area = area;
-            r.phat = phat;
+    } else {
+        for (uint first = 0u; first < candidateCount; first += RIS_LOAD_BATCH) {
+            LightBatch batch = loadLightBatch(first, candidateCount, globalCandidateCount, hasGridCell,
+                    gridCell, proposalSeed);
+            [unroll]
+            for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
+                if (first + k >= candidateCount) break;
+                LightCandidate lg = decodeLightCandidate(batch.lights[k], worldPush.lightRebase.w,
+                        pc.lightAliasAddr != 0);
+                risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
+                        diffAlb, F0, rough, twoSided, sss, seed);
+            }
         }
     }
     r.W = r.phat > 0.0 ? (r.wSum / (r.M * r.phat)) : 0.0;

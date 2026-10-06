@@ -70,7 +70,9 @@ F3+T 资源重载、HDR、DLSS RR/FG、截图、Linux Wayland、动态模型和�
 
 **TLAS 缓存**：四个缓冲槽位分别记住自己的静态地形实例。区块发布、卸载、世界重置或坐标重定位会让缓存失效；平时只写动态实例区间。动态实例逐项比较地址、索引、掩码、SBT 偏移及变换矩阵，不用哈希判断相等。
 
-TLAS 输入没变，且引用的 BLAS 在中间帧也没有构建或 refit，才跳过构建。某个实体 BLAS 更新时会使所有槽位的构建缓存失效，不能因为当前帧没有 BLAS 操作就复用旧包围盒。需要重建时仍使用 `BUILD`，没有改为 `UPDATE`。
+TLAS 输入没变，且引用的 BLAS 在中间帧也没有构建或 refit，才跳过构建。某个实体 BLAS 更新时会使所有槽位的构建缓存失效，不能因为当前帧没有 BLAS 操作就复用旧包围盒。
+
+**TLAS refit**（`composite.tlas-update`，默认开启）：需要更新、但地形发布版本和静态/动态实例数都没变时（典型情况是只有实体在移动或实体 BLAS 被 refit），槽位用 `UPDATE` 原地 refit 上一次的结果，不再整棵 `BUILD`。槽位以 `ALLOW_UPDATE` 创建，scratch 按 build 和 update 两者的较大值分配。refit 沿用上次 BUILD 的树结构，移动的实体会让节点逐渐变松，所以每个槽位最多连续 refit 15 次，之后的下一次变化必须完整 `BUILD`；四个槽位轮转，即每个槽位至少每 64 帧完整重建一次。区块加载卸载、实体出现或消失（实例数变化）也会直接 `BUILD`。
 
 **光照预采样**：每个真实渲染帧先用 compute 生成共享候选池，提前完成 alias 选择、发光颜色解码和矩形光源几何解码。后续 RIS 从池里取候选，但每次查询仍独立选择光源上的采样点并做 reservoir 更新。阴影仍使用当前 TLAS。
 
@@ -101,6 +103,14 @@ experimental-presampling = false
 
 关掉预采样会跳过整个 compute prepass，恢复逐查询 alias 选样。关掉 TLAS 缓存会恢复每帧写全部实例并构建 TLAS。两项开关均不修改 `lights.ris-candidates`。
 
+### RIS 候选数与选样访存
+
+**间接命中的 RIS 候选数**：`lights.ris-candidates`（默认 8）只用于第一次命中，即主射线（含透过玻璃/水的前缀）落到的着色点；之后的反弹改用 `lights.ris-candidates-indirect`（默认 4），取值至少为 1，且不超过 `ris-candidates`。间接命中经过反弹衰减，又已经被 BSDF 采样模糊，少几个候选只会增加互不相关的逐像素噪声，不会像共享候选池那样成片闪烁。想换更多帧率可以设为 2，想回到原来的画质设为与 `ris-candidates` 相同即可。
+
+**批量发起选样访存**：一个本地候选要依次读三次显存（光照网格的 section span → section 内的 alias 列 → Light 记录），全局候选读两次（alias 列 → Light 记录）。M 个候选之间互不依赖，原来却是一个候选的整条链读完才开始下一个。现在每 4 个候选一批，分三轮发起读取：每轮只发起本批所有候选的同一级读取，下一轮才使用结果，因此每批只等三次访存延迟，而不是每个候选各等三次。随机数仍按候选顺序抽取，选中的光源与逐个选样完全相同，估计器和噪声表现不变。没有把局部 alias 压成一层：那需要为每个单元把邻域 5×5×5 个 section 的全部光源展开成独立的 alias 表，岩浆、萤石多的区域显存会成倍增长。
+
+间接候选数在两种路径下都生效；批量访存只用于关闭光照预采样时的逐像素 alias 选样，预采样开启时仍走候选池路径。
+
 ### 怎么比较
 
 用同一存档、相同站位和画质，分别测：
@@ -111,6 +121,8 @@ experimental-presampling = false
 | 只测静态缓存 | 开 | 关 |
 | 两项都开 | 开 | 开 |
 
+TLAS refit 用 `-Dcaustica.rt.tlasUpdate=false` 单独对照。间接候选数用 `-Dcaustica.rt.risCandidatesIndirect=8` 恢复原来的每次命中 8 个候选。
+
 先等区块加载完成，再记录稳定帧时间和卡顿。四个 TLAS 槽位都需要暖机。临时关掉帧生成，以真实渲染帧时间比较，不能拿生成后的显示帧率当作渲染收益。
 
 开启 `-Dcaustica.rt.frameStats=true` 后，计数写入游戏目录的 `rt-frame-stats/frame.csv`：
@@ -118,7 +130,7 @@ experimental-presampling = false
 - `tlasStaticInstancesWritten`：本帧写入的静态实例数。稳定场景暖机后应为 0。
 - `tlasDynamicInstancesWritten`：写入的动态实例数。TLAS 完全复用时也为 0。
 - `tlasInstanceBytesFlushed`：提交 flush 的逻辑字节数，不含驱动按内存原子大小做的取整。
-- `tlasBuilds` / `tlasBuildsSkipped`：构建或复用次数。
+- `tlasBuilds` / `tlasUpdates` / `tlasBuildsSkipped`：完整构建、原地 refit 和直接复用的次数。
 - `lightPresampledCandidates`：本帧生成的池条目数。
 
 `frame.prepareTlas`、`frame.recordTlas`、`frame.lightPresample` 是 CPU 计时，不是 GPU 执行耗时。GPU 对比可用 RenderDoc / Nsight 的 `light proposal prepass` 标签，并把 prepass 和后续光追的总耗时一起看。

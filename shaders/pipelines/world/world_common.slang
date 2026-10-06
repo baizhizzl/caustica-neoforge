@@ -85,7 +85,8 @@ public struct WorldPush {
     public int4     lightPoolOrigin;     // xyz first cached grid cell, w global candidate count
     public int4     lightPoolDims;       // xyz cached cell dimensions, w candidates per cell
     public uint     lightCount;       // packed Light records in pc.lightBufAddr
-    public uint     risCandidates;    // RIS candidate count M per diffuse vertex (0 = emitter NEE off)
+    public uint     risCandidates;    // RIS candidate count M at the primary-terminal hit (0 = emitter NEE off)
+    public uint     risCandidatesIndirect; // M at later indirect hits, in [1, risCandidates] while NEE is on
     // Pre-exposure scalar applied to radiance at the outImage write
     // ONLY, so all light transport above stays in absolute scene units. Keeps stored fp16 values
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
