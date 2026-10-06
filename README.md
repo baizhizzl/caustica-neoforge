@@ -28,6 +28,12 @@ Caustica 的 NeoForge 移植版，用 Vulkan 硬件路径追踪渲染 Minecraft�
 
 ## 更新记录
 
+### 未发布
+
+- 修复 0.1.1-neoforge.4 中方块光源闪烁的问题：共享光照预采样改为默认关闭。同一光照网格单元（16×16×16 方块）内的所有像素每帧共用同一组 64 个候选光源，候选组每帧重抽，整片区域的亮度会一起跳变，降噪器无法把它当作噪声滤掉。
+- 预采样的配置键改为 `lights.experimental-presampling`（启动参数 `-Dcaustica.rt.experimentalLightPresampling=true`），已保存的旧键 `lights.presampling = true` 不再生效，保存设置时自动删除。
+- TLAS 缓存不受影响，仍默认开启。
+
 ### [0.1.1-neoforge.4](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.4) · 2026-10-05
 
 - 地形没有变化时不再逐帧重写全部静态 TLAS 实例。每个 TLAS 槽位分别缓存地形输入，区块加载、卸载、世界重置和坐标重定位时才刷新；场景完全不变时可以跳过 TLAS 构建。

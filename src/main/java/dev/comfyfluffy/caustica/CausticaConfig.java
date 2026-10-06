@@ -76,6 +76,8 @@ public final class CausticaConfig {
     public static synchronized void save() {
         ensureRegistered();
         writeComments();
+        // lights.presampling is no longer read; drop it so a stale `true` is not mistaken for the active switch.
+        FILE.remove("lights.presampling");
         for (RuntimeSetting<?> setting : SETTINGS) {
             setting.writeToFile(FILE);
         }
@@ -86,7 +88,8 @@ public final class CausticaConfig {
         FILE.setComment("enabled",
                 " Caustica ray-tracing settings. A matching -Dcaustica.* system property overrides a value here.");
         FILE.setComment("composite.tlas-cache", " Cache static TLAS inputs and reuse an unchanged slot; disable for comparisons.");
-        FILE.setComment("lights.presampling", " Share fresh light proposals within each frame. Shadow visibility is not cached.");
+        FILE.setComment("lights.experimental-presampling",
+                " Experimental: share one light proposal pool per frame. Faster, but nearby block lights can flicker.");
         FILE.setComment("terrain",
                 " Controls terrain loading. Higher limits can load terrain faster but use more CPU and GPU time.");
         FILE.setComment("frame-generation",
@@ -577,8 +580,10 @@ public final class CausticaConfig {
 
         /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
         public static final class Lights {
+            // Off by default: every pixel in a light-grid cell draws from the same finite per-frame pool, so
+            // the pool's sampling error is shared across the cell and shows up as region-wide light flicker.
             public static final BooleanSetting PRESAMPLING =
-                    bool("caustica.rt.lightPresampling", "lights.presampling", true);
+                    bool("caustica.rt.experimentalLightPresampling", "lights.experimental-presampling", false);
             public static final IntSetting RIS_CANDIDATES =
                     intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
             public static final FloatSetting MIN_FILL_RATIO =

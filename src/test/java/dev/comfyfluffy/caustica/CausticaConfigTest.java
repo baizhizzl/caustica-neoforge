@@ -70,7 +70,7 @@ final class CausticaConfigTest {
             boolean previous = setting.value();
             try {
                 assertTrue(CausticaConfig.settings().contains(setting));
-                assertTrue(setting.defaultValue());
+                assertEquals(setting == CausticaConfig.Rt.Composite.TLAS_CACHE, setting.defaultValue());
                 for (boolean enabled : new boolean[] {false, true}) {
                     setting.set(enabled);
                     setting.writeToFile(config);
