@@ -78,7 +78,7 @@ public final class RtFrameStats {
                     "frame.copyOutput"
             },
             new String[] {"tlasStaticInstancesWritten", "tlasDynamicInstancesWritten", "tlasInstanceBytesFlushed",
-                    "tlasBuilds", "tlasUpdates", "tlasBuildsSkipped", "lightPresampledCandidates", "sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
+                    "tlasBuilds", "tlasUpdates", "tlasBuildsSkipped", "cameraCuts", "lightPresampledCandidates", "sectionsSnapshotted", "sectionCopies", "terrainBuildsCompleted",
                     "terrainMaterialEpochRejects", "entitiesCaptured", "blockEntitiesCaptured",
                     "particlesCaptured", "refits", "entityReuse", "entityRigidFitSuccesses",
                     "entityRigidFitFailures", "vmaBufferCreates",

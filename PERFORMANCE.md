@@ -103,6 +103,7 @@ refit 不改树的结构，只更新包围盒。实体走得越远，相关节�
 - `tlasDynamicInstancesWritten`：写了多少个实体实例，TLAS 被直接复用时也是 0。
 - `tlasInstanceBytesFlushed`：提交的 flush 字节数（不算驱动按对齐补齐的部分）。
 - `tlasBuilds` / `tlasUpdates` / `tlasBuildsSkipped`：完整重建、原地 refit、直接复用各几次。
+- `cameraCuts`：这一帧是否判定为镜头切换（传送、换世界、切换视角、F3+A 等），是的话运动矢量清零、DLSS 历史重置。正常移动时应该一直是 0。
 - `lightPresampledCandidates`：预采样池这一帧生成了多少条（只在开了预采样时有值）。
 
 `frame.prepareTlas`、`frame.recordTlas`、`frame.lightPresample` 是 CPU 耗时，不是 GPU 耗时。要看 GPU 时间，用 RenderDoc 或 Nsight，按 debug label 找 `frame TLAS … build` / `update` 和 `light proposal prepass`。

@@ -276,6 +276,7 @@ public final class RtComposite {
     private float mvCamDeltaY;
     private float mvCamDeltaZ;
     private boolean mvHasPrev;
+    private final RtCameraCut cameraCut = new RtCameraCut();
     private float previousWaterWaveTime;
     private boolean waterWaveTimeValid;
     private long atlasSampler;
@@ -494,6 +495,15 @@ public final class RtComposite {
         }
     }
 
+    /**
+     * Vanilla's full render-state invalidation (dimension change, render-distance change, F3+A) rebuilds the
+     * scene, so the next RT frame restarts motion vectors and DLSS history instead of reprojecting.
+     */
+    public void onRenderStateInvalidated() {
+        resetFailureLatch();
+        cameraCut.force();
+    }
+
     /** Capture the frame's camera for the next composite. Called from GameRendererMixin. */
     public void captureFrame(Matrix4f projection, Matrix4fc viewRotation, double cameraX, double cameraY, double cameraZ) {
         frameProjection.set(projection);
@@ -502,11 +512,6 @@ public final class RtComposite {
         camY = cameraY;
         camZ = cameraZ;
         frameCaptured = true;
-    }
-
-    /** Reset exposure filtering after an explicit render-state invalidation such as F3+A. */
-    public void resetExposureHistory() {
-        exposure.requestReset();
     }
 
     /**
@@ -1006,6 +1011,19 @@ public final class RtComposite {
      * (or after a reset) push the current view-projection with zero delta so MVs come out zero.
      */
     private void updateMotion() {
+        Minecraft mc = Minecraft.getInstance();
+        RtCameraCut.Kind cut = cameraCut.update(mc.level, mc.options.getCameraType(), camX, camY, camZ);
+        if (cut.isCut()) {
+            // Zero motion vectors and fresh DLSS history for this frame; nothing before the cut reprojects.
+            mvHasPrev = false;
+            RtDlssRr.INSTANCE.requestCameraCut();
+            RtDlssFg.INSTANCE.requestHistoryReset();
+            RtFrameStats.FRAME.count("cameraCuts", 1);
+            if (cut == RtCameraCut.Kind.WORLD) {
+                // The previous world's adapted exposure is a poor start for the new one (e.g. Nether -> Overworld).
+                exposure.requestReset();
+            }
+        }
         mvCurProjView.set(frameProjection).mul(frameViewRotation);
         if (mvHasPrev) {
             mvPushMatrix.set(mvPrevProjView);

@@ -73,6 +73,11 @@ public final class RtDlssRr {
         lastFrameNanos = 0;
     }
 
+    /** Invalidate temporal history at a camera cut. The frame-time estimate stays valid. */
+    public void requestCameraCut() {
+        resetHistory = true;
+    }
+
     public boolean isReady() {
         return initialized && !failed && !isNull(feature);
     }
