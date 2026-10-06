@@ -937,12 +937,15 @@ public final class RtAccel {
         private final long staticRevision;
         private final long blasEpoch;
         public final boolean buildRequired;
+        // An in-place UPDATE of the slot's last accepted result instead of a full BUILD.
+        private final boolean update;
 
         private PreparedTlas(RtAccel accel, RtBuffer instanceBuffer, RtBuffer scratch, int instanceCount,
                              String label, TlasRing.Slot slot, List<Instance> baseInstances,
                              List<Instance> dynamicInstances, long staticRevision, long blasEpoch,
-                             boolean buildRequired) {
+                             boolean buildRequired, boolean update) {
             this.slot = slot;
+            this.update = update;
             this.baseInstances = baseInstances;
             this.dynamicInstances = dynamicInstances;
             this.staticRevision = staticRevision;
@@ -975,6 +978,8 @@ public final class RtAccel {
             RtBuffer instanceBuffer;
             RtBuffer scratch;
             int capacity;
+            // Built with ALLOW_UPDATE. Fixed per slot: its AS and scratch were sized for these flags.
+            boolean allowUpdate;
             final RtTlasCache cache = new RtTlasCache();
             final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
 
@@ -1004,11 +1009,14 @@ public final class RtAccel {
         int baseCount = baseInstances.size();
         int count = Math.addExact(baseCount, dynamicInstances.size());
         if (dynamicBlasChanged) ring.blasEpoch++;
+        boolean updateEnabled = CausticaConfig.Rt.Composite.TLAS_UPDATE.value();
         TlasRing.Slot slot = ring.slots[ring.cursor];
         if (slot != null) waiter.await(slot.graphicsUse);
-        if (slot == null || count > slot.capacity) {
+        if (slot == null || count > slot.capacity || slot.allowUpdate != updateEnabled) {
+            int capacity = slot != null && count <= slot.capacity ? slot.capacity
+                    : Math.max(TlasRing.MIN_CAPACITY, (int) (count * TlasRing.GROWTH));
             if (slot != null) slot.destroy();
-            slot = createTlasSlot(ctx, Math.max(TlasRing.MIN_CAPACITY, (int) (count * TlasRing.GROWTH)));
+            slot = createTlasSlot(ctx, capacity, updateEnabled);
             ring.slots[ring.cursor] = slot;
         }
         ring.cursor = (ring.cursor + 1) % TlasRing.RING;
@@ -1035,10 +1043,13 @@ public final class RtAccel {
             RtFrameStats.FRAME.count("tlasInstanceBytesFlushed", bytes);
         }
         if (writeStatic) slot.cache.staticRangeWritten(baseInstances, staticRevision, baseCount);
+        // Same terrain publication and instance counts: refit the slot's previous result in place.
+        boolean update = buildRequired && slot.allowUpdate
+                && slot.cache.canUpdate(baseInstances, staticRevision, baseCount, dynamicInstances.size());
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
                 "frame TLAS " + count + " instances", slot, baseInstances, dynamicInstances,
-                staticRevision, ring.blasEpoch, buildRequired);
+                staticRevision, ring.blasEpoch, buildRequired, update);
     }
 
     // Wrap the mapped Vulkan array in LWJGL structs so its generated accessors own the native ABI/bitfields.
@@ -1058,18 +1069,20 @@ public final class RtAccel {
     }
 
     /** Create one ring slot sized for {@code capacity} instances (instance buffer + AS + backing + scratch). */
-    private static TlasRing.Slot createTlasSlot(RtContext ctx, int capacity) {
+    private static TlasRing.Slot createTlasSlot(RtContext ctx, int capacity, boolean allowUpdate) {
         VkDevice vk = ctx.vk();
         String label = "TLAS ring slot (" + capacity + " instance capacity)";
         TlasRing.Slot slot = new TlasRing.Slot();
         slot.capacity = capacity;
+        slot.allowUpdate = allowUpdate;
         slot.instanceBuffer = ctx.createAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
                 org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
                 label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
             // every per-frame build with count ≤ capacity fits the same backing/scratch.
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.instanceBuffer.deviceAddress);
+            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.instanceBuffer.deviceAddress,
+                    allowUpdate);
             VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
             vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     build.get(0), stack.ints(capacity), sizes);
@@ -1082,7 +1095,9 @@ public final class RtAccel {
             RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
             long handle = pAs.get(0);
             RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
-            slot.scratch = createScratchBuffer(ctx, sizes.buildScratchSize(), label + " build scratch");
+            long scratchSize = allowUpdate ? Math.max(sizes.buildScratchSize(), sizes.updateScratchSize())
+                    : sizes.buildScratchSize();
+            slot.scratch = createScratchBuffer(ctx, scratchSize, label + " build scratch");
             VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
                     .sType$Default().accelerationStructure(handle);
             long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
@@ -1091,14 +1106,16 @@ public final class RtAccel {
         return slot;
     }
 
-    private static VkAccelerationStructureBuildGeometryInfoKHR.Buffer tlasBuildInfo(MemoryStack stack, long instanceBufferAddr) {
+    private static VkAccelerationStructureBuildGeometryInfoKHR.Buffer tlasBuildInfo(MemoryStack stack, long instanceBufferAddr,
+                                                                               boolean allowUpdate) {
         VkAccelerationStructureGeometryKHR.Buffer geom = VkAccelerationStructureGeometryKHR.calloc(1, stack);
         geom.sType$Default().geometryType(VK_GEOMETRY_TYPE_INSTANCES_KHR).flags(VK_GEOMETRY_OPAQUE_BIT_KHR);
         geom.geometry().instances().sType$Default().arrayOfPointers(false);
         geom.geometry().instances().data().deviceAddress(instanceBufferAddr);
         VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = VkAccelerationStructureBuildGeometryInfoKHR.calloc(1, stack);
         build.sType$Default().type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR)
-                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)
+                .flags(VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                        | (allowUpdate ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR : 0))
                 .mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR).geometryCount(1).pGeometries(geom);
         return build;
     }
@@ -1158,14 +1175,20 @@ public final class RtAccel {
     public static void acceptTlasBuild(PreparedTlas tlas) {
         if (tlas.buildRequired) {
             tlas.slot.cache.built(tlas.baseInstances, tlas.staticRevision, tlas.baseInstances.size(),
-                    tlas.dynamicInstances, tlas.blasEpoch);
+                    tlas.dynamicInstances, tlas.blasEpoch, tlas.update);
         }
     }
 
     private static void recordTlasBuildRaw(RtContext ctx, VkCommandBuffer cmd, PreparedTlas tlas) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress);
+            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, tlas.instanceBuffer.deviceAddress,
+                    tlas.slot.allowUpdate);
             build.get(0).dstAccelerationStructure(tlas.accel.handle);
+            if (tlas.update) {
+                // In-place refit: same AS as source and destination, same flags and instance count as its BUILD.
+                build.get(0).mode(VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR)
+                        .srcAccelerationStructure(tlas.accel.handle);
+            }
             build.get(0).scratchData().deviceAddress(scratchAddress(ctx, tlas.scratch));
             VkAccelerationStructureBuildRangeInfoKHR.Buffer range = VkAccelerationStructureBuildRangeInfoKHR.calloc(1, stack);
             range.get(0).primitiveCount(tlas.instanceCount).primitiveOffset(0).firstVertex(0).transformOffset(0);
@@ -1180,9 +1203,10 @@ public final class RtAccel {
             RtFrameStats.FRAME.count("tlasBuildsSkipped", 1);
             return;
         }
-        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, tlas.label + " build")) {
+        try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd,
+                tlas.label + (tlas.update ? " update" : " build"))) {
             recordTlasBuildRaw(ctx, cmd, tlas);
-            RtFrameStats.FRAME.count("tlasBuilds", 1);
+            RtFrameStats.FRAME.count(tlas.update ? "tlasUpdates" : "tlasBuilds", 1);
         }
     }
 

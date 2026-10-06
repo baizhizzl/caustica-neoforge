@@ -85,4 +85,4 @@ JAVA_TOOL_OPTIONS='-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+
 
 ## Performance comparisons
 
-See [TLAS caching and light presampling](../PERFORMANCE.md) for switches, counters, and A/B scenes.
+See [PERFORMANCE.md](../PERFORMANCE.md) (Chinese) for the performance switches, frame-stat counters, and how to compare them.

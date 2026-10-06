@@ -4,6 +4,12 @@ import java.util.List;
 
 /** CPU state for one timeline-protected TLAS slot. Equality is exact, not a hash of GPU input. */
 final class RtTlasCache {
+    /**
+     * Consecutive in-place UPDATEs a slot may take before the next change forces a full BUILD. A refit keeps
+     * the BVH topology of the last BUILD, so moving entities slowly loosen their nodes; with four ring slots
+     * this rebuilds each slot at least every 64 frames.
+     */
+    static final int MAX_CONSECUTIVE_UPDATES = 15;
     private Object writtenSource;
     private long writtenRevision;
     private int writtenCount = -1;
@@ -12,6 +18,7 @@ final class RtTlasCache {
     private int builtBaseCount = -1;
     private long builtBlasEpoch;
     private int dynamicCount;
+    private int updatesSinceBuild;
     private long[] addresses = new long[0];
     private int[] metadata = new int[0];
     private int[] transforms = new int[0];
@@ -46,8 +53,20 @@ final class RtTlasCache {
         return false;
     }
 
+    /**
+     * Whether the slot's last accepted result can be refit in place: the terrain publication and both
+     * instance counts match, so only dynamic transforms, BLAS references or BLAS bounds differ.
+     */
+    boolean canUpdate(Object source, long revision, int baseCount, int dynamicInstanceCount) {
+        return builtBaseCount >= 0 && builtBaseCount == baseCount && builtSource == source
+                && builtRevision == revision && dynamicCount == dynamicInstanceCount
+                && updatesSinceBuild < MAX_CONSECUTIVE_UPDATES;
+    }
+
     /** Committed only after the encoder accepts the complete frame; the slot's graphics timeline guards reuse. */
-    void built(Object source, long revision, int baseCount, List<RtAccel.Instance> dynamic, long blasEpoch) {
+    void built(Object source, long revision, int baseCount, List<RtAccel.Instance> dynamic, long blasEpoch,
+               boolean update) {
+        updatesSinceBuild = update ? updatesSinceBuild + 1 : 0;
         int count = dynamic.size();
         if (addresses.length < count) {
             int capacity = Math.max(count, Math.max(16, addresses.length * 2));

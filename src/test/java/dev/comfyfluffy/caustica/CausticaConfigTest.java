@@ -66,11 +66,12 @@ final class CausticaConfigTest {
         var config = CommentedConfig.inMemory();
         int count = CausticaConfig.Rt.Lights.RIS_CANDIDATES.value();
         for (var setting : new CausticaConfig.BooleanSetting[] {
-                CausticaConfig.Rt.Composite.TLAS_CACHE, CausticaConfig.Rt.Lights.PRESAMPLING}) {
+                CausticaConfig.Rt.Composite.TLAS_CACHE, CausticaConfig.Rt.Composite.TLAS_UPDATE,
+                CausticaConfig.Rt.Lights.PRESAMPLING}) {
             boolean previous = setting.value();
             try {
                 assertTrue(CausticaConfig.settings().contains(setting));
-                assertTrue(setting.defaultValue());
+                assertEquals(setting != CausticaConfig.Rt.Lights.PRESAMPLING, setting.defaultValue());
                 for (boolean enabled : new boolean[] {false, true}) {
                     setting.set(enabled);
                     setting.writeToFile(config);
@@ -80,6 +81,27 @@ final class CausticaConfigTest {
             } finally {
                 setting.set(previous);
             }
+        }
+    }
+
+    @Test
+    void indirectRisCandidatesNeverExceedThePrimaryCount() {
+        CausticaConfig.IntSetting primary = CausticaConfig.Rt.Lights.RIS_CANDIDATES;
+        CausticaConfig.IntSetting indirect = CausticaConfig.Rt.Lights.RIS_CANDIDATES_INDIRECT;
+        int previousPrimary = primary.value();
+        int previousIndirect = indirect.value();
+        try {
+            assertEquals(4, indirect.defaultValue());
+            primary.set(8);
+            indirect.set(4);
+            assertEquals(4, CausticaConfig.Rt.Lights.indirectRisCandidates());
+            primary.set(2);
+            assertEquals(2, CausticaConfig.Rt.Lights.indirectRisCandidates());
+            primary.set(0);
+            assertEquals(0, CausticaConfig.Rt.Lights.indirectRisCandidates());
+        } finally {
+            primary.set(previousPrimary);
+            indirect.set(previousIndirect);
         }
     }
 }

@@ -76,6 +76,8 @@ public final class CausticaConfig {
     public static synchronized void save() {
         ensureRegistered();
         writeComments();
+        // lights.presampling is no longer read; drop it so a stale `true` is not mistaken for the active switch.
+        FILE.remove("lights.presampling");
         for (RuntimeSetting<?> setting : SETTINGS) {
             setting.writeToFile(FILE);
         }
@@ -86,7 +88,10 @@ public final class CausticaConfig {
         FILE.setComment("enabled",
                 " Caustica ray-tracing settings. A matching -Dcaustica.* system property overrides a value here.");
         FILE.setComment("composite.tlas-cache", " Cache static TLAS inputs and reuse an unchanged slot; disable for comparisons.");
-        FILE.setComment("lights.presampling", " Share fresh light proposals within each frame. Shadow visibility is not cached.");
+        FILE.setComment("composite.tlas-update",
+                " Refit the TLAS in place when only moving entities changed; a full rebuild still runs periodically.");
+        FILE.setComment("lights.experimental-presampling",
+                " Experimental: share one light proposal pool per frame. Faster, but nearby block lights can flicker.");
         FILE.setComment("terrain",
                 " Controls terrain loading. Higher limits can load terrain faster but use more CPU and GPU time.");
         FILE.setComment("frame-generation",
@@ -99,7 +104,8 @@ public final class CausticaConfig {
                         + " minimum-interval-us controls frame limiting; 0 disables the limit.");
         FILE.setComment("lights",
                 " Controls direct lighting from glowing blocks such as torches, glowstone, and lava.\n"
-                        + " Set ris-candidates to 0 to disable it. stats, dump, and dump-radius are debugging options.");
+                        + " Set ris-candidates to 0 to disable it. ris-candidates-indirect applies after the first bounce\n"
+                        + " and is capped at ris-candidates. stats, dump, and dump-radius are debugging options.");
         FILE.setComment("tonemap",
                 " Controls the final image. gamma: 1 is neutral; lower values brighten midtones.");
         FILE.setComment("exposure",
@@ -536,6 +542,8 @@ public final class CausticaConfig {
         public static final class Composite {
             public static final BooleanSetting TLAS_CACHE =
                     bool("caustica.rt.tlasCache", "composite.tlas-cache", true);
+            public static final BooleanSetting TLAS_UPDATE =
+                    bool("caustica.rt.tlasUpdate", "composite.tlas-update", true);
             public static final IntSetting DEBUG_VIEW = intValue("caustica.rt.debugView", "composite.debug-view", 0);
             public static final IntSetting SPP = intAtLeast("caustica.rt.spp", "composite.spp", 1, 1);
             public static final IntSetting MAX_BOUNCES =
@@ -577,16 +585,27 @@ public final class CausticaConfig {
 
         /** RIS block-emitter lights. {@code ris-candidates = 0} disables everything. */
         public static final class Lights {
+            // Off by default: every pixel in a light-grid cell draws from the same finite per-frame pool, so
+            // the pool's sampling error is shared across the cell and shows up as region-wide light flicker.
             public static final BooleanSetting PRESAMPLING =
-                    bool("caustica.rt.lightPresampling", "lights.presampling", true);
+                    bool("caustica.rt.experimentalLightPresampling", "lights.experimental-presampling", false);
             public static final IntSetting RIS_CANDIDATES =
                     intAtLeast("caustica.rt.risCandidates", "lights.ris-candidates", 8, 0);
+            // Indirect hits contribute through a lower-throughput, already blurred path, so fewer candidates there
+            // add only independent per-pixel noise. At least 1 keeps RIS active wherever the emitter gate is.
+            public static final IntSetting RIS_CANDIDATES_INDIRECT =
+                    intAtLeast("caustica.rt.risCandidatesIndirect", "lights.ris-candidates-indirect", 4, 1);
             public static final FloatSetting MIN_FILL_RATIO =
                     finiteFloat("caustica.rt.lightMinFillRatio", "lights.min-fill-ratio", 0.25f);
             public static final BooleanSetting STATS = bool("caustica.rt.lightStats", "lights.stats", false);
             public static final BooleanSetting DUMP = bool("caustica.rt.lightDump", "lights.dump", false);
             public static final IntSetting DUMP_RADIUS =
                     intAtLeast("caustica.rt.lightDumpRadius", "lights.dump-radius", 12, 1);
+
+            /** Candidate count at indirect hits, never above the primary-terminal count. */
+            public static int indirectRisCandidates() {
+                return Math.min(RIS_CANDIDATES_INDIRECT.value(), RIS_CANDIDATES.value());
+            }
 
             private Lights() {
             }

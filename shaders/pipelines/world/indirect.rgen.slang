@@ -69,9 +69,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     bool showCelestial = seg.showCelestial;
     // Pass B treats every hit it sees as one indirect-depth step, regardless of material or selected
     // continuation lobe. Deliberately start at zero instead of seg.bounce: the first hit of either
-    // queued split branch is still the primary-terminal shading point. Hits 0 and 1 retain SSS; RIS
-    // remains active with its full configured candidate count at every hit. Pass A's primary/interface
-    // prefix is outside this SSS quality budget.
+    // queued split branch is still the primary-terminal shading point. Hits 0 and 1 retain SSS. RIS runs
+    // at every hit: hit 0 with risCandidates, later hits with risCandidatesIndirect, which the CPU clamps
+    // to [1, risCandidates] so a hit never skips RIS while its emitter gate assumes RIS sampled it.
+    // Pass A's primary/interface prefix is outside this SSS quality budget.
     int indirectDepth = 0;
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
@@ -118,6 +119,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
         int hitDepth = indirectDepth++;
+        uint risCandidates = hitDepth == 0 ? worldPush.risCandidates : worldPush.risCandidatesIndirect;
 
         // ---- Dielectric interface: water, stained glass, ice. ONE handler and one behaviour — every
         // dielectric is a volume. Fresnel from the relative index across the face, then reflect or
@@ -223,7 +225,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             if (risOn) {
                 float3 v = -rd;
                 Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                                         true, 0.0, seed, proposalSeed);
+                                         true, 0.0, risCandidates, seed, proposalSeed);
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                                                  true, 0.0);
             }
@@ -316,7 +318,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         if (risOn) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, false, activeSss,
-                                     seed, proposalSeed);
+                                     risCandidates, seed, proposalSeed);
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, false,
                                              activeSss);
         }
