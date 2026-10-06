@@ -251,7 +251,8 @@ public abstract class VulkanGpuSurfaceMixin {
 							caps.minImageCount(), caps.maxImageCount(), RtDlssFg.INSTANCE.plannedMultiFrameCount()));
 				}
 			}
-			if (RtDeviceBringup.reflexEnabled()) {
+			RtReflex.INSTANCE.swapchainRecreated();
+			if (RtReflex.enabled()) {
 				VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
 				latency.pNext(pCreateInfo.pNext());
 				latency.latencyModeEnable(true);
@@ -273,7 +274,7 @@ public abstract class VulkanGpuSurfaceMixin {
 		if (CausticaConfig.Rt.ENABLED.value()) {
 			RtDlssFg.INSTANCE.setSwapchainFrameLimit(this.swapchainImages.size(), caustica$fgSurfaceMinimumImages);
 		}
-		if (RtDeviceBringup.reflexEnabled()) {
+		if (RtReflex.enabled()) {
 			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
 		}
 		// DLSS-FG diagnostic: MAILBOX/IMMEDIATE present modes let a later present silently replace/skip an

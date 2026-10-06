@@ -212,7 +212,7 @@ public final class RtDeviceBringup {
         return ommEnabled;
     }
 
-    /** True if {@code VK_NV_low_latency2} (Reflex) was enabled on the device (gate on + device support). */
+    /** True if {@code VK_NV_low_latency2} (Reflex) was enabled on the device; {@link RtReflex#enabled()} decides use. */
     public static boolean reflexEnabled() {
         return reflexEnabled;
     }
@@ -378,7 +378,7 @@ public final class RtDeviceBringup {
         if (support.omm) {
             supported.add(VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
         }
-        if (reflexRequested() && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
+        if (physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)) {
             supported.add(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
             if (support.presentId) {
                 supported.add(VK_KHR_PRESENT_ID_EXTENSION_NAME);
@@ -389,10 +389,6 @@ public final class RtDeviceBringup {
 
     private static boolean ommRequested() {
         return CausticaConfig.Rt.Omm.ENABLED.value();
-    }
-
-    private static boolean reflexRequested() {
-        return CausticaConfig.Rt.Reflex.ENABLED.value();
     }
 
     /** Query every feature boolean Caustica might enable in one complete Features2 chain. */
@@ -414,8 +410,7 @@ public final class RtDeviceBringup {
             if (queryOmm) {
                 OMM_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
-            boolean queryPresentId = reflexRequested()
-                    && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)
+            boolean queryPresentId = physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME)
                     && physicalDevice.hasDeviceExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
             if (queryPresentId) {
                 PRESENT_ID_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
@@ -544,7 +539,9 @@ public final class RtDeviceBringup {
         }
 
         // Optional: NVIDIA Reflex (VK_NV_low_latency2). Function-only extension, no feature struct to add.
-        reflexEnabled = reflexRequested() && physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+        // Enabled whenever the GPU offers it: frame generation can be switched on mid-session and brings
+        // Reflex with it, and nothing runs until RtReflex.enabled().
+        reflexEnabled = physicalDevice.hasDeviceExtension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
 
         // Optional: VK_KHR_present_id (presentID<->present correlation for Reflex markers). Its absence must
         // not disable Reflex sleep/pacing itself — only marker correlation degrades.

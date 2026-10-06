@@ -66,8 +66,17 @@ public final class RtReflex {
     private RtReflex() {
     }
 
+    /**
+     * Reflex runs when configured, and always while DLSS Frame Generation is enabled: generated frames add a
+     * frame of latency that NVIDIA requires Reflex to offset. Read when a swapchain is configured; toggling
+     * frame generation reconfigures the swapchain.
+     */
+    public static boolean requested() {
+        return CausticaConfig.Rt.Reflex.ENABLED.value() || CausticaConfig.Rt.Fg.ENABLED.value();
+    }
+
     public static boolean enabled() {
-        return CausticaConfig.Rt.Reflex.ENABLED.value() && RtDeviceBringup.reflexEnabled();
+        return requested() && RtDeviceBringup.reflexEnabled();
     }
 
     /** Current sim frame's marker id (set by the last {@link #sleep} call) — tags SIMULATION/RENDERSUBMIT markers. */
@@ -83,6 +92,14 @@ public final class RtReflex {
      */
     public long advancePresentId() {
         return ++presentCounter;
+    }
+
+    /**
+     * Forget the swapchain sleep mode was applied to. Called whenever a new swapchain is created: a recycled
+     * handle value must not pass for one that already has sleep mode.
+     */
+    public void swapchainRecreated() {
+        sleepModeSwapchain = 0L;
     }
 
     /** The swapchain {@link #applySleepMode} last successfully applied to, or 0 if none (not yet ready). */

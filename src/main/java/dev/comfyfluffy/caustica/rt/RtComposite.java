@@ -236,6 +236,10 @@ public final class RtComposite {
     private int fgInterpH = -1;
     private int fgInterpFormat = Integer.MIN_VALUE;
     private boolean fgReset = true;
+    // Latched at multi-frame index 1 and reused by every generated frame of the same real frame.
+    private boolean fgFrameReset;
+    private final Matrix4f fgViewToClip = new Matrix4f();
+    private final Matrix4f fgClipToView = new Matrix4f();
     private final Matrix4f fgClipToPrev = new Matrix4f();
     private final Matrix4f fgPrevToClip = new Matrix4f();
     private final Matrix4f fgMatTmp = new Matrix4f();
@@ -2040,6 +2044,13 @@ public final class RtComposite {
                 throw new IllegalStateException("DLSSG feature not ready (ensureFgFeature failed)");
             }
             ensureFgInterp(ctx, count, swapW, swapH, fmt);
+            // Non-short-circuit: a pending FG request is consumed even when fgReset already forces the reset.
+            fgFrameReset = fgReset | RtDlssFg.INSTANCE.takeHistoryReset();
+            fgReset = false;
+            // The camera space is the rotation-only, camera-relative view the MV view-projections use, and
+            // depth is this projection's reversed Z, so DLSSG reconstructs positions consistently with gDepth.
+            fgViewToClip.set(frameProjection);
+            fgClipToView.set(frameProjection).invert();
             // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
             // the (rotation-only, camera-relative) MV view-projections, so jitter-free.
             fgMatTmp.set(mvCurProjView).invert();
@@ -2074,12 +2085,11 @@ public final class RtComposite {
                 out.view, out.image, fmt,
                 swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
                 true /* depthInverted (reversed-Z) */, hdrBackbuffer /* colorBuffersHDR */,
-                true /* cameraMotionIncluded (in mvecs) */, fgReset,
-                fgClipToPrev, fgPrevToClip);
+                true /* cameraMotionIncluded (in mvecs) */, fgFrameReset,
+                fgViewToClip, fgClipToView, fgClipToPrev, fgPrevToClip);
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(fg interpolate) failed");
         }
-        fgReset = false;
         if (!ok) {
             throw new IllegalStateException("ngxshim_evaluate_dlssg failed (RtDlssFg.evaluate returned false)");
         }
