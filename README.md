@@ -8,7 +8,7 @@
 
 ## 安装
 
-[下载 0.1.1-neoforge.4](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.4)
+[下载 0.1.1-neoforge.5](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.5)
 
 | Minecraft | NeoForge | Java |
 |---|---|---|
@@ -26,7 +26,7 @@
 
 ## 更新记录
 
-### 未发布
+### [0.1.1-neoforge.5](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.5) · 2026-10-06
 
 修了 0.1.1-neoforge.4 里方块光源闪烁的问题。
 
@@ -44,7 +44,7 @@
 
 - 地形没变时，不再每帧重写所有静态 TLAS 实例。四个 TLAS 槽位各自记住自己的地形数据，只在区块加载卸载、换世界或坐标重定位时刷新；整个场景都没动时直接跳过 TLAS 构建。
 - 实体照常每帧比较、更新。任何实体 BLAS 构建或 refit 之后，所有槽位都会重建一次，避免用到过期的包围盒。
-- 新增共享光照预采样（后来发现会导致光源闪烁，见上面的「未发布」）。
+- 新增共享光照预采样（后来发现会导致光源闪烁，已在 .5 默认关闭）。
 
 ### [0.1.1-neoforge.3](https://github.com/baizhizzl/caustica-neoforge/releases/tag/v0.1.1-neoforge.3) · 2026-10-02
 
