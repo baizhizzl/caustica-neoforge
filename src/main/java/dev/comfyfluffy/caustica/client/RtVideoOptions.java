@@ -244,7 +244,11 @@ public final class RtVideoOptions {
                     Component.translatable("caustica.options.rt.dlssQuality." + steps.get(position))),
             new OptionInstance.IntRange(0, steps.size() - 1),
             initialPosition,
-            position -> setting.set(steps.get(position)));
+            position -> {
+                setting.set(steps.get(position));
+                RtDlssRr.INSTANCE.requestHistoryReset();
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            });
     }
 
     private static OptionInstance<Boolean> hdrEnabled() {

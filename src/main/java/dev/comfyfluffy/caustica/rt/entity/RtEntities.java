@@ -277,6 +277,8 @@ public final class RtEntities {
     // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
     private final List<BeCandidate> beCandidates = new ArrayList<>();
+    // Candidates selected for emission this frame, ordered by position before their instances are built.
+    private final List<BeCandidate> beSelected = new ArrayList<>();
     private final ArrayDeque<BeCandidate> beCandidatePool = new ArrayDeque<>();
     // (Re)builds recorded so far this frame, reset each beginFrame; gates new BE builds to BE_BUILDS_PER_FRAME.
     private int beBuildsThisFrame;
@@ -510,11 +512,16 @@ public final class RtEntities {
         BlockEntity be;
         double dist2;
         long posKey;
+        // Resolved during preparation and emitted after the selected candidates are reordered by position.
+        BeEntry preparedEntry;
+        float[] preparedDisp;
 
         void set(BlockEntity be, double dist2, long posKey) {
             this.be = be;
             this.dist2 = dist2;
             this.posKey = posKey;
+            this.preparedEntry = null;
+            this.preparedDisp = null;
         }
     }
 
@@ -522,6 +529,9 @@ public final class RtEntities {
         int byDistance = Double.compare(a.dist2, b.dist2);
         return byDistance != 0 ? byDistance : Long.compare(a.posKey, b.posKey);
     };
+
+    // Emitted block entities are ordered by position so camera movement/rotation never permutes them.
+    private static final Comparator<BeCandidate> BE_POS_ORDER = (a, b) -> Long.compare(a.posKey, b.posKey);
 
     /** Reused per-frame lists; one slot is retired before it can be selected again. */
     private static final class FrameLists {
@@ -1088,6 +1098,8 @@ public final class RtEntities {
         for (int i = 0; i < candidates.size(); i++) {
             BeCandidate candidate = candidates.get(i);
             candidate.be = null;
+            candidate.preparedEntry = null;
+            candidate.preparedDisp = null;
             beCandidatePool.addLast(candidate);
         }
         candidates.clear();
@@ -1114,23 +1126,43 @@ public final class RtEntities {
         if (candidates.size() > 1) {
             candidates.sort(BE_CANDIDATE_ORDER);
         }
-        int firstBlockEntity = build.count;
-        for (BeCandidate candidate : candidates) {
-            if (build.full() || build.count - firstBlockEntity >= maxBlockEntities()) {
+        // Distance order decides which block entities fit the per-frame and per-total budgets; prepare them
+        // first, then emit the selected set ordered by position so the instance list stays stable.
+        beSelected.clear();
+        int blockEntityCap = maxBlockEntities();
+        int entityCap = maxEntities();
+        for (int read = 0; read < candidates.size() && beSelected.size() < blockEntityCap; read++) {
+            if (build.logicalCount + beSelected.size() >= entityCap) {
                 break;
             }
-            updateBlockEntity(ctx, build, beDispatcher, candidate.be, partial, now, rbx, rby, rbz);
+            BeCandidate candidate = candidates.get(read);
+            if (prepareBlockEntity(ctx, build, beDispatcher, candidate, partial, now)) {
+                beSelected.add(candidate);
+            }
         }
+        if (beSelected.size() > 1) {
+            beSelected.sort(BE_POS_ORDER);
+        }
+        for (BeCandidate candidate : beSelected) {
+            emitBe(ctx, build, candidate.preparedEntry, candidate.preparedDisp, rbx, rby, rbz);
+            candidate.preparedEntry = null;
+            candidate.preparedDisp = null;
+        }
+        beSelected.clear();
     }
 
-    /** Re-mesh one block entity; rebuild its cached BLAS only if the mesh changed (budgeted); then emit it. */
-    private void updateBlockEntity(RtContext ctx, FrameBuild build, BlockEntityRenderDispatcher beDispatcher,
-                                   BlockEntity be, float partial, long now, int rbx, int rby, int rbz) {
+    /**
+     * Re-mesh one block entity and resolve the entry/displacement to emit; rebuild its cached BLAS only if
+     * the mesh changed (budgeted). Returns whether the candidate is selected for emission this frame.
+     */
+    private boolean prepareBlockEntity(RtContext ctx, FrameBuild build, BlockEntityRenderDispatcher beDispatcher,
+                                       BeCandidate candidate, float partial, long now) {
+        BlockEntity be = candidate.be;
         capture.reset();
         try {
             BlockEntityRenderState state = beDispatcher.tryExtractRenderState(be, partial, null, false);
             if (state == null) {
-                return; // off-screen-only (beacon/end-gateway), distance-culled, or no renderer
+                return false; // off-screen-only (beacon/end-gateway), distance-culled, or no renderer
             }
             collector.begin(capture, false);
             // Identity pose ⇒ block-local mesh; world placement is the per-frame instance transform in emitBe.
@@ -1143,7 +1175,7 @@ public final class RtEntities {
             collector.begin(null, false);
         }
         if (capture.isEmpty()) {
-            return;
+            return false;
         }
         long key = be.getBlockPos().asLong();
         BeEntry entry = beCache.get(key);
@@ -1156,10 +1188,12 @@ public final class RtEntities {
             // Geometry changed (or new BE) → rebuild, but only within this frame's budget. Over budget: keep
             // showing the previous geometry; a brand-new BE simply pops in over the next frames.
             if (beBuildsThisFrame >= beBuildsPerFrame()) {
-                if (entry != null) {
-                    emitBe(ctx, build, entry, null, rbx, rby, rbz); // over budget: keep last geometry, no MV
+                if (entry == null) {
+                    return false;
                 }
-                return;
+                candidate.preparedEntry = entry; // over budget: keep last geometry, no MV
+                candidate.preparedDisp = null;
+                return true;
             }
             // Per-vertex MV from the previous build's block-local mesh (same vertex count ⇒ pairable).
             // The BE itself doesn't move, so the world displacement is the pure local delta.
@@ -1174,7 +1208,9 @@ public final class RtEntities {
             beCache.put(key, rebuilt);
             entry = rebuilt;
         }
-        emitBe(ctx, build, entry, disp, rbx, rby, rbz);
+        candidate.preparedEntry = entry;
+        candidate.preparedDisp = disp;
+        return true;
     }
 
     /** Upload the already-captured BE mesh to fresh buffers and build its BLAS (block-local). */
@@ -1995,6 +2031,7 @@ public final class RtEntities {
         nameTagBatches.clear();
         resetPoseStack(blockEntityPoseStack);
         beCandidates.clear();
+        beSelected.clear();
         beCandidatePool.clear();
         retainedGeometryBytes = 0L;
         collector.clearCaches();

@@ -200,6 +200,9 @@ public final class RtComposite {
     // Set true after this frame's display dispatch wrote hdrDisplayImage (HDR enabled + RT ran); gates the
     // HDR present blit so a frame where RT did not run falls back to the vanilla SDR present.
     private boolean hdrWrittenThisFrame;
+    // Set true once this frame recorded the world trace that produced the guide buffers. Gates DLSS-FG so an
+    // interpolated frame never reprojects against guides left over from a frame that skipped RT.
+    private boolean rtRenderedThisFrame;
     // DLSS-FG "hudless" resource: a copy of the main render target before the combined UI overlay
     // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
     // active), resized on demand.
@@ -532,6 +535,8 @@ public final class RtComposite {
             throw new IllegalStateException("Previous RT graphics use was never completed");
         }
         RtFrameStats.FRAME.beginIfInactive();
+        frameCaptured = false;
+        rtRenderedThisFrame = false;
         hdrWrittenThisFrame = false;
     }
 
@@ -565,6 +570,7 @@ public final class RtComposite {
         frameCounter++; // global frame serial used by remaining per-frame/entity rings and diagnostics
         VulkanDiagnostics.setInFlight("graphics-latest", "frame=" + frameCounter + " size=" + width + "x" + height);
         hdrWrittenThisFrame = false; // set true again below once this frame's HDR display image is written
+        rtRenderedThisFrame = false;
         if (failed) {
             return false;
         }
@@ -838,6 +844,9 @@ public final class RtComposite {
         setCelestialUvAtlas(0L);
         RtEntities.INSTANCE.onResourceReload();
         RtContext ctx = RtContext.currentOrNull();
+        // Invalidate and join terrain worker tasks before the pipeline/material teardown below, so no worker
+        // can still reference the textures the reload is about to replace.
+        RtTerrain.onResourceReloadStart(ctx);
         if (ctx != null) {
             ctx.waitIdle();
             if (worldPipeline != null) {
@@ -1318,6 +1327,7 @@ public final class RtComposite {
         // every owner in this frame's manifest is protected through the final overlay consumer.
         RtEntities.INSTANCE.markGraphicsUse(frameEntities, graphicsUse);
         exposure.markStateReadbackUse(graphicsUse);
+        rtRenderedThisFrame = true;
     }
 
     /**
@@ -1489,9 +1499,8 @@ public final class RtComposite {
             lightPresampling.destroy();
             lightPresampling = null;
         }
-        if (RtDlssRr.enabled()) {
-            RtDlssRr.INSTANCE.destroy();
-        }
+        // Always tear the feature down: it may have been allocated while enabled and then disabled mid-session.
+        RtDlssRr.INSTANCE.destroy();
         if (displayImage != null) {
             displayImage.destroy();
             displayImage = null;
@@ -1600,6 +1609,9 @@ public final class RtComposite {
             }
             atlasSampler = 0L;
         }
+        frameCaptured = false;
+        rtRenderedThisFrame = false;
+        hdrWrittenThisFrame = false;
     }
 
     private long atlasSampler(RtContext ctx) {
@@ -2009,7 +2021,8 @@ public final class RtComposite {
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
-        if (failed || gDepth == null || gMotion == null || !frameCaptured) {
+        if (failed || !rtRenderedThisFrame || gDepth == null || gMotion == null || !frameCaptured) {
+            fgReset = true;
             return null;
         }
         RtContext ctx = RtContext.currentOrNull();
@@ -2023,10 +2036,12 @@ public final class RtComposite {
             }
             ensureFgInterp(ctx, count, swapW, swapH, fmt);
             // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
-            // the (rotation-only, camera-relative) MV view-projections, so jitter-free.
+            // the (rotation-only, camera-relative) MV view-projections, so jitter-free. updateMotion() has
+            // already advanced mvPrevProjView to the current frame, so this frame's previous view-projection
+            // is mvPushMatrix.
             fgMatTmp.set(mvCurProjView).invert();
-            fgClipToPrev.set(mvPrevProjView).mul(fgMatTmp);
-            fgMatTmp.set(mvPrevProjView).invert();
+            fgClipToPrev.set(mvPushMatrix).mul(fgMatTmp);
+            fgMatTmp.set(mvPushMatrix).invert();
             fgPrevToClip.set(mvCurProjView).mul(fgMatTmp);
         }
         if (index < 1 || index > fgInterp.length || fgInterp[index - 1] == null) {

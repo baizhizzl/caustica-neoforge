@@ -11,6 +11,10 @@ final class RtTlasCacheTest {
         return new RtAccel.Instance(new float[] {1, 0, 0, 2, 0, 1, 0, 3, 0, 0, 1, 4}, address, index, mask, sbt);
     }
 
+    private static RtAccel.Instance at(float x, float y, float z, long address, int index) {
+        return new RtAccel.Instance(new float[] {1, 0, 0, x, 0, 1, 0, y, 0, 0, 1, z}, address, index, 255, 4);
+    }
+
     @Test
     void coldSlotsNeedAnUploadAndABuildEvenForAnEmptyScene() {
         RtTlasCache cache = new RtTlasCache();
@@ -117,13 +121,15 @@ final class RtTlasCacheTest {
     void onlyAnUnchangedPublicationWithEqualCountsCanBeRefit() {
         Object source = new Object();
         RtTlasCache cache = new RtTlasCache();
-        assertFalse(cache.canUpdate(source, 3, 10, 1), "a cold slot has no result to refit");
-        cache.built(source, 3, 10, List.of(instance(100, 2, 255, 4)), 0, false);
-        assertTrue(cache.canUpdate(source, 3, 10, 1));
-        assertFalse(cache.canUpdate(source, 3, 10, 2), "instance count changed");
-        assertFalse(cache.canUpdate(source, 3, 11, 1), "static instance count changed");
-        assertFalse(cache.canUpdate(source, 4, 10, 1), "terrain publication changed");
-        assertFalse(cache.canUpdate(new Object(), 3, 10, 1), "world identity changed");
+        var dynamic = List.of(instance(100, 2, 255, 4));
+        assertFalse(cache.canUpdate(source, 3, 10, dynamic), "a cold slot has no result to refit");
+        cache.built(source, 3, 10, dynamic, 0, false);
+        assertTrue(cache.canUpdate(source, 3, 10, dynamic));
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(instance(100, 2, 255, 4), instance(100, 2, 255, 4))),
+                "instance count changed");
+        assertFalse(cache.canUpdate(source, 3, 11, dynamic), "static instance count changed");
+        assertFalse(cache.canUpdate(source, 4, 10, dynamic), "terrain publication changed");
+        assertFalse(cache.canUpdate(new Object(), 3, 10, dynamic), "world identity changed");
     }
 
     @Test
@@ -132,12 +138,58 @@ final class RtTlasCacheTest {
         RtTlasCache cache = new RtTlasCache();
         cache.built(source, 3, 10, List.of(instance(100, 2, 255, 4)), 0, false);
         for (int i = 0; i < RtTlasCache.MAX_CONSECUTIVE_UPDATES; i++) {
-            assertTrue(cache.canUpdate(source, 3, 10, 1));
+            assertTrue(cache.canUpdate(source, 3, 10, List.of(instance(100 + i, 2, 255, 4))));
             cache.built(source, 3, 10, List.of(instance(100 + i, 2, 255, 4)), 0, true);
         }
-        assertFalse(cache.canUpdate(source, 3, 10, 1));
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(instance(100, 2, 255, 4))));
         cache.built(source, 3, 10, List.of(instance(500, 2, 255, 4)), 0, false);
-        assertTrue(cache.canUpdate(source, 3, 10, 1));
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(instance(500, 2, 255, 4))));
+    }
+
+    @Test
+    void smallMovementAndBlasAddressChangesStillPermitARefit() {
+        Object source = new Object();
+        RtTlasCache cache = new RtTlasCache();
+        cache.built(source, 3, 10, List.of(at(0, 0, 0, 100, 2)), 0, false);
+        // 1–3 block step plus a new refit-ring BLAS address for the same instance.
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(at(1, 0, 0, 201, 2))));
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(at(-2, 1, 2, 202, 2))));
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(at(3, 0, 0, 203, 2))));
+        // A 4-block displacement is exactly the supported maximum.
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(at(0, 4, 0, 204, 2))));
+    }
+
+    @Test
+    void metadataChangesRejectARefit() {
+        Object source = new Object();
+        // 0x800000 = entity kind bit, 0x400000 = particle kind bit (RtAccel.INSTANCE_KIND_MASK).
+        RtTlasCache maskCache = new RtTlasCache();
+        maskCache.built(source, 3, 10, List.of(instance(100, 0x800001, 255, 4)), 0, false);
+        assertFalse(maskCache.canUpdate(source, 3, 10, List.of(instance(100, 0x800001, 127, 4))),
+                "visibility mask changed");
+
+        RtTlasCache sbtCache = new RtTlasCache();
+        sbtCache.built(source, 3, 10, List.of(instance(100, 0x800001, 255, 4)), 0, false);
+        assertFalse(sbtCache.canUpdate(source, 3, 10, List.of(instance(100, 0x800001, 255, 8))),
+                "SBT record offset changed");
+
+        RtTlasCache kindCache = new RtTlasCache();
+        kindCache.built(source, 3, 10, List.of(instance(100, 0x800001, 255, 4)), 0, false);
+        assertFalse(kindCache.canUpdate(source, 3, 10, List.of(instance(100, 0x400001, 255, 4))),
+                "entity kind bit became the particle kind bit");
+        // The non-kind custom-index bits may change without rejecting the refit.
+        assertTrue(kindCache.canUpdate(source, 3, 10, List.of(instance(100, 0x800002, 255, 4))));
+    }
+
+    @Test
+    void largeDisplacementRejectsARefit() {
+        Object source = new Object();
+        RtTlasCache cache = new RtTlasCache();
+        cache.built(source, 3, 10, List.of(at(0, 0, 0, 100, 0x800001)), 0, false);
+        // Two distant instances swapped, or one despawned and another spawned far away.
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(at(5, 0, 0, 100, 0x800001))));
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(at(0, 0, -100, 100, 0x800001))));
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(at(Float.NaN, 0, 0, 100, 0x800001))));
     }
 
     @Test

@@ -10,6 +10,9 @@ final class RtTlasCache {
      * this rebuilds each slot at least every 64 frames.
      */
     static final int MAX_CONSECUTIVE_UPDATES = 15;
+    // A refit keeps the last BUILD's leaf bounds; an instance that moved further than this between slot uses
+    // (a swap, respawn or teleport) would stretch those bounds across the world, so it needs a full BUILD.
+    static final float MAX_REFIT_DISPLACEMENT_SQ = 16.0f;
     private Object writtenSource;
     private long writtenRevision;
     private int writtenCount = -1;
@@ -55,12 +58,33 @@ final class RtTlasCache {
 
     /**
      * Whether the slot's last accepted result can be refit in place: the terrain publication and both
-     * instance counts match, so only dynamic transforms, BLAS references or BLAS bounds differ.
+     * instance counts match, no instance changed its kind bits, mask or SBT offset, and every instance
+     * moved at most {@link #MAX_REFIT_DISPLACEMENT_SQ} since then, so only transforms and BLAS addresses differ.
      */
-    boolean canUpdate(Object source, long revision, int baseCount, int dynamicInstanceCount) {
-        return builtBaseCount >= 0 && builtBaseCount == baseCount && builtSource == source
-                && builtRevision == revision && dynamicCount == dynamicInstanceCount
-                && updatesSinceBuild < MAX_CONSECUTIVE_UPDATES;
+    boolean canUpdate(Object source, long revision, int baseCount, List<RtAccel.Instance> dynamic) {
+        if (builtBaseCount < 0 || builtBaseCount != baseCount || builtSource != source
+                || builtRevision != revision || dynamicCount != dynamic.size()
+                || updatesSinceBuild >= MAX_CONSECUTIVE_UPDATES) {
+            return false;
+        }
+        for (int i = 0; i < dynamicCount; i++) {
+            RtAccel.Instance instance = dynamic.get(i);
+            int m = i * 3;
+            if ((metadata[m] & RtAccel.INSTANCE_KIND_MASK) != (instance.customIndex() & RtAccel.INSTANCE_KIND_MASK)
+                    || metadata[m + 1] != instance.mask()
+                    || metadata[m + 2] != instance.sbtRecordOffset()) {
+                return false;
+            }
+            float[] matrix = instance.transform3x4();
+            float dx = matrix[3] - Float.intBitsToFloat(transforms[i * 12 + 3]);
+            float dy = matrix[7] - Float.intBitsToFloat(transforms[i * 12 + 7]);
+            float dz = matrix[11] - Float.intBitsToFloat(transforms[i * 12 + 11]);
+            float distSq = dx * dx + dy * dy + dz * dz;
+            if (!Float.isFinite(distSq) || distSq > MAX_REFIT_DISPLACEMENT_SQ) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** Committed only after the encoder accepts the complete frame; the slot's graphics timeline guards reuse. */

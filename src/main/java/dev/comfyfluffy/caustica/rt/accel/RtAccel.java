@@ -360,6 +360,11 @@ public final class RtAccel {
     public static final int SBT_TERRAIN_SHADOW_OFFSET = SBT_RAY_SHADOW * TERRAIN_BUCKETS;
     public static final int SBT_ENTITY_OFFSET = TERRAIN_BUCKETS * 2;
     public static final int SBT_HIT_GROUP_COUNT = SBT_ENTITY_OFFSET + TERRAIN_BUCKETS * 2;
+    /**
+     * The custom-index kind bits (entity vs particle) within the 24-bit {@code instanceCustomIndex}. A TLAS
+     * refit must not change them: the hit shader forwards entity hits and particles through different paths.
+     */
+    public static final int INSTANCE_KIND_MASK = 0xC00000;
 
     /**
      * Result of {@link #prepareUpdatableBlasBuild}: the per-frame BUILD op to record, plus the persistent
@@ -1045,7 +1050,7 @@ public final class RtAccel {
         if (writeStatic) slot.cache.staticRangeWritten(baseInstances, staticRevision, baseCount);
         // Same terrain publication and instance counts: refit the slot's previous result in place.
         boolean update = buildRequired && slot.allowUpdate
-                && slot.cache.canUpdate(baseInstances, staticRevision, baseCount, dynamicInstances.size());
+                && slot.cache.canUpdate(baseInstances, staticRevision, baseCount, dynamicInstances);
         slot.graphicsUse.mark(graphicsUse);
         return new PreparedTlas(slot.accel, slot.instanceBuffer, slot.scratch, count,
                 "frame TLAS " + count + " instances", slot, baseInstances, dynamicInstances,

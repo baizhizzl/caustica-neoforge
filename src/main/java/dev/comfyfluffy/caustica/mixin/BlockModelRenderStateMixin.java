@@ -57,7 +57,7 @@ public abstract class BlockModelRenderStateMixin implements ContainedBlockSource
         // world model through FRAPI so custom geometry and wrapper transforms are retained even when the
         // display set hands the block to a special renderer. Replaces only the RT-capture submission.
         Matrix4fc transform = this.transformation != null ? this.transformation : this.specialRendererTransformation;
-        rt.captureBlockState(this.caustica$containedState, transform, poseStack);
+        rt.captureBlockState(this.caustica$containedState, transform, poseStack, outlineColor);
         ci.cancel();
     }
 }
