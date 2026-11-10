@@ -1206,8 +1206,11 @@ public final class RtTerrain {
         try {
             if (isTaskCurrent(result.task())) {
                 completedBuilds.add(result);
-            } else if (result.prepared() != null) {
-                destroyPreparedSection(result.prepared());
+            } else {
+                RtTerrainOmm.clearCache();
+                if (result.prepared() != null) {
+                    destroyPreparedSection(result.prepared());
+                }
             }
         } finally {
             finishActiveTask();
@@ -1215,7 +1218,9 @@ public final class RtTerrain {
     }
 
     private boolean isTaskCurrent(SectionTask task) {
-        return task.terrainEpoch == terrainEpoch;
+        return !fullClearRequested
+                && task.terrainEpoch == terrainEpoch
+                && task.materialEpoch == RtMaterialRegistry.INSTANCE.epoch();
     }
 
     private void beginActiveTask() {
@@ -1674,6 +1679,7 @@ public final class RtTerrain {
         // Device teardown is the one path that must prove every worker and GPU callback has relinquished
         // its resources before the executor, allocator, and VkDevice disappear.
         terrainEpoch++;
+        RtTerrainOmm.clearCache();
         lightGrid.cancelPending();
         drainTasksForClear(ctx);
         cancelAllDirtyGroups();
@@ -1755,6 +1761,7 @@ public final class RtTerrain {
         staticInstancesRevision++;
         ctx.gpuExecutor().throwIfFailed();
         terrainEpoch++;
+        RtTerrainOmm.clearCache();
 
         // Token maps are render-thread ownership, so clearing them makes every old completion unpublishable
         // even in the narrow race where it observed the previous epoch immediately before this increment.

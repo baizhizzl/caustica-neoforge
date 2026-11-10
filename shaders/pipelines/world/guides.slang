@@ -180,6 +180,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
 
         uint material = payloadMaterial();
         float3 interfacePos = ro + direction * payload.hitT;
+        rayConeWidth = max(rayConeWidth + rayConeSpread * payload.hitT, RAY_CONE_MIN_WIDTH);
         if (material == MATERIAL_OPAQUE || material == MATERIAL_PARTICLE) {
             float endpointRoughness = material == MATERIAL_PARTICLE
                     ? 1.0 : clamp(payloadRoughness(), 0.0, 1.0);

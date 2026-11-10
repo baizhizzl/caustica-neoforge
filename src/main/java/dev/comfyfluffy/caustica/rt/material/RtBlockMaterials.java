@@ -139,160 +139,175 @@ public final class RtBlockMaterials {
     /** Compile, pack, mip, upload, and publish block-atlas plus authored entity material pages. */
     public void prepareAll(RtContext ctx, int materialPageCapacity, RtEmissionSemantics emissionSemantics,
                            RtMaterialOverrides overrides) {
-        List<TextureAtlasSprite> sprites = blockSprites();
-        List<Candidate> authored = new ArrayList<>();
-        int specCount = 0;
-        int normalCount = 0;
-        int heuristicCount = 0;
-        int largest = 1 + 2 * GUTTER;
-        for (TextureAtlasSprite sprite : sprites) {
-            if (sprite == null) continue;
-            Identifier name = sprite.contents().name();
-            Identifier spec = sibling(name, "_s.png");
-            Identifier normal = sibling(name, "_n.png");
-            int features = 0;
-            if (resourceExists(spec)) {
-                features |= RtMaterialRegistry.FEATURE_SPEC;
-                specCount++;
-            }
-            if (resourceExists(normal)) {
-                features |= RtMaterialRegistry.FEATURE_NORMAL;
-                normalCount++;
-            }
-            // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
-            // sprites proven to occur on an emitting block state. A resource-pack
-            // emission.strength_cd_m2 override replaces the level once resolved — it never
-            // changes which sprites get a mask compiled here.
-            if ((features & RtMaterialRegistry.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
-                features |= RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION;
-                heuristicCount++;
-            }
-            if (features != 0) {
-                int width = sprite.contents().width();
-                int height = sprite.contents().height();
-                largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
-                authored.add(new Candidate(sprite, name, null, features, spec, normal, width, height));
-            }
-        }
-        Map<Identifier, Integer> resourceFeatures = discoverEntityMaterialResources(sprites, overrides);
-        for (Map.Entry<Identifier, Integer> discovered : resourceFeatures.entrySet()) {
-            Identifier albedo = discovered.getKey();
-            int features = discovered.getValue();
-            try (NativeImage image = load(albedo)) {
-                if (image == null || image.getWidth() <= 0 || image.getHeight() <= 0) continue;
-                Identifier name = logicalTextureName(albedo);
-                int width = image.getWidth();
-                int height = image.getHeight();
-                Identifier spec = siblingTexture(albedo, "_s");
-                Identifier normal = siblingTexture(albedo, "_n");
-                largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
-                authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
-                if ((features & RtMaterialRegistry.FEATURE_SPEC) != 0) specCount++;
-                if ((features & RtMaterialRegistry.FEATURE_NORMAL) != 0) normalCount++;
-            } catch (Throwable t) {
-                warnOnce("RT entity material albedo load failed for " + albedo, t);
-            }
-        }
-
-        int pageSize = authored.isEmpty() ? 32 : Math.max(DEFAULT_PAGE_SIZE, nextPowerOfTwo(largest));
-        if (pageSize > MAX_PAGE_SIZE) {
-            CausticaMod.LOGGER.warn("RT material sprite exceeds canonical page limit ({} > {}); oversized maps use neutral fallback",
-                    pageSize, MAX_PAGE_SIZE);
-            pageSize = MAX_PAGE_SIZE;
-            authored.removeIf(candidate -> candidate.width + 2 * GUTTER > MAX_PAGE_SIZE
-                    || candidate.height + 2 * GUTTER > MAX_PAGE_SIZE);
-            if (authored.isEmpty()) pageSize = 32;
-        }
-        authored.sort(Comparator.<Candidate>comparingInt(candidate -> candidate.height).reversed()
-                .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
-                .thenComparing(candidate -> candidate.name.toString()));
-
-        List<LayoutPage> layouts = new ArrayList<>();
-        layouts.add(new LayoutPage(pageSize, true));
-        for (Candidate candidate : authored) {
-            boolean placed = false;
-            for (int i = 0; i < layouts.size(); i++) {
-                if (layouts.get(i).place(candidate)) {
-                    candidate.page = i;
-                    placed = true;
-                    break;
+        reset();
+        try {
+            List<TextureAtlasSprite> sprites = blockSprites();
+            List<Candidate> authored = new ArrayList<>();
+            int specCount = 0;
+            int normalCount = 0;
+            int heuristicCount = 0;
+            int largest = 1 + 2 * GUTTER;
+            for (TextureAtlasSprite sprite : sprites) {
+                if (sprite == null) continue;
+                Identifier name = sprite.contents().name();
+                Identifier spec = sibling(name, "_s.png");
+                Identifier normal = sibling(name, "_n.png");
+                int features = 0;
+                if (resourceExists(spec)) {
+                    features |= RtMaterialRegistry.FEATURE_SPEC;
+                    specCount++;
+                }
+                if (resourceExists(normal)) {
+                    features |= RtMaterialRegistry.FEATURE_NORMAL;
+                    normalCount++;
+                }
+                // Authored LabPBR owns emission whenever _s exists. Albedo inference is only compiled for
+                // sprites proven to occur on an emitting block state. A resource-pack
+                // emission.strength_cd_m2 override replaces the level once resolved — it never
+                // changes which sprites get a mask compiled here.
+                if ((features & RtMaterialRegistry.FEATURE_SPEC) == 0 && emissionSemantics.permits(sprite)) {
+                    features |= RtMaterialRegistry.FEATURE_HEURISTIC_EMISSION;
+                    heuristicCount++;
+                }
+                if (features != 0) {
+                    int width = sprite.contents().width();
+                    int height = sprite.contents().height();
+                    largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
+                    authored.add(new Candidate(sprite, name, null, features, spec, normal, width, height));
                 }
             }
-            if (!placed) {
-                LayoutPage page = new LayoutPage(pageSize, false);
-                if (!page.place(candidate)) continue;
-                candidate.page = layouts.size();
-                layouts.add(page);
+            Map<Identifier, Integer> resourceFeatures = discoverEntityMaterialResources(sprites, overrides);
+            for (Map.Entry<Identifier, Integer> discovered : resourceFeatures.entrySet()) {
+                Identifier albedo = discovered.getKey();
+                int features = discovered.getValue();
+                try (NativeImage image = load(albedo)) {
+                    if (image == null || image.getWidth() <= 0 || image.getHeight() <= 0) continue;
+                    Identifier name = logicalTextureName(albedo);
+                    int width = image.getWidth();
+                    int height = image.getHeight();
+                    Identifier spec = siblingTexture(albedo, "_s");
+                    Identifier normal = siblingTexture(albedo, "_n");
+                    largest = Math.max(largest, Math.max(width, height) + 2 * GUTTER);
+                    authored.add(new Candidate(null, name, albedo, features, spec, normal, width, height));
+                    if ((features & RtMaterialRegistry.FEATURE_SPEC) != 0) specCount++;
+                    if ((features & RtMaterialRegistry.FEATURE_NORMAL) != 0) normalCount++;
+                } catch (Throwable t) {
+                    warnOnce("RT entity material albedo load failed for " + albedo, t);
+                }
             }
-        }
-        if (layouts.size() > materialPageCapacity) {
-            throw new IllegalStateException("RT material pages require " + layouts.size()
-                    + " descriptor slots but capacity is " + materialPageCapacity);
-        }
 
-        int mipCount = Integer.numberOfTrailingZeros(pageSize) + 1;
-        PagePixels[] pagePixels = new PagePixels[layouts.size()];
-        for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
-            pagePixels[pageIndex] = new PagePixels(pageSize, mipCount);
-        }
-        pagePixels[0].writeFallback();
-        // Decode + blit in parallel: each candidate owns a disjoint (aligned, gutter-inclusive) cell of
-        // its page, so writes never overlap; failures only touch the candidate's own fields.
-        authored.parallelStream().forEach(candidate -> {
-            try {
-                Decoded decoded = decode(candidate);
-                candidate.emissionSummary = decoded.emissionSummary();
-                candidate.emissionGrid = decoded.emissionGrid();
-                pagePixels[candidate.page].write(candidate, decoded.levels());
-            } catch (Throwable t) {
-                warnOnce("RT canonical material decode failed for " + candidate.name, t);
-                candidate.page = -1;
+            int pageSize = authored.isEmpty() ? 32 : Math.max(DEFAULT_PAGE_SIZE, nextPowerOfTwo(largest));
+            if (pageSize > MAX_PAGE_SIZE) {
+                CausticaMod.LOGGER.warn("RT material sprite exceeds canonical page limit ({} > {}); oversized maps use neutral fallback",
+                        pageSize, MAX_PAGE_SIZE);
+                pageSize = MAX_PAGE_SIZE;
+                authored.removeIf(candidate -> candidate.width + 2 * GUTTER > MAX_PAGE_SIZE
+                        || candidate.height + 2 * GUTTER > MAX_PAGE_SIZE);
+                if (authored.isEmpty()) pageSize = 32;
             }
-        });
-        for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
-            PagePixels pixels = pagePixels[pageIndex];
-            pages.add(new Page(
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface0,
-                            "material surface0 page " + pageIndex),
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
-                            "material normalAo page " + pageIndex),
-                    new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
-                            "material surface1 page " + pageIndex),
-                    pageIndex));
-        }
+            authored.sort(Comparator.<Candidate>comparingInt(candidate -> candidate.height).reversed()
+                    .thenComparing(Comparator.comparingInt((Candidate candidate) -> candidate.width).reversed())
+                    .thenComparing(candidate -> candidate.name.toString()));
 
-        float fallbackUv = GUTTER / (float) pageSize;
-        fallback = new Entry(0, 0, 0, fallbackUv, fallbackUv,
-                1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1,
-                RtMaterialDesc.EmissionSummary.NONE, null);
-        for (TextureAtlasSprite sprite : sprites) {
-            if (sprite != null) entries.put(sprite, fallbackFor(sprite));
-        }
-        for (Candidate candidate : authored) {
-            if (candidate.page < 0) continue;
-            int maxLod = maxLodFor(candidate.width, candidate.height);
-            Entry entry = new Entry(candidate.features, candidate.page, maxLod,
-                    candidate.x / (float) pageSize, candidate.y / (float) pageSize,
-                    candidate.width / (float) pageSize, candidate.height / (float) pageSize,
-                    candidate.blockSprite() ? candidate.sprite.getU0() : 0.0f,
-                    candidate.blockSprite() ? candidate.sprite.getV0() : 0.0f,
-                    candidate.blockSprite() ? inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()) : 1.0f,
-                    candidate.blockSprite() ? inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()) : 1.0f,
-                    candidate.emissionSummary, candidate.emissionGrid);
-            if (candidate.blockSprite()) entries.put(candidate.sprite, entry);
-            else resourceEntries.put(candidate.name, entry);
-        }
+            List<LayoutPage> layouts = new ArrayList<>();
+            layouts.add(new LayoutPage(pageSize, true));
+            for (Candidate candidate : authored) {
+                boolean placed = false;
+                for (int i = 0; i < layouts.size(); i++) {
+                    if (layouts.get(i).place(candidate)) {
+                        candidate.page = i;
+                        placed = true;
+                        break;
+                    }
+                }
+                if (!placed) {
+                    LayoutPage page = new LayoutPage(pageSize, false);
+                    if (!page.place(candidate)) continue;
+                    candidate.page = layouts.size();
+                    layouts.add(page);
+                }
+            }
+            if (layouts.size() > materialPageCapacity) {
+                throw new IllegalStateException("RT material pages require " + layouts.size()
+                        + " descriptor slots but capacity is " + materialPageCapacity);
+            }
 
-        long bytesPerBundle = 0L;
-        int w = pageSize;
-        for (int mip = 0; mip < mipCount; mip++) {
-            bytesPerBundle += (long) w * w * 4L;
-            w = Math.max(1, w / 2);
+            int mipCount = Integer.numberOfTrailingZeros(pageSize) + 1;
+            PagePixels[] pagePixels = new PagePixels[layouts.size()];
+            for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
+                pagePixels[pageIndex] = new PagePixels(pageSize, mipCount);
+            }
+            pagePixels[0].writeFallback();
+            // Decode + blit in parallel: each candidate owns a disjoint (aligned, gutter-inclusive) cell of
+            // its page, so writes never overlap; failures only touch the candidate's own fields.
+            authored.parallelStream().forEach(candidate -> {
+                try {
+                    Decoded decoded = decode(candidate);
+                    candidate.emissionSummary = decoded.emissionSummary();
+                    candidate.emissionGrid = decoded.emissionGrid();
+                    pagePixels[candidate.page].write(candidate, decoded.levels());
+                } catch (Throwable t) {
+                    warnOnce("RT canonical material decode failed for " + candidate.name, t);
+                    candidate.page = -1;
+                }
+            });
+            for (int pageIndex = 0; pageIndex < layouts.size(); pageIndex++) {
+                PagePixels pixels = pagePixels[pageIndex];
+                RtMaterialPageTexture surface0 = null;
+                RtMaterialPageTexture normalAo = null;
+                RtMaterialPageTexture surface1 = null;
+                try {
+                    surface0 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface0,
+                            "material surface0 page " + pageIndex);
+                    normalAo = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.normalAo,
+                            "material normalAo page " + pageIndex);
+                    surface1 = new RtMaterialPageTexture(ctx, pageSize, pageSize, pixels.surface1,
+                            "material surface1 page " + pageIndex);
+                    pages.add(new Page(surface0, normalAo, surface1, pageIndex));
+                } catch (Throwable t) {
+                    if (surface1 != null) surface1.destroy();
+                    if (normalAo != null) normalAo.destroy();
+                    if (surface0 != null) surface0.destroy();
+                    throw t;
+                }
+            }
+
+            float fallbackUv = GUTTER / (float) pageSize;
+            fallback = new Entry(0, 0, 0, fallbackUv, fallbackUv,
+                    1.0f / pageSize, 1.0f / pageSize, 0, 0, 1, 1,
+                    RtMaterialDesc.EmissionSummary.NONE, null);
+            for (TextureAtlasSprite sprite : sprites) {
+                if (sprite != null) entries.put(sprite, fallbackFor(sprite));
+            }
+            for (Candidate candidate : authored) {
+                if (candidate.page < 0) continue;
+                int maxLod = maxLodFor(candidate.width, candidate.height);
+                Entry entry = new Entry(candidate.features, candidate.page, maxLod,
+                        candidate.x / (float) pageSize, candidate.y / (float) pageSize,
+                        candidate.width / (float) pageSize, candidate.height / (float) pageSize,
+                        candidate.blockSprite() ? candidate.sprite.getU0() : 0.0f,
+                        candidate.blockSprite() ? candidate.sprite.getV0() : 0.0f,
+                        candidate.blockSprite() ? inverseExtent(candidate.sprite.getU1() - candidate.sprite.getU0()) : 1.0f,
+                        candidate.blockSprite() ? inverseExtent(candidate.sprite.getV1() - candidate.sprite.getV0()) : 1.0f,
+                        candidate.emissionSummary, candidate.emissionGrid);
+                if (candidate.blockSprite()) entries.put(candidate.sprite, entry);
+                else resourceEntries.put(candidate.name, entry);
+            }
+
+            long bytesPerBundle = 0L;
+            int w = pageSize;
+            for (int mip = 0; mip < mipCount; mip++) {
+                bytesPerBundle += (long) w * w * 4L;
+                w = Math.max(1, w / 2);
+            }
+            CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
+                    sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount,
+                    pages.size(), pageSize, pageSize, MAX_VALID_LOD,
+                    String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
+        } catch (Throwable t) {
+            reset();
+            throw t;
         }
-        CausticaMod.LOGGER.info("RT canonical material pages: blockSprites={}, entityResources={}, spec={}, normal={}, heuristicEmission={}, pages={}, size={}x{}, validLod<={}, gpuMiB={}",
-                sprites.size(), resourceEntries.size(), specCount, normalCount, heuristicCount,
-                pages.size(), pageSize, pageSize, MAX_VALID_LOD,
-                String.format(java.util.Locale.ROOT, "%.2f", bytesPerBundle * pages.size() * 3.0 / (1024.0 * 1024.0)));
     }
 
     public void bindPages(RtPipeline pipeline, long sampler) {

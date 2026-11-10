@@ -1269,7 +1269,7 @@ public final class RtEntities {
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
-                ENTITY_BIT | (build.count & 0x7FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
+                ENTITY_BIT | (build.count & 0x3FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
         build.lists.usedBlockEntities.add(e);
         build.logicalCount++;

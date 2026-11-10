@@ -260,7 +260,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // Dynamic entities: instances with this custom-index flag bit carry real captured ModelPart
     // geometry; the low bits index the entity geometry table, not the section table.
     if ((InstanceID() & ENTITY_BIT) != 0u) {
-        uint eidx = InstanceID() & ~ENTITY_BIT;
+        uint eidx = InstanceID() & IDX_MASK;
         EntityGeom g = ConstPtr<EntityGeom>(pc.entityTableAddr)[eidx];
         uint pid = PrimitiveIndex() + g.triBase[GeometryIndex()];
         Prim pr = ConstPtr<Prim>(g.primAddr)[pid];

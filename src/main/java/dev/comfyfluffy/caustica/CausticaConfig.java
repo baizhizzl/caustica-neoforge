@@ -58,9 +58,10 @@ public final class CausticaConfig {
         @SuppressWarnings("unused")
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
-            Rt.Lights.PRESAMPLING, Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
+            Rt.Lights.PRESAMPLING, Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES,
+            Rt.Overlay.BLOCK_OUTLINE_ENABLED, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
-            Rt.Screenshots.EXR_ENABLED, Rt.Hdr.ENABLED, Ngx.PATH,
+            Rt.Screenshots.EXR_ENABLED, Rt.Diagnostics.HEAVY_CRASH_DIAGNOSTICS, Rt.Hdr.ENABLED, Ngx.PATH,
         };
     }
 
@@ -217,7 +218,7 @@ public final class CausticaConfig {
 
         @Override
         public void reloadFromSystemProperties() {
-            set(Boolean.parseBoolean(System.getProperty(key, Boolean.toString(defaultValue))));
+            this.value = resolveInitial();
         }
 
         @Override
@@ -282,16 +283,7 @@ public final class CausticaConfig {
 
         @Override
         public void reloadFromSystemProperties() {
-            String prop = System.getProperty(key);
-            if (prop == null) {
-                this.value = defaultValue;
-                return;
-            }
-            try {
-                this.value = sanitize.applyAsInt(Integer.parseInt(prop.trim()));
-            } catch (NumberFormatException e) {
-                this.value = defaultValue;
-            }
+            this.value = resolveInitial();
         }
 
         @Override
@@ -369,22 +361,13 @@ public final class CausticaConfig {
             if (value == null) {
                 this.value = defaultValue;
             } else {
-                this.value = (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(value));
+                this.value = (float) valueClamp.applyAsDouble(value);
             }
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            String prop = System.getProperty(key);
-            if (prop == null) {
-                this.value = defaultValue;
-                return;
-            }
-            try {
-                this.value = (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(Double.parseDouble(prop.trim())));
-            } catch (NumberFormatException e) {
-                this.value = defaultValue;
-            }
+            this.value = resolveInitial();
         }
 
         @Override
@@ -456,7 +439,7 @@ public final class CausticaConfig {
 
         @Override
         public void reloadFromSystemProperties() {
-            set(System.getProperty(key, defaultValue));
+            this.value = resolveInitial();
         }
 
         @Override
@@ -513,7 +496,7 @@ public final class CausticaConfig {
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = System.getProperty(key);
+            this.value = resolveInitial();
         }
 
         @Override
@@ -989,10 +972,6 @@ public final class CausticaConfig {
 
     private static FloatSetting clampedFloat(String key, String tomlPath, float fallback, float min, float max) {
         return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v, v -> Math.clamp(v, min, max));
-    }
-
-    private static FloatSetting radians(String key, String tomlPath, float fallbackDegrees) {
-        return new FloatSetting(key, tomlPath, fallbackDegrees, Math::toRadians, Math::toDegrees, v -> Double.isFinite(v) ? v : 0.0);
     }
 
     private static int defaultWorkerThreads() {
