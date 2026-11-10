@@ -96,7 +96,8 @@ public bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoo
     cell.spanCount = 0u;
     cell.invWeightSum = 0.0;
     cellCoord = int3(0, 0, 0);
-    if (pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0) return false;
+    if (pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0 || pc.lightLocalAliasAddr == 0
+            || worldPush.lightGridOrigin.w <= 0.0) return false;
     int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
     if (coord.x < 0 || coord.y < 0 || coord.z < 0
             || coord.x >= worldPush.lightGridDims.x
@@ -221,6 +222,10 @@ LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateC
             sectionFirst[k] = spanSelf ? span[k].firstLight : span[k].aliasFirstLight;
             uint sectionCount = spanSelf ? (span[k].packedLightCounts & 0xffffu)
                     : (span[k].packedLightCounts >> 16u);
+            if (sectionCount == 0u || pc.lightLocalAliasAddr == 0) {
+                active[k] = false;
+                continue;
+            }
             innerSample[k] *= float(sectionCount);
             lightIndex[k] = min(uint(innerSample[k]), sectionCount - 1u);
             sectionAlias[k] = ConstPtr<LightAlias>(pc.lightLocalAliasAddr)[sectionFirst[k] + lightIndex[k]];
@@ -280,6 +285,9 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
                      float rough, bool twoSided, float sss, uint candidateCount,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
+    if (candidateCount == 0u || worldPush.lightCount == 0u || pc.lightBufAddr == 0) {
+        return r;
+    }
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
@@ -349,6 +357,9 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
     float3 origin = hitPos + side * n * SURF_BIAS;
     float3 toL = s.pos - origin;
     float dist = length(toL);
+    if (dist <= 1.0e-5) {
+        return float3(0.0, 0.0, 0.0);
+    }
     // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
     VisibilityResult shadow = visibility(origin, toL / dist, dist * 0.999);
     float3 vis = shadow.transmittance;

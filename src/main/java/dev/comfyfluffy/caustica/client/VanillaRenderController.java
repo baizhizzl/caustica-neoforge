@@ -120,6 +120,14 @@ public final class VanillaRenderController {
 		}
 	}
 
+	public void resetFailureLatch() {
+		if (this.failureLatched) {
+			this.failureLatched = false;
+			this.inactiveReason = null;
+			this.lastLoggedInactiveReason = null;
+		}
+	}
+
 	private String findInactiveReason(RenderTarget mainTarget) {
 		if (this.failureLatched || RtComposite.INSTANCE.hasFailed()) {
 			return "RT composite failure latch is set";

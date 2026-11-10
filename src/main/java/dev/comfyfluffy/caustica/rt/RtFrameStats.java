@@ -38,6 +38,7 @@ public final class RtFrameStats {
                     "terrain.drainCompletion",
                     "terrain.snapshotDispatch",
                     "terrain.publish",
+                    "terrain.lightGridPublish",
                     "entity.capture",
                     "entity.capture.extract",
                     "entity.capture.submit",

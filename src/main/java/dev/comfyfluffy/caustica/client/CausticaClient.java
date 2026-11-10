@@ -1,14 +1,22 @@
 package dev.comfyfluffy.caustica.client;
 
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.compat.AtlasSpriteFinder;
+import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
+import dev.comfyfluffy.caustica.ngx.NgxRuntime;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.rt.RtDeviceBringup;
 import dev.comfyfluffy.caustica.rt.RtComposite;
+import dev.comfyfluffy.caustica.rt.RtFramePresenter;
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import dev.comfyfluffy.caustica.rt.RtReflex;
 import dev.comfyfluffy.caustica.rt.RtUiOverlay;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
+import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
 import net.neoforged.api.distmarker.Dist;
@@ -33,7 +41,7 @@ public final class CausticaClient {
 
     private static void onClientTick(ClientTickEvent.Pre event) {
 		if (!VanillaRenderController.rtRuntimeWorkRequested()) {
-			if (rtInitDone) {
+			if (rtInitDone || RtContext.currentOrNull() != null || NgxRuntime.INSTANCE.isInitialized()) {
 				shutdownRt();
 			}
 			return;
@@ -60,8 +68,8 @@ public final class CausticaClient {
 				RtTerrain.update(ctx);
 				// Log DLSS-FG availability once when frame generation is enabled (capability query only;
 				// the present-loop integration that consumes it is built separately).
-				if (dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.enabled()) {
-					dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.probeAvailabilityOnce();
+				if (RtDlssFg.enabled()) {
+					RtDlssFg.INSTANCE.probeAvailabilityOnce();
 				}
 			}
 		}
@@ -74,36 +82,51 @@ public final class CausticaClient {
 	private static void shutdownRt() {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
-		if (!rtInitDone) {
+		RtContext ctx = RtContext.currentOrNull();
+		if (!rtInitDone && ctx == null && !NgxRuntime.INSTANCE.isInitialized()) {
 			RtWorkerPool.INSTANCE.shutdown();
-        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
+			AtlasSpriteFinder.clearCache();
 			return;
 		}
 
-		RtContext ctx = RtContext.currentOrNull();
 		if (ctx != null) {
 			// Let the terrain epoch cancel queued work and release every active-task token before
 			// shutdownNow(): discarded worker Runnables cannot deliver their terminal callbacks.
 			RtTerrain.shutdown(ctx);
 		}
 		RtWorkerPool.INSTANCE.shutdown();
-        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
+		AtlasSpriteFinder.clearCache();
 		if (ctx != null) {
 			RtEntities.INSTANCE.shutdown();
 		}
 		RtComposite.INSTANCE.destroy();
 		RtEntityTextures.INSTANCE.reset();
 		RtBlockMaterials.INSTANCE.destroy();
-		dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.destroy();
-		if (ctx != null) {
-			dev.comfyfluffy.caustica.rt.RtFramePresenter.INSTANCE.destroy(ctx.device());
-			dev.comfyfluffy.caustica.rt.RtReflex.INSTANCE.destroy(ctx.device().vkDevice());
+		RtDlssFg.INSTANCE.destroy();
+		VulkanDevice device = ctx != null ? ctx.device() : currentVulkanDevice();
+		if (device != null) {
+			RtFramePresenter.INSTANCE.destroy(device);
+			RtReflex.INSTANCE.destroy(device.vkDevice());
 		}
 		// Shut NGX down once, after every feature (RR + FG) has been released above.
-		dev.comfyfluffy.caustica.ngx.NgxRuntime.INSTANCE.shutdown();
+		NgxRuntime.INSTANCE.shutdown();
 		if (ctx != null) {
 			ctx.destroy();
 		}
 		rtInitDone = false;
+	}
+
+	private static VulkanDevice currentVulkanDevice() {
+		try {
+			if (!RenderSystem.isOnRenderThread()) {
+				return null;
+			}
+			var gpuDevice = RenderSystem.getDevice();
+			if (gpuDevice != null && ((GpuDeviceAccessor) gpuDevice).caustica$getBackend() instanceof VulkanDevice vulkanDevice) {
+				return vulkanDevice;
+			}
+		} catch (Throwable ignored) {
+		}
+		return null;
 	}
 }

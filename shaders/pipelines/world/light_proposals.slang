@@ -36,6 +36,10 @@ public float3 lightHalfV(Light light) {
 }
 
 public void selectGlobalLight(uint64_t aliasAddr, uint lightCount, inout uint proposalSeed, out uint lightIndex) {
+    if (lightCount == 0u) {
+        lightIndex = 0u;
+        return;
+    }
     float aliasSample = lightProposalRandom(proposalSeed) * float(lightCount);
     uint column = min(uint(aliasSample), lightCount - 1u);
     if (aliasAddr != 0) {
@@ -49,6 +53,10 @@ public void selectGlobalLight(uint64_t aliasAddr, uint lightCount, inout uint pr
 
 public void selectSectionLight(uint64_t localAliasAddr, uint firstLight, uint lightCount, inout uint proposalSeed,
                         out uint lightIndex) {
+    if (lightCount == 0u || localAliasAddr == 0) {
+        lightIndex = firstLight;
+        return;
+    }
     float aliasSample = lightProposalRandom(proposalSeed) * float(lightCount);
     uint column = min(uint(aliasSample), lightCount - 1u);
     LightAlias alias = ConstPtr<LightAlias>(localAliasAddr)[firstLight + column];
@@ -59,6 +67,10 @@ public void selectSectionLight(uint64_t localAliasAddr, uint firstLight, uint li
 
 public void selectLightGridSpanLight(uint64_t spanAddr, uint64_t localAliasAddr, LightGridCell cell, inout uint proposalSeed,
                               out uint lightIndex) {
+    if (spanAddr == 0 || localAliasAddr == 0 || cell.spanCount == 0u) {
+        lightIndex = 0u;
+        return;
+    }
     ConstPtr<LightGridSpan> spans = ConstPtr<LightGridSpan>(spanAddr);
     float aliasSample = lightProposalRandom(proposalSeed) * float(cell.spanCount);
     uint column = min(uint(aliasSample), cell.spanCount - 1u);

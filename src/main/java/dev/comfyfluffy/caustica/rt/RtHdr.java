@@ -164,19 +164,26 @@ public final class RtHdr {
             VkSurfaceFormatKHR.Buffer formats = VkSurfaceFormatKHR.calloc(n, stack);
             KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(phys, surface, count, formats);
 
-            boolean anyHdr = false;
+            boolean pqSupported = false;
+            boolean anyHdrOrWide = false;
             CausticaMod.LOGGER.info("HDR: chosen swapchain image format={} ({}); surface advertises {} (format,colorSpace) pair(s):",
                     chosenFormat, formatName(chosenFormat), n);
             for (int i = 0; i < n; i++) {
                 VkSurfaceFormatKHR f = formats.get(i);
                 int cs = f.colorSpace();
+                boolean pq = isPqHdrColorSpace(cs);
                 boolean hdr = isHdrColorSpace(cs);
-                anyHdr |= hdr;
+                pqSupported |= pq;
+                anyHdrOrWide |= hdr;
+                String suffix = pq ? "  <-- HDR10/PQ (supported)"
+                        : (hdr ? "  <-- HDR/wide-gamut (non-PQ)" : "");
                 CausticaMod.LOGGER.info("  [{}] format={} ({}), colorSpace={} ({}){}",
-                        i, f.format(), formatName(f.format()), cs, colorSpaceName(cs), hdr ? "  <-- HDR-capable" : "");
+                        i, f.format(), formatName(f.format()), cs, colorSpaceName(cs), suffix);
             }
-            if (anyHdr) {
-                CausticaMod.LOGGER.info("HDR: at least one HDR-capable color space is exposed; PQ/HDR10 presentation is available.");
+            if (pqSupported) {
+                CausticaMod.LOGGER.info("HDR: HDR10_ST2084 (PQ) color space is exposed; PQ/HDR10 presentation is available.");
+            } else if (anyHdrOrWide) {
+                CausticaMod.LOGGER.warn("HDR: surface exposes extended/HDR color spaces without HDR10_ST2084 (PQ); PQ/HDR10 presentation is unavailable on this surface.");
             } else {
                 CausticaMod.LOGGER.warn("HDR: only SDR color spaces are exposed by this Vulkan surface. Enable OS/display HDR; on Linux, use native Wayland with HDR enabled in the compositor.");
             }
@@ -185,7 +192,11 @@ public final class RtHdr {
         }
     }
 
-    private static boolean isHdrColorSpace(int cs) {
+    static boolean isPqHdrColorSpace(int cs) {
+        return cs == CS_HDR10_ST2084;
+    }
+
+    static boolean isHdrColorSpace(int cs) {
         return cs == CS_EXTENDED_SRGB_LINEAR || cs == CS_EXTENDED_SRGB_NONLINEAR
                 || cs == CS_HDR10_ST2084 || cs == CS_HDR10_HLG || cs == CS_DOLBYVISION
                 || cs == CS_BT2020_LINEAR || cs == CS_DISPLAY_P3_LINEAR;

@@ -23,6 +23,13 @@ public final class VerifyMixinContracts {
     private static final String MIXIN = "Lorg/spongepowered/asm/mixin/Mixin;";
     private static final String SHADOW = "Lorg/spongepowered/asm/mixin/Shadow;";
     private static final String ACCESSOR = "Lorg/spongepowered/asm/mixin/gen/Accessor;";
+    private static final String INVOKER = "Lorg/spongepowered/asm/mixin/gen/Invoker;";
+    private static final String INJECT = "Lorg/spongepowered/asm/mixin/injection/Inject;";
+    private static final String REDIRECT = "Lorg/spongepowered/asm/mixin/injection/Redirect;";
+    private static final String MODIFY_ARG = "Lorg/spongepowered/asm/mixin/injection/ModifyArg;";
+    private static final String MODIFY_ARGS = "Lorg/spongepowered/asm/mixin/injection/ModifyArgs;";
+    private static final String WRAP_OPERATION = "Lcom/llamalad7/mixinextras/injector/wrapoperation/WrapOperation;";
+    private static final String MODIFY_EXPR = "Lcom/llamalad7/mixinextras/injector/ModifyExpressionValue;";
     private static final Map<String, ClassNode> CLASSES = new HashMap<>();
     private static final List<String> ERRORS = new ArrayList<>();
     private static int checks;
@@ -31,6 +38,10 @@ public final class VerifyMixinContracts {
 
     public static void main(String[] args) throws IOException {
         String json = Files.readString(Path.of(args[0]));
+        require(!Pattern.compile("\"mixins\"\\s*:").matcher(json).find(),
+                "Client-only mod must not declare common \"mixins\" in caustica.mixins.json");
+        require(!Pattern.compile("\"server\"\\s*:").matcher(json).find(),
+                "Client-only mod must not declare \"server\" mixins in caustica.mixins.json");
         var packageMatch = Pattern.compile("\"package\"\\s*:\\s*\"([^\"]+)\"").matcher(json);
         if (!packageMatch.find()) {
             throw new IllegalArgumentException("Missing mixin package");
@@ -74,10 +85,22 @@ public final class VerifyMixinContracts {
                 AnnotationNode accessor = annotation(handler.visibleAnnotations, handler.invisibleAnnotations, ACCESSOR);
                 if (accessor != null) {
                     String fieldName = value(accessor, "value", "");
+                    if (fieldName.isEmpty()) {
+                        fieldName = inferAccessorTarget(handler.name);
+                    }
                     Type[] arguments = Type.getArgumentTypes(handler.desc);
                     String fieldType = arguments.length == 0 ? Type.getReturnType(handler.desc).getDescriptor()
                             : arguments[0].getDescriptor();
                     require(findField(target, fieldName, fieldType) != null, context + ": missing accessor field " + fieldName + fieldType);
+                }
+                AnnotationNode invoker = annotation(handler.visibleAnnotations, handler.invisibleAnnotations, INVOKER);
+                if (invoker != null) {
+                    String methodName = value(invoker, "value", "");
+                    if (methodName.isEmpty()) {
+                        methodName = inferInvokerTarget(handler.name);
+                    }
+                    require(!findMethods(target, methodName + handler.desc).isEmpty(),
+                            context + ": missing invoker method " + methodName + handler.desc + " on " + target.name);
                 }
                 for (AnnotationNode injection : annotations(handler.visibleAnnotations, handler.invisibleAnnotations)) {
                     Object methodValue = value(injection, "method", null);
@@ -90,8 +113,12 @@ public final class VerifyMixinContracts {
                         List<MethodNode> methods = findMethods(target, selector);
                         require(!methods.isEmpty(), context + ": missing method " + selector + " on " + target.name);
                         for (MethodNode method : methods) {
-                            if (injection.desc.equals("Lorg/spongepowered/asm/mixin/injection/Inject;")) {
+                            if (injection.desc.equals(INJECT)) {
                                 auditCallback(context, handler, method);
+                            } else if (injection.desc.equals(REDIRECT) || injection.desc.equals(MODIFY_ARG)
+                                    || injection.desc.equals(MODIFY_ARGS) || injection.desc.equals(WRAP_OPERATION)
+                                    || injection.desc.equals(MODIFY_EXPR)) {
+                                auditInjectorModifier(context, injection, handler, method);
                             }
                             Object atValue = value(injection, "at", null);
                             if (atValue instanceof AnnotationNode at) {
@@ -126,6 +153,77 @@ public final class VerifyMixinContracts {
             }
         }
         require((handler.access & Opcodes.ACC_STATIC) == (target.access & Opcodes.ACC_STATIC), context + ": static callback mismatch");
+    }
+
+    private static void auditInjectorModifier(
+            String context,
+            AnnotationNode injection,
+            MethodNode handler,
+            MethodNode target
+    ) {
+        Type returnType = Type.getReturnType(handler.desc);
+        Type[] args = Type.getArgumentTypes(handler.desc);
+        if (injection.desc.equals(MODIFY_ARG)) {
+            require(args.length >= 1, context + ": @ModifyArg handler must accept the modified argument");
+            require(!returnType.equals(Type.VOID_TYPE), context + ": @ModifyArg handler must return modified value");
+            if (args.length == 1) {
+                require(args[0].equals(returnType),
+                        context + ": @ModifyArg single argument " + args[0] + " must match return " + returnType);
+            }
+        } else if (injection.desc.equals(MODIFY_ARGS)) {
+            require(returnType.equals(Type.VOID_TYPE), context + ": @ModifyArgs handler must return void");
+            require(args.length >= 1 && args[0].getDescriptor().equals("Lorg/spongepowered/asm/mixin/injection/invoke/arg/Args;"),
+                    context + ": @ModifyArgs first argument must be Args");
+        } else if (injection.desc.equals(MODIFY_EXPR)) {
+            require(args.length >= 1 && !returnType.equals(Type.VOID_TYPE) && args[0].equals(returnType),
+                    context + ": @ModifyExpressionValue first argument must match non-void return type");
+        } else if (injection.desc.equals(WRAP_OPERATION)) {
+            boolean hasOperation = false;
+            for (Type arg : args) {
+                if (arg.getDescriptor().equals("Lcom/llamalad7/mixinextras/injector/wrapoperation/Operation;")) {
+                    hasOperation = true;
+                    break;
+                }
+            }
+            require(hasOperation, context + ": @WrapOperation handler must accept Operation");
+        } else if (injection.desc.equals(REDIRECT)) {
+            Object atValue = value(injection, "at", null);
+            if (atValue instanceof AnnotationNode at && "INVOKE".equals(value(at, "value", ""))) {
+                String selector = value(at, "target", "");
+                int lparen = selector.indexOf('(');
+                if (lparen > 0) {
+                    Type invokedReturn = Type.getReturnType(selector.substring(lparen));
+                    require(returnType.equals(invokedReturn),
+                            context + ": @Redirect return " + returnType + " does not match " + invokedReturn);
+                }
+            }
+            if ((target.access & Opcodes.ACC_STATIC) != 0) {
+                require((handler.access & Opcodes.ACC_STATIC) != 0,
+                        context + ": @Redirect into static target method must be static");
+            }
+        }
+    }
+
+    private static String inferAccessorTarget(String methodName) {
+        for (String prefix : List.of("get", "set", "is")) {
+            if (methodName.startsWith(prefix) && methodName.length() > prefix.length()
+                    && Character.isUpperCase(methodName.charAt(prefix.length()))) {
+                return Character.toLowerCase(methodName.charAt(prefix.length()))
+                        + methodName.substring(prefix.length() + 1);
+            }
+        }
+        return methodName;
+    }
+
+    private static String inferInvokerTarget(String methodName) {
+        for (String prefix : List.of("call", "invoke")) {
+            if (methodName.startsWith(prefix) && methodName.length() > prefix.length()
+                    && Character.isUpperCase(methodName.charAt(prefix.length()))) {
+                return Character.toLowerCase(methodName.charAt(prefix.length()))
+                        + methodName.substring(prefix.length() + 1);
+            }
+        }
+        return methodName;
     }
 
     private static void auditAt(String context, MethodNode method, AnnotationNode at) {
@@ -189,7 +287,7 @@ public final class VerifyMixinContracts {
                 throw new IOException("Class unavailable on target classpath: " + name);
             }
             ClassNode node = new ClassNode();
-            new ClassReader(input).accept(node, ClassReader.SKIP_DEBUG | ClassReader.SKIP_FRAMES);
+            new ClassReader(input).accept(node, ClassReader.SKIP_FRAMES);
             CLASSES.put(name, node);
             return node;
         }

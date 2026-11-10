@@ -104,6 +104,41 @@ final class RtLightHierarchyTest {
                 () -> RtLightHierarchy.build(sections, 0, 0, 0, () -> true));
     }
 
+    @Test
+    void zeroPowerFarSectionClampsPackedCoordinatesAndCapsSectionLightsToU16() {
+        float[] zeroPower = light(0f, 0f);
+        RtLightHierarchy.Data farZero = RtLightHierarchy.build(List.of(
+                new RtLightHierarchy.SectionInput(0, 2000, -500, 1500, zeroPower),
+                new RtLightHierarchy.SectionInput(1, 0, 0, 0, light(1f, 1f))
+        ), 0, 0, 0, () -> false);
+
+        int stride = RtLightHierarchy.GPU_FLOATS_PER_LIGHT;
+        for (int i = 0; i < farZero.lightCount(); i++) {
+            int packed = Float.floatToRawIntBits(farZero.packedLights()[i * stride + stride - 1]);
+            int gx = packed & 0x3ff;
+            int gy = (packed >>> 10) & 0x3ff;
+            int gz = (packed >>> 20) & 0x3ff;
+            org.junit.jupiter.api.Assertions.assertTrue(gx >= 0 && gx <= 1023);
+            org.junit.jupiter.api.Assertions.assertTrue(gy >= 0 && gy <= 1023);
+            org.junit.jupiter.api.Assertions.assertTrue(gz >= 0 && gz <= 1023);
+        }
+
+        int overLimit = 65_540;
+        float[] manyLights = new float[overLimit * RtLightCollector.FLOATS_PER_LIGHT];
+        for (int i = 0; i < overLimit; i++) {
+            int base = i * RtLightCollector.FLOATS_PER_LIGHT;
+            manyLights[base + 3] = 1f;
+            manyLights[base + 16] = 1f;
+            manyLights[base + 17] = 1f;
+            manyLights[base + 18] = 1f;
+        }
+        RtLightHierarchy.Data capped = RtLightHierarchy.build(List.of(
+                new RtLightHierarchy.SectionInput(0, 0, 0, 0, manyLights)
+        ), 0, 0, 0, () -> false);
+        assertEquals(0xffff, capped.lightCount());
+        assertEquals(0xffff, capped.sectionLightCounts()[0]);
+    }
+
     private static float[] light(float area, float radiance) {
         float[] record = new float[RtLightCollector.FLOATS_PER_LIGHT];
         record[3] = area;

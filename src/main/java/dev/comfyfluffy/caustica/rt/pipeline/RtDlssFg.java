@@ -5,6 +5,7 @@ import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
 
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
+import dev.comfyfluffy.caustica.rt.RtComposite;
 import dev.comfyfluffy.caustica.rt.RtContext;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
 import dev.comfyfluffy.caustica.ngx.DlssSettings;
@@ -28,7 +29,7 @@ public final class RtDlssFg {
     public static final RtDlssFg INSTANCE = new RtDlssFg();
 
     public static boolean enabled() {
-        return CausticaConfig.Rt.Fg.ENABLED.value();
+        return RtComposite.enabled() && CausticaConfig.Rt.Fg.ENABLED.value();
     }
 
     private NgxLibrary lib;
@@ -84,6 +85,17 @@ public final class RtDlssFg {
     /** Discard history across enable/multiplier changes without releasing in-flight GPU resources. */
     public void requestHistoryReset() {
         resetHistory = true;
+    }
+
+    /** Re-arm DLSS-FG after an explicit render-state recovery or when re-enabled. */
+    public void resetFailureLatch() {
+        if (failed) {
+            failed = false;
+            if (!available && isNull(feature)) {
+                probed = false;
+            }
+            requestHistoryReset();
+        }
     }
 
     public boolean isReady() {
@@ -175,6 +187,7 @@ public final class RtDlssFg {
                 featureRenderHeight = renderHeight;
                 featureBackbufferFormat = backbufferFormat;
                 initialized = true;
+                resetHistory = true;
                 CausticaMod.LOGGER.info("DLSS-FG feature created: {}x{} (render {}x{}, backbuffer format {})",
                         width, height, renderWidth, renderHeight, backbufferFormat);
             }

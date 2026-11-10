@@ -27,6 +27,19 @@ final class RtHdrTest {
         assertThrows(IllegalArgumentException.class, () -> RtHdr.masteringMetadata(0));
     }
 
+    @Test
+    void distinguishesHdr10PqFromNonPqExtendedColorSpaces() {
+        org.junit.jupiter.api.Assertions.assertTrue(RtHdr.isPqHdrColorSpace(1000104008));
+        org.junit.jupiter.api.Assertions.assertTrue(RtHdr.isHdrColorSpace(1000104008));
+        // scRGB / HLG / Display-P3 linear are HDR/wide-gamut, NOT SMPTE ST 2084 (PQ)
+        org.junit.jupiter.api.Assertions.assertFalse(RtHdr.isPqHdrColorSpace(1000104002));
+        org.junit.jupiter.api.Assertions.assertTrue(RtHdr.isHdrColorSpace(1000104002));
+        org.junit.jupiter.api.Assertions.assertFalse(RtHdr.isPqHdrColorSpace(1000104010));
+        org.junit.jupiter.api.Assertions.assertTrue(RtHdr.isHdrColorSpace(1000104010));
+        org.junit.jupiter.api.Assertions.assertFalse(RtHdr.isPqHdrColorSpace(0));
+        org.junit.jupiter.api.Assertions.assertFalse(RtHdr.isHdrColorSpace(0));
+    }
+
     private static void assertChromaticity(RtHdr.Chromaticity actual, float x, float y) {
         assertEquals(x, actual.x(), EPSILON);
         assertEquals(y, actual.y(), EPSILON);

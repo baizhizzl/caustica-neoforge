@@ -288,6 +288,10 @@ public final class RtEntityCapture implements VertexConsumer {
      * one. They sample the block atlas (the capture's {@code currentTexSlot} = 0, the bindless fallback).
      */
     public void addBakedQuad(Matrix4f pose, BakedQuad quad, int color) {
+        addBakedQuad(pose, quad, color, 0f);
+    }
+
+    public void addBakedQuad(Matrix4f pose, BakedQuad quad, int color, float emission) {
         for (int i = 0; i < 4; i++) {
             Vector3fc p = quad.position(i);
             pose.transformPosition(p.x(), p.y(), p.z(), scratch);
@@ -298,7 +302,7 @@ public final class RtEntityCapture implements VertexConsumer {
             qnx[n] = 0f; qny[n] = 0f; qnz[n] = 0f; // no authored normal → emitQuad falls back to geometric
             qcol[n] = color;
             if (++n == 4) {
-                emitQuad();
+                appendQuad(qx, qy, qz, null, qu, qv, qnx[0], qny[0], qnz[0], qcol[0], false, emission);
                 n = 0;
             }
         }

@@ -27,7 +27,15 @@ abstract class GenerateRtBindings extends DefaultTask {
     @Inject abstract ExecOperations getExecOps()
 
     private static final List<Map> PIPELINES = [
-            [prefix: "WORLD", source: "pipelines/world/indirect.rgen.slang", resources: [
+            [prefix: "WORLD", source: "pipelines/world/indirect.rgen.slang",
+             siblings: [
+                     "pipelines/world/primary.rgen.slang",
+                     "pipelines/world/closest_hit.rchit.slang",
+                     "pipelines/world/any_hit.rahit.slang",
+                     "pipelines/world/sky.rmiss.slang",
+                     "pipelines/world/guide.rmiss.slang"
+             ],
+             resources: [
                     TLAS: "topLevelAS", OUTPUT: "outImage", BLOCK_ALBEDO: "blockAlbedoAtlas",
                     G_NORMAL: "gNormal", G_ALBEDO: "gAlbedo", G_DEPTH: "gDepth", G_MOTION: "gMotion",
                     G_SPEC_ALBEDO: "gSpecAlbedo", G_SPEC_MOTION: "gSpecMotion",
@@ -47,15 +55,31 @@ abstract class GenerateRtBindings extends DefaultTask {
                     HIST_BINS: "histBins", IMAGE: "exposureImage", STATE: "stateBuf"]],
             [prefix: "BLOOM", source: "pipelines/bloom/main.comp.slang", resources: [
                     OUTPUT: "dstImage", SOURCE: "srcImage", EXPOSURE: "exposureImage"]],
-            [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang", resources: [
+            [prefix: "SKY_LUT", source: "pipelines/sky_lut/view.comp.slang",
+             siblings: [
+                     "pipelines/sky_lut/transmittance.comp.slang",
+                     "pipelines/sky_lut/multiscatter.comp.slang"
+             ],
+             resources: [
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
                     SKY_VIEW_IMAGE: "skyViewImage", TRANSMITTANCE_SAMPLER: "transmittanceLut",
                     MULTISCATTER_SAMPLER: "multiScatterLut"]],
-            [prefix: "PRESENT", source: "pipelines/hdr_composite/main.comp.slang", resources: [
+            [prefix: "PRESENT", source: "pipelines/hdr_composite/main.comp.slang",
+             siblings: ["pipelines/sdr_present/main.comp.slang"],
+             resources: [
                     OUTPUT: "outputImage", SOURCE: "sourceImage"]],
-            [prefix: "OVERLAY_IMAGE", source: "pipelines/overlay_composite/glow.frag.slang", resources: [VALUE: "sourceImage"]],
-            [prefix: "OVERLAY_SAMPLER", source: "pipelines/name_tag/fragment.frag.slang", resources: [VALUE: "fontAtlas"]],
-            [prefix: "OVERLAY_TLAS", source: "pipelines/block_outline/fragment.frag.slang", resources: [VALUE: "tlas"]]
+            [prefix: "OVERLAY_IMAGE", source: "pipelines/overlay_composite/glow.frag.slang",
+             siblings: [
+                     "pipelines/overlay_composite/passthrough.frag.slang",
+                     "pipelines/overlay_composite/vertex.vert.slang"
+             ],
+             resources: [VALUE: "sourceImage"]],
+            [prefix: "OVERLAY_SAMPLER", source: "pipelines/name_tag/fragment.frag.slang",
+             siblings: ["pipelines/name_tag/vertex.vert.slang"],
+             resources: [VALUE: "fontAtlas"]],
+            [prefix: "OVERLAY_TLAS", source: "pipelines/block_outline/fragment.frag.slang",
+             siblings: ["pipelines/block_outline/vertex.vert.slang"],
+             resources: [VALUE: "tlas"]]
     ]
 
     // Gradle decorates task classes; this must remain non-private for Groovy dispatch inside PIPELINES.each.
@@ -89,6 +113,25 @@ abstract class GenerateRtBindings extends DefaultTask {
             def unexpected = reflected.keySet().findAll { !spec.resources.containsValue(it) }
             if (!missing.isEmpty() || !unexpected.isEmpty()) {
                 throw new GradleException("${spec.source} descriptor mismatch; missing=${missing}, unexpected=${unexpected}")
+            }
+
+            (spec.siblings ?: []).each { siblingPath ->
+                def siblingReflection = reflect(new File(shaderRoot.get().asFile, siblingPath as String), scratchDir)
+                def siblingSlots = siblingReflection.parameters.findAll { it.binding?.kind == "descriptorTableSlot" }
+                siblingSlots.each { param ->
+                    def name = param.name as String
+                    def expected = reflected[name]
+                    if (expected == null) {
+                        throw new GradleException("${siblingPath} declares descriptor '${name}' absent from ${spec.source}")
+                    }
+                    def expectedSet = (expected.space ?: 0) as int
+                    def actualSet = (param.binding.space ?: 0) as int
+                    def expectedIndex = expected.index as int
+                    def actualIndex = param.binding.index as int
+                    if (expectedSet != actualSet || expectedIndex != actualIndex) {
+                        throw new GradleException("${siblingPath} descriptor '${name}' at (set=${actualSet}, binding=${actualIndex}) disagrees with ${spec.source} (set=${expectedSet}, binding=${expectedIndex})")
+                    }
+                }
             }
 
             def locations = spec.resources.collectEntries { suffix, resource ->

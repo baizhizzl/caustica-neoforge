@@ -31,14 +31,9 @@ public abstract class ScreenshotMixin {
             CallbackInfo ci
     ) {
         if (forceName == null && downscaleFactor == 1
-                && CausticaConfig.Rt.Screenshots.EXR_ENABLED.value()) {
-            String pairedPngName = RtScreenshotExporter.exportPaired(workDir, callback);
-            if (pairedPngName != null) {
-                // Re-enter vanilla's named path with our reserved PNG name. The non-null name bypasses
-                // this hook on the nested call and makes both outputs use exactly one basename.
-                Screenshot.grab(workDir, pairedPngName, target, downscaleFactor, callback);
-                ci.cancel();
-            }
+                && CausticaConfig.Rt.Screenshots.EXR_ENABLED.value()
+                && RtScreenshotExporter.grabWithExr(workDir, target, downscaleFactor, callback)) {
+            ci.cancel();
         }
     }
 }

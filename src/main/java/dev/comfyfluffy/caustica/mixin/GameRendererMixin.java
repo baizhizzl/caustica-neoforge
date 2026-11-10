@@ -71,8 +71,8 @@ public abstract class GameRendererMixin {
     @Inject(method = "render3dHud", at = @At("HEAD"))
     private void caustica$finishWorldBeforeHud(CameraRenderState camera, PlayerRenderState player,
             OptionsRenderState options, boolean consistentDepthRequired, CallbackInfo ci) {
-        WorldRenderScaler.INSTANCE.end(this.mainRenderTarget);
         try {
+            WorldRenderScaler.INSTANCE.end(this.mainRenderTarget);
             RtWorldOverlay.INSTANCE.compositeIntoUiOverlay(this.mainRenderTarget, RtComposite.INSTANCE.currentGraphicsUse());
         } finally {
             // The overlay's TLAS read must enter the graphics submission before this token is signalled.
@@ -89,7 +89,11 @@ public abstract class GameRendererMixin {
     @Inject(method = "render()V", at = @At(value = "INVOKE",
             target = "Lnet/minecraft/client/renderer/fog/FogRenderer;endFrame()V", shift = At.Shift.AFTER))
     private void caustica$restoreWorldScale(CallbackInfo ci) {
-        WorldRenderScaler.INSTANCE.endSafetyNet(this.mainRenderTarget);
+        try {
+            WorldRenderScaler.INSTANCE.endSafetyNet(this.mainRenderTarget);
+        } finally {
+            RtComposite.INSTANCE.finishGraphicsUse();
+        }
     }
 
     @Inject(method = "render()V", at = @At(value = "INVOKE",

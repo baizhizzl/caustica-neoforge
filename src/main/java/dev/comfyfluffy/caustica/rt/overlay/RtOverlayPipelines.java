@@ -480,11 +480,17 @@ public final class RtOverlayPipelines {
      */
     public static final class SampledImageSetPool {
         public final long layout;
-        private final long pool;
+        private long pool;
+        private int capacity;
 
-        private SampledImageSetPool(long layout, long pool) {
+        private SampledImageSetPool(long layout, long pool, int capacity) {
             this.layout = layout;
             this.pool = pool;
+            this.capacity = capacity;
+        }
+
+        public int capacity() {
+            return capacity;
         }
 
         /** Allocate a fresh descriptor set from this pool and write {@code view}/{@code sampler} into it once. */
@@ -507,10 +513,33 @@ public final class RtOverlayPipelines {
             }
         }
 
+        /** Recreate the backing descriptor pool (device must be idle) while preserving {@link #layout}. */
+        public void resetPool(RtContext ctx, int maxSets, String label) {
+            VkDevice vk = ctx.vk();
+            VK10.vkDestroyDescriptorPool(vk, pool, null);
+            pool = createSampledImageDescriptorPool(ctx, maxSets, label);
+            capacity = maxSets;
+        }
+
         /** Frees every descriptor set ever allocated from this pool, along with the pool and layout. */
         public void destroy(VkDevice vk) {
             VK10.vkDestroyDescriptorPool(vk, pool, null);
             VK10.vkDestroyDescriptorSetLayout(vk, layout, null);
+        }
+    }
+
+    private static long createSampledImageDescriptorPool(RtContext ctx, int maxSets, String label) {
+        VkDevice vk = ctx.vk();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer p = stack.mallocLong(1);
+            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(maxSets);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default()
+                    .maxSets(maxSets).pPoolSizes(poolSizes);
+            check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(" + label + ")");
+            long pool = p.get(0);
+            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, label + " descriptor pool");
+            return pool;
         }
     }
 
@@ -526,14 +555,8 @@ public final class RtOverlayPipelines {
             long dsl = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, label + " descriptor set layout");
 
-            VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(1, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(maxSets);
-            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(maxSets).pPoolSizes(poolSizes);
-            check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(" + label + ")");
-            long pool = p.get(0);
-            RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, label + " descriptor pool");
-
-            return new SampledImageSetPool(dsl, pool);
+            long pool = createSampledImageDescriptorPool(ctx, maxSets, label);
+            return new SampledImageSetPool(dsl, pool, maxSets);
         }
     }
 

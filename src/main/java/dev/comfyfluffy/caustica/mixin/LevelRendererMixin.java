@@ -4,9 +4,13 @@ import com.mojang.renderpearl.api.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.resource.GraphicsResourceAllocator;
 import dev.comfyfluffy.caustica.client.VanillaRenderController;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
+import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
 import net.minecraft.client.renderer.LevelRenderer;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.client.renderer.state.level.LevelRenderState;
+import net.minecraft.client.renderer.state.level.TransientBlockRenderState;
+import net.minecraft.gizmos.SimpleGizmoCollector;
+import net.minecraft.util.Util;
 import org.joml.Vector4f;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -21,6 +25,22 @@ public abstract class LevelRendererMixin {
 	@Final
 	private LevelRenderState levelRenderState;
 
+	@Shadow
+	private boolean currentFrameRendersEntityOutline;
+
+	@Shadow
+	@Final
+	private SimpleGizmoCollector renderThreadGizmos;
+
+	@Shadow
+	@Final
+	private Long2ObjectLinkedOpenHashMap<TransientBlockRenderState> transientBlocks;
+
+	@Shadow
+	private void performTransientBlockRemovals() {
+		throw new AssertionError("mixin stub");
+	}
+
 	@Inject(method = "render", at = @At("HEAD"), cancellable = true)
 	private void caustica$cancelVanillaWorld(
 			GraphicsResourceAllocator resourceAllocator,
@@ -29,7 +49,7 @@ public abstract class LevelRendererMixin {
 			GpuBufferSlice terrainFog,
 			Vector4f fogColor,
 			boolean shouldRenderSky,
-            boolean consistentDepthRequired,
+			boolean consistentDepthRequired,
 			CallbackInfo ci) {
 		Runnable playerCompiledSectionCallback = this.levelRenderState.playerCompiledSectionCallback;
 		boolean waitingForRtPlayerSection = false;
@@ -46,6 +66,14 @@ public abstract class LevelRendererMixin {
 			return;
 		}
 
+		// Keep per-frame LevelRenderer bookkeeping drained when the raster pass is skipped.
+		this.currentFrameRendersEntityOutline = false;
+		this.renderThreadGizmos.drainGizmos();
+		this.performTransientBlockRemovals();
+		if (!this.transientBlocks.isEmpty()) {
+			long nowMs = Util.getMillis();
+			this.transientBlocks.values().removeIf(tb -> nowMs >= tb.liveUntilMs);
+		}
 		VanillaRenderController.INSTANCE.markWorldSkipped();
 		ci.cancel();
 	}

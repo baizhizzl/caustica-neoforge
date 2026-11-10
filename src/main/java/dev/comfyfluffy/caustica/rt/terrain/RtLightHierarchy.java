@@ -20,10 +20,11 @@ final class RtLightHierarchy {
      * fetches these at random indices, so that halving of transactions is the point of the layout.
      * <p>The rectangle area is NOT stored: it is exactly {@code 4*|halfU x halfV|}, since the collector
      * builds {@code halfU = 0.5*(aHi-aLo)*e01} and {@code rectArea = |e01 x e03|*(aHi-aLo)*(bHi-bLo)}.
-     * world.rgen derives it from the cross product it already computes for the emitter normal.
+     * Direct-light evaluation derives it from the cross product already computed for the emitter normal.
      */
     static final int GPU_FLOATS_PER_LIGHT = 8;
     private static final int MAX_PACKED_GRID_DIM = 1024;
+    private static final int MAX_SECTION_LIGHTS = 0xffff;
     private static final int NORMAL_FLIP_BIT = 1 << 30;
 
     private RtLightHierarchy() {
@@ -68,8 +69,8 @@ final class RtLightHierarchy {
             float ox = section.sectionX * 16f - rebaseX;
             float oy = section.sectionY * 16f - rebaseY;
             float oz = section.sectionZ * 16f - rebaseZ;
-            for (int source = 0; source < section.lights.length;
-                 source += SOURCE_FLOATS_PER_LIGHT, lightIndex++) {
+            for (int j = 0; j < count; j++, lightIndex++) {
+                int source = j * SOURCE_FLOATS_PER_LIGHT;
                 int destination = lightIndex * GPU_FLOATS_PER_LIGHT;
                 int sectionDestination = lightIndex * 3;
                 lightSectionCoords[sectionDestination] = section.sectionX;
@@ -152,7 +153,14 @@ final class RtLightHierarchy {
                 int z = lightSectionCoords[source + 2] - gridSectionZ;
                 if ((x | y | z) < 0 || x >= MAX_PACKED_GRID_DIM || y >= MAX_PACKED_GRID_DIM
                         || z >= MAX_PACKED_GRID_DIM) {
-                    throw new IllegalStateException("Light section is outside packed light grid");
+                    if (powers[i] > 0.0) {
+                        throw new IllegalStateException("Light section is outside packed light grid");
+                    }
+                    // Zero-power lights (R11G11B10 underflow) have zero selection weight in every alias
+                    // table and are excluded from grid bounds, so clamp their unused grid coordinates.
+                    x = 0;
+                    y = 0;
+                    z = 0;
                 }
                 int destination = i * GPU_FLOATS_PER_LIGHT + 7;
                 int flags = Float.floatToRawIntBits(packedLights[destination]) & NORMAL_FLIP_BIT;
@@ -167,7 +175,7 @@ final class RtLightHierarchy {
     }
 
     private static int lightCount(float[] lights) {
-        return lights != null ? lights.length / SOURCE_FLOATS_PER_LIGHT : 0;
+        return lights != null ? Math.min(lights.length / SOURCE_FLOATS_PER_LIGHT, MAX_SECTION_LIGHTS) : 0;
     }
 
     private static List<SectionInput> orderedSections(List<SectionInput> sections,

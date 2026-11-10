@@ -31,6 +31,7 @@ import net.minecraft.client.multiplayer.ClientChunkCache;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.BlockStateModelSet;
+import net.minecraft.client.renderer.block.FluidRenderer;
 import net.minecraft.client.renderer.block.FluidStateModelSet;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
@@ -66,15 +67,14 @@ import dev.comfyfluffy.caustica.rt.terrain.RtSectionTable.SectionGeom;
  * chunk is loaded ({@code hasChunk}), so chunk load/unload drives build/free without any mixin.
  *
  * <p>Geometry comes from the vanilla model path (correct shapes, neighbour cull, biome
- * tint, alpha cutout, and model quad transforms) — on NeoForge the Fabric Renderer API does not
- * exist, so {@link dev.comfyfluffy.caustica.compat.VanillaModelQuads} collects the baked quads
- * straight off {@code BlockStateModel} parts. Vertices are section-local (f32-exact); each TLAS
+ * tint, alpha cutout, and model quad transforms) via {@link dev.comfyfluffy.caustica.compat.VanillaModelQuads},
+ * which collects baked quads straight off {@code BlockStateModel} parts. Vertices are section-local (f32-exact); each TLAS
  * instance carries a
  * translation {@code sectionOrigin − rebaseOrigin} (rebase = player block at the last rebuild, so
  * transforms stay small at any world coordinate) and an {@code instanceCustomIndex} into a BDA
  * section table ({@code {primAddr, uvAddr, triBase[4]}} per section) the hit shaders read. The index
  * buffer itself is retained only for the BLAS build (per-triangle corner UVs mean shading never needs
- * an index-buffer read — lever B), so its address isn't duplicated into this table.
+ * an index-buffer read), so its address isn't duplicated into this table.
  *
  * <p>Tessellation reads only an immutable snapshot ({@link RtSectionSnapshots.Region}, palette-only
  * copies captured on the render thread and cached persistently across passes — see
@@ -161,9 +161,8 @@ public final class RtTerrain {
     private final RtSectionTable table = new RtSectionTable();
     private long staticInstancesRevision;
     private boolean ready;
-    // Full-residency invalidation requested off the render thread. Wired to Fabric's
-    // InvalidateRenderStateCallback = vanilla LevelExtractor.allChanged() (dimension change via setLevel,
-    // render-distance change, F3+A). Consumed in tick(), where the RT context is available.
+    // Full-residency invalidation requested via LevelExtractor.allChanged() (dimension change via setLevel,
+    // render-distance change, F3+A) or resource reload. Consumed on the next render-frame stream or tick.
     private volatile boolean fullClearRequested;
     private volatile boolean dirtyPending;
     private boolean noWorldClearApplied;
@@ -353,10 +352,10 @@ public final class RtTerrain {
     }
 
     /**
-     * Request a full residency clear, applied on the next {@link #tick} (render thread, where the RT
-     * context is available). Wired to Fabric's {@code InvalidateRenderStateCallback} — vanilla's
-     * {@link net.minecraft.client.renderer.extract.LevelExtractor#allChanged()}, which fires on a
-     * dimension change (via {@code setLevel}), a render-distance change, and F3+A. Thread-safe.
+     * Request a full residency clear, applied on the next render-frame streaming pass or {@link #tick}
+     * (render thread, where the RT context is available). Triggered by
+     * {@link net.minecraft.client.renderer.extract.LevelExtractor#allChanged()} (dimension change via
+     * {@code setLevel}, render-distance change, F3+A) and resource reloads. Thread-safe.
      */
     public static void requestFullClear() {
         RtTerrainOmm.clearCache();
@@ -395,11 +394,9 @@ public final class RtTerrain {
             return; // resource reload gap: keep old work dormant until the new epoch requests a full clear
         }
 
-        // Full clear on an explicit invalidation — vanilla's LevelExtractor.allChanged() via the Fabric
-        // InvalidateRenderStateCallback. That fires on a dimension switch (setLevel → allChanged),
-        // render-distance change, and F3+A. Without it, End→Overworld keeps the old dimension's geometry:
-        // residency is keyed by raw section coords (no world identity), so the same coords stay resident
-        // and are never rebuilt for the new world.
+        // Full clear on an explicit invalidation — LevelExtractor.allChanged() (dimension switch,
+        // render-distance change, F3+A) or resource reload. Without it, switching dimensions keeps the old
+        // dimension's geometry because residency is keyed by raw section coords without world identity.
         if (fullClearRequested) {
             fullClearRequested = false;
             clear(ctx, false);
@@ -449,6 +446,10 @@ public final class RtTerrain {
         Minecraft mc = Minecraft.getInstance();
         if (mc.level == null || mc.player == null) {
             return;
+        }
+        if (fullClearRequested) {
+            fullClearRequested = false;
+            clear(ctx, false);
         }
         lastFrameStreamNanos = System.nanoTime();
         stream(ctx);
@@ -575,6 +576,17 @@ public final class RtTerrain {
                                     int radius, int loY, int hiY, List<SectionGeom> removed) {
         int newMinX = pcx - radius, newMaxX = pcx + radius;
         int newMinZ = pcz - radius, newMaxZ = pcz + radius;
+        // Evict cached snapshots for columns leaving the 1-chunk neighbourhood rim around the desired window.
+        int newRimMinX = newMinX - 1, newRimMaxX = newMaxX + 1;
+        int newRimMinZ = newMinZ - 1, newRimMaxZ = newMaxZ + 1;
+        for (int scx = windowPcx - radius - 1; scx <= windowPcx + radius + 1; scx++) {
+            boolean xOutRim = scx < newRimMinX || scx > newRimMaxX;
+            for (int scz = windowPcz - radius - 1; scz <= windowPcz + radius + 1; scz++) {
+                if (xOutRim || scz < newRimMinZ || scz > newRimMaxZ) {
+                    invalidateColumnSnapshots(scx, scz, loY, hiY);
+                }
+            }
+        }
         for (int scx = windowPcx - radius; scx <= windowPcx + radius; scx++) {
             boolean xOutside = scx < newMinX || scx > newMaxX;
             for (int scz = windowPcz - radius; scz <= windowPcz + radius; scz++) {
@@ -638,12 +650,16 @@ public final class RtTerrain {
         }
     }
 
+    private void invalidateColumnSnapshots(int scx, int scz, int loY, int hiY) {
+        for (int scy = loY - 1; scy <= hiY + 1; scy++) {
+            snapshots.invalidate(sectionKey(scx, scy, scz));
+        }
+    }
+
     private void removeDesiredColumnSections(int scx, int scz, int loY, int hiY, List<SectionGeom> removed) {
+        invalidateColumnSnapshots(scx, scz, loY, hiY);
         for (int scy = loY; scy <= hiY; scy++) {
             long key = sectionKey(scx, scy, scz);
-            // Unloaded or out of the window — the chunk may reload with different data, so the cached
-            // snapshot can't be trusted past this point.
-            snapshots.invalidate(key);
             desired.remove(key);
             clearQueuedWork(key, true);
             invalidateInFlight(key);
@@ -895,10 +911,13 @@ public final class RtTerrain {
      */
     private static DispatchContext dispatchContext(RtContext ctx, ClientLevel level) {
         Minecraft mc = Minecraft.getInstance();
+        FluidStateModelSet fluidModels = mc.getModelManager().getFluidStateModelSet();
         return new DispatchContext(ctx, level,
-                mc.getModelManager().getBlockStateModelSet(), mc.getModelManager().getFluidStateModelSet(),
+                mc.getModelManager().getBlockStateModelSet(), fluidModels,
+                new FluidRenderer(fluidModels),
                 mc.getBlockColors(),
-                AtlasSpriteFinder.of(mc.getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS)));
+                AtlasSpriteFinder.of(mc.getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS)),
+                mc.options.cutoutLeaves().get());
     }
 
     /**
@@ -1100,10 +1119,11 @@ public final class RtTerrain {
                         return;
                     }
                     WorkerTessState ws = WORKER_TESS.get(); // thread-confined; reset per task, arrays amortized
-                    ws.reset(dispatch.blockColors(), dispatch.blockSpriteFinder());
+                    ws.reset(dispatch.blockColors(), dispatch.blockSpriteFinder(), dispatch.cutoutLeaves());
                     CpuSection cpu = buildCpuSection(region, dispatch.modelSet(), ws.blockRandom,
                             ws.capture,
-                            dispatch.fluidModelSet(), ws.fluidCapture, ws.mesh, ws.pos, materialSnapshot, sx, sy, sz);
+                            dispatch.fluidModelSet(), dispatch.fluidRenderer(), ws.fluidCapture,
+                            ws.mesh, ws.pos, materialSnapshot, sx, sy, sz);
                     if (!isTaskCurrent(task)) {
                         completeTask(task, null, null, null);
                         return;
@@ -1429,8 +1449,9 @@ public final class RtTerrain {
 
     /** Per-tick render-thread snapshot dependencies shared by reextract + missing dispatch. */
     private record DispatchContext(RtContext ctx, ClientLevel level, BlockStateModelSet modelSet,
-                                   FluidStateModelSet fluidModelSet, BlockColors blockColors,
-                                   AtlasSpriteFinder blockSpriteFinder) {
+                                   FluidStateModelSet fluidModelSet, FluidRenderer fluidRenderer,
+                                   BlockColors blockColors, AtlasSpriteFinder blockSpriteFinder,
+                                   boolean cutoutLeaves) {
     }
 
     private record DirtyEvent(long groupId, LongArrayList keys) {

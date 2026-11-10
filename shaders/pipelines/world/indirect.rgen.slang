@@ -10,7 +10,7 @@
 //   * NEE toward the sun — a single analytic directional light, gated by one hit-object visibility
 //     query (TerminateOnFirstHit | SkipClosestHit). Lambertian BRDF = albedo/PI.
 //   * a cosine-weighted Lambertian continuation ray (throughput *= albedo; the PI and cos cancel).
-// Sky / ambient light needs no separate AO pass: continuation rays that escape land in world.rmiss,
+// Sky / ambient light needs no separate AO pass: continuation rays that escape land in sky.rmiss,
 // which returns sky radiance — so soft sky fill and contact AO both fall out of the path integral.
 //
 // Each frame emits a single SPP-averaged (still noisy) estimate; temporal convergence is the denoiser's
@@ -32,7 +32,7 @@ import lighting;
 import sky;
 import bindings;
 
-// Atmospheric transmittance LUT (RtSkyLut), also bound to world.rmiss at the same binding: raygen reads it
+// Atmospheric transmittance LUT (RtSkyLut), also bound to sky.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
 public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     float3 L = float3(0.0, 0.0, 0.0);
@@ -62,17 +62,16 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     // a dielectric it is whatever the parent was travelling through.
     MediumStack medium = seg.medium;
     bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
-    // Sky-disc gate (see world.rmiss): the sun/moon disc is shown to the primary ray and to rays spawned
+    // Sky-disc gate (see sky.rmiss): the sun/moon disc is shown to the primary ray and to rays spawned
     // by a specular/dielectric bounce (mirror reflections + refractions of the sun/moon), but hidden from
     // diffuse-sampled continuation rays — those are already covered by the sun NEE, so the tiny disc
     // would be a double-counted firefly. Reset true on every specular/water bounce, false on a diffuse one.
     bool showCelestial = seg.showCelestial;
-    // Pass B treats every hit it sees as one indirect-depth step, regardless of material or selected
-    // continuation lobe. Deliberately start at zero instead of seg.bounce: the first hit of either
-    // queued split branch is still the primary-terminal shading point. Hits 0 and 1 retain SSS. RIS runs
-    // at every hit: hit 0 with risCandidates, later hits with risCandidatesIndirect, which the CPU clamps
-    // to [1, risCandidates] so a hit never skips RIS while its emitter gate assumes RIS sampled it.
-    // Pass A's primary/interface prefix is outside this SSS quality budget.
+    // Every shaded non-dielectric surface hit increments indirectDepth; unshaded dielectric/water
+    // pass-through interfaces do not consume it, so the first surface seen through glass or water still
+    // receives primary-terminal RIS candidate count and SSS budget. Hits 0 and 1 retain SSS. RIS runs at
+    // every shaded hit: hit 0 with risCandidates, later hits with risCandidatesIndirect, which the CPU
+    // clamps to [1, risCandidates] so a hit never skips RIS while its emitter gate assumes RIS sampled it.
     int indirectDepth = 0;
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
         // Radiance SBT records run any-hit only for true alpha cutout. Translucent/water go straight to
@@ -98,7 +97,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 break;
             }
 
-            // world.rmiss writes sky radiance (gradient + sun/moon disc + stars) into the payload's
+            // sky.rmiss writes sky radiance (gradient + sun/moon disc + stars) into the payload's
             // surface words as a full float3, so this is absolute scene units with nothing to undo. The
             // packed show-celestial flag decides whether this path segment may see the bright disc.
             float3 sky = payloadSky();
@@ -118,8 +117,6 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         float3 hitPos = ro + rd * payload.hitT;
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0), RAY_CONE_MIN_WIDTH);
         uint material = payloadMaterial();
-        int hitDepth = indirectDepth++;
-        uint risCandidates = hitDepth == 0 ? worldPush.risCandidates : worldPush.risCandidatesIndirect;
 
         // ---- Dielectric interface: water, stained glass, ice. ONE handler and one behaviour — every
         // dielectric is a volume. Fresnel from the relative index across the face, then reflect or
@@ -194,6 +191,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             }
             continue;
         }
+
+        int hitDepth = indirectDepth++;
+        uint risCandidates = hitDepth == 0 ? worldPush.risCandidates : worldPush.risCandidatesIndirect;
 
         // Particles (material == 2): camera-facing receiver billboard. The instance mask keeps particles
         // off secondary rays, so this only fires at bounce 0; they receive direct light and one diffuse

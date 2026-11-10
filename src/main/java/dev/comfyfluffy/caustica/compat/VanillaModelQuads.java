@@ -1,7 +1,6 @@
 package dev.comfyfluffy.caustica.compat;
 
 import java.util.function.Predicate;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.ModelBlockRenderer;
 import net.minecraft.client.renderer.block.dispatch.BlockStateModel;
@@ -29,9 +28,9 @@ public final class VanillaModelQuads {
         private final ScratchLists<BlockStateModelPart> scratch = new ScratchLists<>(4, 256);
 
         public void emit(BlockStateModel model, BlockAndTintGetter level, BlockPos pos,
-                BlockState state, RandomSource random, Predicate<Direction> cullTest, QuadSink out) {
-            boolean forceOpaque = ModelBlockRenderer.forceOpaque(
-                    Minecraft.getInstance().options.cutoutLeaves().get(), state);
+                BlockState state, RandomSource random, boolean cutoutLeaves,
+                Predicate<Direction> cullTest, QuadSink out) {
+            boolean forceOpaque = ModelBlockRenderer.forceOpaque(cutoutLeaves, state);
             var parts = scratch.acquire();
             try {
                 // World context is required for connected textures and other position-dependent NeoForge models.

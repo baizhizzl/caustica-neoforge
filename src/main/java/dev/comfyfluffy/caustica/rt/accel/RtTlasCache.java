@@ -1,5 +1,7 @@
 package dev.comfyfluffy.caustica.rt.accel;
 
+import dev.comfyfluffy.caustica.rt.entity.RtEntities;
+
 import java.util.List;
 
 /** CPU state for one timeline-protected TLAS slot. Equality is exact, not a hash of GPU input. */
@@ -70,9 +72,16 @@ final class RtTlasCache {
         for (int i = 0; i < dynamicCount; i++) {
             RtAccel.Instance instance = dynamic.get(i);
             int m = i * 3;
-            if ((metadata[m] & RtAccel.INSTANCE_KIND_MASK) != (instance.customIndex() & RtAccel.INSTANCE_KIND_MASK)
+            int kind = instance.customIndex() & RtAccel.INSTANCE_KIND_MASK;
+            if ((metadata[m] & RtAccel.INSTANCE_KIND_MASK) != kind
                     || metadata[m + 1] != instance.mask()
                     || metadata[m + 2] != instance.sbtRecordOffset()) {
+                return false;
+            }
+            // Particle billboards use an identity instance matrix and bake rebase-space positions directly
+            // into a fresh per-frame BLAS; a different particle BLAS can jump arbitrarily without changing
+            // the instance translation, so never refit across a particle BLAS replacement.
+            if ((kind & RtEntities.PARTICLE_BIT) != 0 && addresses[i] != instance.blasDeviceAddress()) {
                 return false;
             }
             float[] matrix = instance.transform3x4();

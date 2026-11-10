@@ -122,6 +122,7 @@ public final class RtWorldOverlay {
         }
         if (overlayImage == null || overlayImage.width != width || overlayImage.height != height) {
             if (overlayImage != null) {
+                ctx.waitIdle();
                 overlayImage.destroy();
             }
             overlayImage = ctx.createStorageImage(width, height, TARGET_FORMAT,
@@ -148,11 +149,14 @@ public final class RtWorldOverlay {
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay UI composite")) {
                 beginColorRendering(cmd, stack, targetView, width, height, false); // LOAD the transparent UI image
-                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.handle);
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.layout, 0,
-                        stack.longs(uiCompositeSet.set), null);
-                VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
-                endRendering(cmd);
+                try {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.handle);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, uiCompositePipeline.layout, 0,
+                            stack.longs(uiCompositeSet.set), null);
+                    VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                } finally {
+                    endRendering(cmd);
+                }
             }
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // this composite's writes visible to whatever presents next
         }
@@ -162,8 +166,21 @@ public final class RtWorldOverlay {
         encoder.execute(cmd);
     }
 
+    /** Notify features of a resource reload so stale font/atlas bindings can be dropped. */
+    public void onResourceReload() {
+        for (RtOverlayFeature f : features) {
+            f.onResourceReload();
+        }
+    }
+
+    /** Clear the session failure latch when the user re-enables RT. */
+    public void resetFailureLatch() {
+        failed = false;
+    }
+
     /** Teardown with the rest of the RT stack ({@code RtComposite.destroy}); the device is idle by then. */
     public void destroy() {
+        failed = false;
         for (RtOverlayFeature f : features) {
             f.destroy();
         }

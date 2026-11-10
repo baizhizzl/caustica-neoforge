@@ -203,4 +203,15 @@ final class RtTlasCacheTest {
         cache.built(source, 3, 10, List.of(moved), 0, true);
         assertFalse(cache.needsBuild(source, 3, 10, List.of(moved), 0));
     }
+
+    @Test
+    void freshlyBuiltParticleBlasAddressChangeRejectsInPlaceTlasRefit() {
+        Object source = new Object();
+        RtTlasCache cache = new RtTlasCache();
+        // 0x400000 = RtEntities.PARTICLE_BIT: particle BLASes are freshly rebuilt per frame with varying
+        // primitive counts, so swapping the BLAS address must force a full TLAS build instead of an UPDATE.
+        cache.built(source, 3, 10, List.of(instance(100, 0x400001, 2, 4)), 0, false);
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(instance(200, 0x400001, 2, 4))));
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(instance(100, 0x400001, 2, 4))));
+    }
 }

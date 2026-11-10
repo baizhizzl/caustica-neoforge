@@ -18,9 +18,11 @@ import net.minecraft.resources.Identifier;
 
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.WeakHashMap;
 
 /**
@@ -51,12 +53,13 @@ public final class RtEntityTextures {
 
     public static final RtEntityTextures INSTANCE = new RtEntityTextures();
 
-    // RenderType identity → resolved primary image-view handle. WEAK: some render types are rebuilt
-    // every frame with a fresh identity (e.g. the charged-creeper energy-swirl layer, whose scrolling
-    // texture transform makes RenderTypes.energySwirl() allocate a new RenderType each frame). A weak map
-    // lets those dead identities be collected instead of accumulating; stable singletons (zombie.png, …)
-    // stay cached and skip the costly RenderType.prepare().
-    private final Map<RenderType, Long> viewCache = new WeakHashMap<>();
+    // RenderType identity → resolved primary GpuTextureView. WEAK: some render types are rebuilt every
+    // frame with a fresh identity (e.g. the charged-creeper energy-swirl layer, whose scrolling texture
+    // transform makes RenderTypes.energySwirl() allocate a new RenderType each frame). Caching the
+    // GpuTextureView rather than its raw VkImageView address lets us detect closed dynamic views (skins,
+    // maps, dynamic overlays) via GpuTextureView.isClosed() and re-resolve instead of sampling destroyed handles.
+    private final Map<RenderType, GpuTextureView> viewCache = new WeakHashMap<>();
+    private final Set<RenderType> untexturedCache = Collections.newSetFromMap(new WeakHashMap<>());
     private final Map<RenderType, Identifier> locationCache = new WeakHashMap<>();
     // Resolved image-view handle → bindless slot. The slot identifies a *texture*, not a RenderType, so
     // many render types that differ only by a texture transform we don't replicate (the swirl's scroll)
@@ -64,9 +67,9 @@ public final class RtEntityTextures {
     // falls back to slot 0 (the block atlas). Append-only: a handle's slot never changes once assigned,
     // so update-after-bind writes for new slots never disturb in-flight frames.
     private final Map<Long, Integer> viewSlotCache = new HashMap<>();
-    // Atlas-location → bindless slot, for items/blocks (which texture from an atlas, not a per-type
-    // file). Seeded with the block atlas = slot 0 (also the fallback). Items use a separate item atlas.
-    private final Map<Identifier, Integer> atlasSlotCache = new HashMap<>();
+    // Atlas-location → resolved GpuTextureView, checked for isClosed() so recreated dynamic textures
+    // obtain a fresh slot instead of keeping a stale VkImageView. Block atlas always maps to slot 0.
+    private final Map<Identifier, GpuTextureView> atlasViewCache = new HashMap<>();
     private final List<Pending> pending = new ArrayList<>(); // albedo slots awaiting descriptor upload
     // Descriptor array capacity of the currently alive world pipeline. A higher config value applies after
     // reset/recreate; a lower value stops allocating new slots immediately without invalidating old ones.
@@ -107,30 +110,33 @@ public final class RtEntityTextures {
 
     /**
      * The bindless slot for a texture atlas (block/item atlas used by item + block-model quads), cached
-     * per atlas location. The block atlas is pre-seeded to slot 0; other atlases (the item atlas) get
-     * their own slot. Returns 0 (fallback) if unresolvable or the array is full.
+     * per atlas location while the underlying {@link GpuTextureView} remains open. The block atlas maps to
+     * slot 0; other atlases (the item atlas) get their own slot. Returns 0 (fallback) if unresolvable or full.
      */
     public int slotForAtlas(Identifier atlasLocation) {
-        if (atlasLocation == null) {
+        if (atlasLocation == null || TextureAtlas.LOCATION_BLOCKS.equals(atlasLocation)) {
             return 0;
         }
-        Integer cached = atlasSlotCache.get(atlasLocation);
-        if (cached != null) {
-            return cached;
-        }
-        long view = 0L;
-        try {
-            GpuTextureView v = Minecraft.getInstance().getTextureManager().getTexture(atlasLocation).getTextureView();
-            view = vkImageView(v);
-        } catch (Throwable t) {
-            if (!loggedFailure) {
-                loggedFailure = true;
-                CausticaMod.LOGGER.warn("RT atlas texture resolution failed for {}", atlasLocation, t);
+        GpuTextureView cached = atlasViewCache.get(atlasLocation);
+        if (cached == null || cached.isClosed()) {
+            cached = null;
+            try {
+                GpuTextureView v = Minecraft.getInstance().getTextureManager().getTexture(atlasLocation).getTextureView();
+                if (v != null && !v.isClosed()) {
+                    atlasViewCache.put(atlasLocation, v);
+                    cached = v;
+                } else {
+                    atlasViewCache.remove(atlasLocation);
+                }
+            } catch (Throwable t) {
+                atlasViewCache.remove(atlasLocation);
+                if (!loggedFailure) {
+                    loggedFailure = true;
+                    CausticaMod.LOGGER.warn("RT atlas texture resolution failed for {}", atlasLocation, t);
+                }
             }
         }
-        int slot = slotForView(view);
-        atlasSlotCache.put(atlasLocation, slot);
-        return slot;
+        return slotForView(vkImageView(cached));
     }
 
     /**
@@ -142,8 +148,10 @@ public final class RtEntityTextures {
      * survives {@link #reset} like any other atlas. Falls back to slot 0 if registration fails.
      */
     public int whiteSlot() {
-        if (!whiteRegistered) {
-            whiteRegistered = true; // one attempt; on failure slotForAtlas caches the slot-0 fallback
+        GpuTextureView existing = atlasViewCache.get(WHITE_LOCATION);
+        if (!whiteRegistered || (existing != null && existing.isClosed())) {
+            whiteRegistered = true;
+            atlasViewCache.remove(WHITE_LOCATION);
             NativeImage image = new NativeImage(1, 1, false);
             image.setPixel(0, 0, 0xFFFFFFFF);
             Minecraft.getInstance().getTextureManager()
@@ -195,10 +203,10 @@ public final class RtEntityTextures {
     public void reset(int descriptorCapacity) {
         capacity = Math.max(1, descriptorCapacity);
         viewCache.clear();
+        untexturedCache.clear();
         locationCache.clear();
         viewSlotCache.clear();
-        atlasSlotCache.clear();
-        atlasSlotCache.put(TextureAtlas.LOCATION_BLOCKS, 0); // block atlas = the slot-0 fallback
+        atlasViewCache.clear();
         pending.clear();
         nextSlot = 1;
     }
@@ -247,11 +255,15 @@ public final class RtEntityTextures {
         if (renderType == null) {
             return 0L;
         }
-        Long cached = viewCache.get(renderType);
+        GpuTextureView cached = viewCache.get(renderType);
         if (cached != null) {
-            return cached;
+            if (!cached.isClosed()) {
+                return vkImageView(cached);
+            }
+            viewCache.remove(renderType);
+        } else if (untexturedCache.contains(renderType)) {
+            return 0L;
         }
-        long handle = 0L;
         try {
             PreparedRenderType prepared = renderType.prepare();
             GpuTextureView chosen = null;
@@ -269,8 +281,12 @@ public final class RtEntityTextures {
             if (chosen == null) {
                 chosen = firstNonAux;
             }
-            if (chosen != null) {
-                handle = vkImageView(chosen);
+            if (chosen != null && !chosen.isClosed()) {
+                viewCache.put(renderType, chosen);
+                return vkImageView(chosen);
+            }
+            if (chosen == null) {
+                untexturedCache.add(renderType);
             }
         } catch (Throwable t) {
             if (!loggedFailure) {
@@ -278,8 +294,7 @@ public final class RtEntityTextures {
                 CausticaMod.LOGGER.warn("RT entity texture resolution failed for {}", renderType, t);
             }
         }
-        viewCache.put(renderType, handle);
-        return handle;
+        return 0L;
     }
 
     private static long vkImageView(GpuTextureView view) {

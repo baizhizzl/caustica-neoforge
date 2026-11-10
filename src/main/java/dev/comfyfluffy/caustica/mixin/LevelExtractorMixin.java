@@ -49,6 +49,6 @@ public class LevelExtractorMixin {
     @Inject(method = "allChanged()V", at = @At("RETURN"))
     private void caustica$rtAllChanged(CallbackInfo ci) {
         RtTerrain.requestFullClear();
-        RtComposite.INSTANCE.resetFailureLatch(); // F3+A doubles as manual RT recovery after a latched failure
+        RtComposite.INSTANCE.onRenderStateInvalidated();
     }
 }

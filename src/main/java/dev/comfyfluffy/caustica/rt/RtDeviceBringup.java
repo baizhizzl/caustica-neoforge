@@ -93,10 +93,10 @@ public final class RtDeviceBringup {
     /**
      * OPTIONAL RT extensions: enabled only when the selected device supports them AND the gate is on, but
      * never required — a device lacking them still comes up RT-capable (unlike {@link #RT_EXTENSIONS}, whose
-     * absence disables RT entirely). {@code VK_EXT_opacity_micromap} (any-hit opt, lever C): per-triangle
-     * opacity micromaps let the hardware skip {@code world.rahit} on fully-opaque/transparent cutout micro-
-     * triangles, so the alpha-test any-hit runs only on the foliage silhouette. Hardware-accelerated on RTX
-     * 40-series and Blackwell; absent / software elsewhere, hence optional.
+     * absence disables RT entirely). {@code VK_EXT_opacity_micromap}: per-triangle opacity micromaps let the
+     * hardware skip alpha-test any-hit invocation on fully-opaque/transparent cutout micro-triangles, so the
+     * any-hit shader runs only on the foliage silhouette. Hardware-accelerated on RTX 40-series and
+     * Blackwell; absent / software elsewhere, hence optional.
      */
     public static final List<String> OPTIONAL_RT_EXTENSIONS = List.of(
             VK_EXT_OPACITY_MICROMAP_EXTENSION_NAME);
@@ -112,6 +112,7 @@ public final class RtDeviceBringup {
             VK_NV_LOW_LATENCY_2_EXTENSION_NAME, VK_KHR_PRESENT_ID_EXTENSION_NAME);
 
     private static volatile boolean rtRequested;
+    private static volatile boolean rtReady;
     private static volatile SerBackend serBackend = SerBackend.NONE;
     private static volatile boolean ommEnabled; // VK_EXT_opacity_micromap actually enabled on the device
     private static volatile boolean reflexEnabled; // VK_NV_low_latency2 actually enabled on the device
@@ -193,6 +194,11 @@ public final class RtDeviceBringup {
     /** True once we have augmented a device creation to request RT (extensions + features). */
     public static boolean rtRequested() {
         return rtRequested;
+    }
+
+    /** True once a Vulkan device has been created with RT extensions/features and passed {@link #probe(VkDevice)}. */
+    public static boolean isRtReady() {
+        return rtReady;
     }
 
     public static String worldRaygenShader() {
@@ -475,6 +481,7 @@ public final class RtDeviceBringup {
 
     /** Add supported RT features after their matching extension names have been requested. */
     public static void addFeatures(Set<VulkanFeature> features, VulkanPhysicalDevice physicalDevice) {
+        rtReady = false;
         if (!enabledByProperty()) {
             return;
         }
@@ -572,6 +579,7 @@ public final class RtDeviceBringup {
      * the device truly came up RT-capable.
      */
     public static void probe(VkDevice device) {
+        rtReady = false;
         if (!rtRequested) {
             CausticaMod.LOGGER.info("Ray tracing not requested; skipping RT probe");
             maxOpacity4StateSubdivisionLevel = 0;
@@ -634,7 +642,9 @@ public final class RtDeviceBringup {
                     reflexEnabled = false;
                 }
             }
+            rtReady = true;
         } catch (Throwable t) {
+            rtReady = false;
             // A probe must never break device creation.
             CausticaMod.LOGGER.error("RT probe threw; continuing without RT", t);
         }

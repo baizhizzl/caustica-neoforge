@@ -64,15 +64,19 @@ public final class RtUiOverlay {
     }
 
     /**
-     * Runs regardless of HDR mode because the GUI redirect and composite-back reproduce vanilla in SDR,
-     * while {@code RtWorldOverlay}'s composite point is this same
-     * seam and needs it to fire every frame. Active only once the game has finished loading: the composite
-     * pipeline lazily compiles its shaders, which are not available during the loading screen (would crash
-     * with "Couldn't find source for core/screenquad"). Gating the redirect here keeps the loading-screen
-     * GUI on the normal path.
+     * Active when the Vulkan RT device is ready, the RT renderer is enabled, the composite pipeline has not
+     * faulted, and the game has finished loading (the composite pipeline lazily compiles its shaders, which
+     * are not available during the loading screen).
      */
     public static boolean enabled() {
-        return !compositeFailed && Minecraft.getInstance().isGameLoadFinished();
+        return RtDeviceBringup.isRtReady()
+                && RtComposite.enabled()
+                && !compositeFailed
+                && Minecraft.getInstance().isGameLoadFinished();
+    }
+
+    public static void resetFailureLatch() {
+        compositeFailed = false;
     }
 
     /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */
@@ -133,9 +137,10 @@ public final class RtUiOverlay {
         return prepare(main);
     }
 
-    /** Reset the per-frame clear latch. Called at the start of {@code GameRenderer.render} (every frame). */
+    /** Reset the per-frame clear and population latches. Called at the start of {@code GameRenderer.render}. */
     public static void beginFrame() {
         overlayClearedThisFrame = false;
+        usedThisFrame = false;
     }
 
     /**
@@ -167,12 +172,10 @@ public final class RtUiOverlay {
             usedThisFrame = false;
             return;
         }
-        if (RtComposite.INSTANCE.isHdrPresentActive()) {
-            // HDR path composites the overlay over the PQ HDR image at present; leave usedThisFrame set so
-            // presentHdr can consume it. Do NOT composite over the SDR main target (it isn't presented).
-            return;
-        }
-        usedThisFrame = false;
+        // Keep usedThisFrame set when HDR present is active so presentHdr also composites the UI over the
+        // PQ swapchain image, while still compositing onto the SDR main target so F2 PNG screenshots
+        // retain HUD/GUI in HDR mode (captureFgHudless already ran before GuiRenderer.render).
+        usedThisFrame = RtComposite.INSTANCE.isHdrPresentActive();
         RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
         if (main == null || main.getColorTextureView() == null) {
             return;

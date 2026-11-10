@@ -1,7 +1,6 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
-import net.minecraft.client.color.block.BlockTintSource;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.client.renderer.block.FluidModel;
 import net.minecraft.client.renderer.block.FluidRenderer;
@@ -17,6 +16,8 @@ import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import net.neoforged.neoforge.client.fluid.CustomFluidRenderer;
+import net.neoforged.neoforge.client.fluid.FluidTintSource;
 
 /**
  * Custom fluid mesher used in place of vanilla {@link FluidRenderer} for every fluid in the RT terrain
@@ -101,7 +102,15 @@ final class RtFluidMesher {
     }
 
     static void tesselate(BlockAndTintGetter level, BlockPos pos, FluidRenderer.Output output,
-                          FluidStateModelSet fluidModels, BlockState blockState, FluidState fluidState) {
+                          FluidStateModelSet fluidModels, FluidRenderer fallbackRenderer,
+                          BlockState blockState, FluidState fluidState) {
+        FluidModel model = fluidModels.get(fluidState);
+        CustomFluidRenderer customRenderer = model.customRenderer();
+        if (customRenderer != null
+                && customRenderer.renderFluid(fallbackRenderer, fluidState, level, pos, output, blockState)) {
+            return;
+        }
+
         BlockPos posDown = pos.below();
         BlockState blockStateDown = level.getBlockState(posDown);
         FluidState fluidStateDown = blockStateDown.getFluidState();
@@ -126,10 +135,9 @@ final class RtFluidMesher {
             return;
         }
 
-        FluidModel model = fluidModels.get(fluidState);
         var builder = output.getBuilder(model.layer());
-        BlockTintSource tintSource = model.tintSource();
-        int tintColor = tintSource != null ? tintSource.colorInWorld(blockState, level, pos) : -1;
+        FluidTintSource tintSource = model.fluidTintSource();
+        int tintColor = tintSource != null ? tintSource.colorInWorld(fluidState, blockState, level, pos) : -1;
         Fluid type = fluidState.getType();
         float heightSelf = getHeight(level, type, pos, blockState, fluidState);
         float heightNorthEast;

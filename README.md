@@ -44,7 +44,7 @@ Caustica 是基于 Vulkan 硬件光线追踪的路径追踪渲染模组，用实
 - 本模组仅需在**客户端**安装。
 - 开启 **DLSS 帧生成**时，请同时开启**垂直同步（VSync）**，否则生成帧无法按稳定节奏输出。
 - 若游戏崩溃后自动回退到 OpenGL 后端，重启后请重新在视频设置中切回 Vulkan。
-- Linux 下若启动时出现栈溢出（StackOverflowError），可在 JVM 参数中添加 `-Xss2M`。
+- Linux / Windows 下若启动时因 NVIDIA NGX 初始化栈深较大而出现栈溢出（`StackOverflowError`），请在启动器 JVM 参数中添加 `-Xss16m`。
 
 ## 兼容性
 

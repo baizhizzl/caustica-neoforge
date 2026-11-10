@@ -113,22 +113,27 @@ NGX_SHIM_EXPORT int ngxshim_required_extensions(int wantDevice, char* outBuf, in
 
     unsigned int count = wantDevice ? deviceCount : instanceCount;
     const char** exts = wantDevice ? deviceExts : instanceExts;
+    if (!outBuf || bufLen <= 0) {
+        return (int) count;
+    }
 
     int pos = 0;
+    unsigned int written = 0;
     for (unsigned int i = 0; i < count && exts; i++) {
         int n = (int) std::strlen(exts[i]);
         if (pos + n + 1 >= bufLen) {
-            break;
+            outBuf[pos] = 0;
+            NGX_LOG("required_extensions: buffer truncated at %u/%u bytesWritten=%d", written, count, pos);
+            return -1;
         }
         std::memcpy(outBuf + pos, exts[i], n);
         pos += n;
         outBuf[pos++] = '\n';
+        written++;
     }
-    if (pos < bufLen) {
-        outBuf[pos] = 0;
-    }
-    NGX_LOG("required_extensions: exit count=%u bytesWritten=%d", count, pos);
-    return (int) count;
+    outBuf[pos] = 0;
+    NGX_LOG("required_extensions: exit count=%u bytesWritten=%d", written, pos);
+    return (int) written;
 }
 
 // Initializes NGX against the live device. featureDllPath is the directory that
@@ -166,6 +171,7 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
     g_lastResult = (int) r;
     NGX_LOG("init: Init_with_ProjectID r=0x%08x", (unsigned) r);
     if (NVSDK_NGX_FAILED(r)) {
+        g_device = VK_NULL_HANDLE;
         NGX_LOG("init: FAILED init, returning 0x%08x", (unsigned) r);
         return (int) r;
     }
@@ -174,6 +180,11 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
     r = NVSDK_NGX_VULKAN_GetCapabilityParameters(&g_capabilityParams);
     g_lastResult = (int) r;
     NGX_LOG("init: GetCapabilityParameters r=0x%08x g_capabilityParams=%p", (unsigned) r, (void*) g_capabilityParams);
+    if (NVSDK_NGX_FAILED(r)) {
+        g_capabilityParams = nullptr;
+        NVSDK_NGX_VULKAN_Shutdown1(device);
+        g_device = VK_NULL_HANDLE;
+    }
     return (int) r;
 }
 
@@ -256,6 +267,12 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
     }
 
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    if (!feature) {
+        NVSDK_NGX_VULKAN_ReleaseFeature(handle);
+        NVSDK_NGX_VULKAN_DestroyParameters(params);
+        g_lastResult = (int) NVSDK_NGX_Result_Fail;
+        return nullptr;
+    }
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = true; // allocated above; release destroys it
@@ -403,6 +420,11 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     }
 
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    if (!feature) {
+        NVSDK_NGX_VULKAN_ReleaseFeature(handle);
+        g_lastResult = (int) NVSDK_NGX_Result_Fail;
+        return nullptr;
+    }
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = false; // shared capability block, freed at shutdown
@@ -547,6 +569,11 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
     }
 
     DlssFeature* feature = (DlssFeature*) std::malloc(sizeof(DlssFeature));
+    if (!feature) {
+        NVSDK_NGX_VULKAN_ReleaseFeature(handle);
+        g_lastResult = (int) NVSDK_NGX_Result_Fail;
+        return nullptr;
+    }
     feature->handle = handle;
     feature->params = params;
     feature->ownsParams = false; // shared capability block, freed at shutdown

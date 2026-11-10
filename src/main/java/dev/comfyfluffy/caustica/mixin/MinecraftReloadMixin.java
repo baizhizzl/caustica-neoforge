@@ -1,30 +1,42 @@
 package dev.comfyfluffy.caustica.mixin;
 
+import dev.comfyfluffy.caustica.compat.AtlasSpriteFinder;
 import dev.comfyfluffy.caustica.rt.RtComposite;
+import net.minecraft.client.GameLoadCookie;
 import net.minecraft.client.Minecraft;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.concurrent.CompletableFuture;
 
 /**
- * Drains in-flight RT work at the start of a user-triggered resource reload (F3+T, or applying a
- * resource pack), before MC re-stitches the block atlas and destroys the old GPU image. The RT
- * descriptors still reference that image, so destroying it while one of our frames is in flight trips
- * the Vulkan validation-layer {@code vkDestroyImage} abort (the "sometimes crash" on a pack switch).
- *
- * <p>The no-arg {@code reloadResourcePacks()} is the user-facing entry (F3+T and the pack screen);
- * startup loading uses a private overload, when RT isn't up yet, so it isn't hooked. The actual
- * re-resolve/rebind of every texture handle happens on the next world frame (see
- * {@link RtComposite#onResourceReloadStart()} → {@code ensureWorld}), once the new atlas exists.
+ * Coordinates RT pipeline teardown and re-enablement across Minecraft resource reloads (manual F3+T,
+ * pack-screen changes, and resource-pack recovery). Drains in-flight RT work right before pack reloading
+ * starts — after deferred/queued reload checks have passed — so descriptors referencing old atlas/entity
+ * textures are destroyed before Minecraft frees those GPU images, then clears the reload gate once the new
+ * reload finishes or recovery aborts.
  */
 @Mixin(Minecraft.class)
 public class MinecraftReloadMixin {
-    @Inject(method = "reloadResourcePacks()Ljava/util/concurrent/CompletableFuture;", at = @At("HEAD"))
-    private void caustica$rtReloadStart(CallbackInfoReturnable<CompletableFuture<Void>> cir) {
+    @Inject(
+            method = "reloadResourcePacks(ZLnet/minecraft/client/GameLoadCookie;)Ljava/util/concurrent/CompletableFuture;",
+            at = @At(value = "INVOKE", target = "Lnet/minecraft/server/packs/repository/PackRepository;reload()V"))
+    private void caustica$rtReloadStart(boolean isRecovery, GameLoadCookie loadCookie,
+            CallbackInfoReturnable<CompletableFuture<Void>> cir) {
         RtComposite.INSTANCE.onResourceReloadStart();
-        dev.comfyfluffy.caustica.compat.AtlasSpriteFinder.clearCache();
+        AtlasSpriteFinder.clearCache();
+    }
+
+    @Inject(method = "onResourceLoadFinished(Lnet/minecraft/client/GameLoadCookie;)V", at = @At("RETURN"))
+    private void caustica$rtReloadFinished(GameLoadCookie loadCookie, CallbackInfo ci) {
+        RtComposite.INSTANCE.onResourceReloadFinished();
+    }
+
+    @Inject(method = "abortResourcePackRecovery()V", at = @At("RETURN"))
+    private void caustica$rtReloadRecoveryAborted(CallbackInfo ci) {
+        RtComposite.INSTANCE.onResourceReloadFinished();
     }
 }

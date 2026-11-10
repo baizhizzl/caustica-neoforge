@@ -34,3 +34,13 @@ Bundled NVIDIA SDK runtime libraries may include files matching:
 
 Caustica's `ngxshim` native library is project-owned glue code and follows
 Caustica's project license unless otherwise noted.
+
+## Reference & Runtime Libraries
+
+- **Fabric Rendering API (FabricMC)** (`Apache-2.0`, <https://github.com/FabricMC/fabric>):
+  Block/entity quad emission semantics and atlas sprite UV lookup algorithms in
+  `dev.comfyfluffy.caustica.compat` were adapted with reference to Fabric's
+  rendering API specifications.
+- **NightConfig** (`LGPL-3.0`, <https://github.com/TheElectronWill/night-config>):
+  Used for TOML configuration parsing (`config/caustica.toml`) and provided at
+  runtime by NeoForge.

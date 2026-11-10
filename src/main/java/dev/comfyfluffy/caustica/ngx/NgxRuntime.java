@@ -11,6 +11,7 @@ import net.neoforged.fml.ModList;
 import net.neoforged.fml.loading.FMLPaths;
 
 import org.lwjgl.system.MemoryStack;
+import org.lwjgl.vulkan.VK;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VkInstance;
 
@@ -21,12 +22,15 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Stream;
 
 /**
@@ -133,13 +137,14 @@ public final class NgxRuntime {
 
         VkInstance instance = device.vkDevice().getPhysicalDevice().getInstance();
         try (Arena arena = Arena.ofConfined()) {
+            long gipa = VK.getFunctionProvider().getFunctionAddress("vkGetInstanceProcAddr");
             long gdpa;
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 gdpa = VK10.vkGetInstanceProcAddr(instance, stack.ASCII("vkGetDeviceProcAddr"));
             }
             int rc = lib.init(0L, wideString(arena, dataPath.toString()),
                     instance.address(), device.vkDevice().getPhysicalDevice().address(), device.vkDevice().address(),
-                    0L, gdpa, wideString(arena, nativesDir == null ? "" : nativesDir.toString()));
+                    gipa, gdpa, wideString(arena, nativesDir == null ? "" : nativesDir.toString()));
             if (ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_init failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
@@ -183,7 +188,15 @@ public final class NgxRuntime {
             }
             byte[] bytes = in.readAllBytes();
             if (!sameBytes(dst, bytes)) {
-                Files.write(dst, bytes);
+                try {
+                    Files.write(dst, bytes);
+                } catch (AccessDeniedException e) {
+                    if (Files.isRegularFile(dst)) {
+                        CausticaMod.LOGGER.warn("NGX native {} is locked by another process; keeping existing file", dst);
+                        return true;
+                    }
+                    throw e;
+                }
             }
             return true;
         }
@@ -193,7 +206,21 @@ public final class NgxRuntime {
         for (String name : PLATFORM_NATIVES.exactFeatureNames()) {
             extractBundledNative(name, dir.resolve(name));
         }
-        for (String name : bundledFeatureLibraryNames()) {
+        List<String> bundledVersioned = bundledFeatureLibraryNames();
+        if (!PLATFORM_NATIVES.featureNamePrefixes().isEmpty() && !bundledVersioned.isEmpty()) {
+            Set<String> keep = new HashSet<>(bundledVersioned);
+            keep.addAll(PLATFORM_NATIVES.exactFeatureNames());
+            keep.add(PLATFORM_NATIVES.shimName());
+            try (Stream<Path> existing = Files.list(dir)) {
+                for (Path file : existing.toList()) {
+                    String fileName = file.getFileName().toString();
+                    if (PLATFORM_NATIVES.isFeatureLibrary(fileName) && !keep.contains(fileName)) {
+                        Files.deleteIfExists(file);
+                    }
+                }
+            }
+        }
+        for (String name : bundledVersioned) {
             extractBundledNative(name, dir.resolve(name));
         }
     }
@@ -261,7 +288,7 @@ public final class NgxRuntime {
 
     private static MemorySegment wideString(Arena arena, String s) {
         byte[] data = s.getBytes(WCHAR_CHARSET);
-        MemorySegment seg = arena.allocate((long) data.length + WCHAR_SIZE);
+        MemorySegment seg = arena.allocate((long) data.length + WCHAR_SIZE, WCHAR_SIZE);
         MemorySegment.copy(data, 0, seg, ValueLayout.JAVA_BYTE, 0, data.length);
         for (int i = 0; i < WCHAR_SIZE; i++) {
             seg.set(ValueLayout.JAVA_BYTE, data.length + i, (byte) 0);

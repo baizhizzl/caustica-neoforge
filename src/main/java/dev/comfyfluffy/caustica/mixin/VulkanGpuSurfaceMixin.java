@@ -235,21 +235,19 @@ public abstract class VulkanGpuSurfaceMixin {
 	private int caustica$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
 			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
 		try (MemoryStack stack = MemoryStack.stackPush()) {
-			if (CausticaConfig.Rt.ENABLED.value()) {
-				VkSurfaceCapabilitiesKHR caps = VkSurfaceCapabilitiesKHR.calloc(stack);
-				int result = KHRSurface.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device.getPhysicalDevice(),
-						pCreateInfo.surface(), caps);
-				if (result != VK10.VK_SUCCESS) {
-					return result;
-				}
-				caustica$fgSurfaceMinimumImages = caps.minImageCount();
-				RtDlssFg.INSTANCE.setSurfaceFrameLimits(caps.minImageCount(), caps.maxImageCount());
-				if (RtDlssFg.enabled()) {
-					// All generated images are acquired before MC submits or presents the real image.
-					// Reserve the surface minimum as well, or a high MFG count can wait on its own batch.
-					pCreateInfo.minImageCount(DlssSettings.requiredSwapchainImages(pCreateInfo.minImageCount(),
-							caps.minImageCount(), caps.maxImageCount(), RtDlssFg.INSTANCE.plannedMultiFrameCount()));
-				}
+			VkSurfaceCapabilitiesKHR caps = VkSurfaceCapabilitiesKHR.calloc(stack);
+			int result = KHRSurface.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device.getPhysicalDevice(),
+					pCreateInfo.surface(), caps);
+			if (result != VK10.VK_SUCCESS) {
+				return result;
+			}
+			caustica$fgSurfaceMinimumImages = caps.minImageCount();
+			RtDlssFg.INSTANCE.setSurfaceFrameLimits(caps.minImageCount(), caps.maxImageCount());
+			if (RtDlssFg.enabled()) {
+				// All generated images are acquired before MC submits or presents the real image.
+				// Reserve the surface minimum as well, or a high MFG count can wait on its own batch.
+				pCreateInfo.minImageCount(DlssSettings.requiredSwapchainImages(pCreateInfo.minImageCount(),
+						caps.minImageCount(), caps.maxImageCount(), RtDlssFg.INSTANCE.plannedMultiFrameCount()));
 			}
 			if (RtDeviceBringup.reflexEnabled()) {
 				VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
@@ -270,9 +268,7 @@ public abstract class VulkanGpuSurfaceMixin {
 	@Inject(method = "configure", at = @At("TAIL"))
 	private void caustica$applySwapchainExtensionState(GpuSurface.Configuration config, CallbackInfo ci) {
 		caustica$applyHdrMetadataIfNeeded();
-		if (CausticaConfig.Rt.ENABLED.value()) {
-			RtDlssFg.INSTANCE.setSwapchainFrameLimit(this.swapchainImages.size(), caustica$fgSurfaceMinimumImages);
-		}
+		RtDlssFg.INSTANCE.setSwapchainFrameLimit(this.swapchainImages.size(), caustica$fgSurfaceMinimumImages);
 		if (RtDeviceBringup.reflexEnabled()) {
 			RtReflex.INSTANCE.applySleepMode(this.device.vkDevice(), this.swapchain);
 		}
@@ -391,11 +387,10 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	/**
-	 * DLSS Frame Generation (slice 2): after Minecraft blits the real frame into its acquired swapchain image
-	 * (but before {@code present()} shows it), present the generated frame(s) into additional swapchain images
-	 * via {@link RtFramePresenter}, so the display order is generated-then-real. Runs only on the normal
-	 * present path — the HDR/PQ present hooks cancel {@code blitFromTexture} at HEAD, so this TAIL is
-	 * skipped there (HDR+FG deferred). Iteration 1 duplicates the final frame (no DLSSG eval yet).
+	 * DLSS Frame Generation on the native SDR present path: after Minecraft blits the real frame into its
+	 * acquired swapchain image (but before {@code present()} shows it), prepare the generated frame(s) into
+	 * additional swapchain images via {@link RtFramePresenter} so the display order is generated-then-real.
+	 * HDR frames cancel {@code blitFromTexture} at HEAD and invoke {@link #caustica$presentGeneratedFramesHdr}.
 	 */
 	@Inject(method = "blitFromTexture", at = @At("TAIL"))
 	private void caustica$presentGeneratedFrames(CommandEncoderBackend commandEncoder, GpuTextureView textureView, CallbackInfo ci) {

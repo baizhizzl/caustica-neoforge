@@ -31,7 +31,7 @@ neoForge {
 	runs {
 		client {
 			client()
-			// java.lang.foreign restricted methods (FFM bindings to amd_fidelityfx_vk.dll)
+			// java.lang.foreign restricted methods (FFM bindings to ngxshim)
 			jvmArgument "--enable-native-access=ALL-UNNAMED"
 
 			// NVIDIA NGX (DLSS) allocates ~1MB on the stack during init, which overflows Java's default 1MB thread stack.
@@ -61,12 +61,10 @@ dependencies {
 	testImplementation "org.junit.jupiter:junit-jupiter"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 
-	// Layered TOML config (config/caustica.toml) — NightConfig, the same library NeoForge's
-	// ModConfigSpec is built on. jarJar bundles them into the mod jar's META-INF/jarjar.
+	// Layered TOML config (config/caustica.toml) — NightConfig is provided by NeoForge's bootstrap
+	// runtime; keep compile/test classpath coordinates aligned without duplicating it in META-INF/jarjar.
 	implementation "com.electronwill.night-config:core:3.8.3"
 	implementation "com.electronwill.night-config:toml:3.8.3"
-	jarJar "com.electronwill.night-config:core:3.8.3"
-	jarJar "com.electronwill.night-config:toml:3.8.3"
 }
 
 processResources {
@@ -93,9 +91,11 @@ def resolveVulkanTool = { String name ->
 	def exe = org.gradle.internal.os.OperatingSystem.current().windows ? ".exe" : ""
 	def sdk = System.getenv("VULKAN_SDK")
 	if (sdk) {
-		def fromSdk = file("${sdk}/Bin/${name}${exe}")
-		if (fromSdk.exists()) {
-			return fromSdk.absolutePath
+		for (def binDir : ["Bin", "bin"]) {
+			def fromSdk = file("${sdk}/${binDir}/${name}${exe}")
+			if (fromSdk.exists()) {
+				return fromSdk.absolutePath
+			}
 		}
 	}
 	return "${name}${exe}" // fall back to PATH; exec fails with a clear message if absent

@@ -25,7 +25,7 @@ import dev.comfyfluffy.caustica.rt.entity.RtEntities;
  *   <li>Re-rasterize this frame's glowing entities (their CPU-side capture positions, already kept around
  *   by {@link RtEntities} for BLAS refit) with a trivial unlit pipeline into a full-res RGBA8 mask
  *   (rgb = the entity's vanilla outline colour, a = coverage) — a mod-owned storage image. The camera
- *   transform mirrors the one {@code world.rgen} used this frame, so the silhouette lands pixel-exact on
+ *   transform mirrors the one primary raygen used this frame, so the silhouette lands pixel-exact on
  *   the ray-traced entity.</li>
  *   <li>Sobel-edge that mask and blend the ~2px boundary onto the composite target via fixed-function
  *   alpha blending.</li>
@@ -134,6 +134,7 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
         }
         if (maskImage == null || maskImage.width != width || maskImage.height != height) {
             if (maskImage != null) {
+                ctx.waitIdle();
                 maskImage.destroy();
             }
             maskImage = ctx.createStorageImage(width, height, MASK_FORMAT,
@@ -147,31 +148,37 @@ final class RtGlowOutlineFeature implements RtOverlayFeature {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "glow entity mask")) {
                 RtWorldOverlay.beginColorRendering(cmd, stack, maskImage.view, width, height, true);
-                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, maskPipeline.handle);
-                VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
-                VK10.vkCmdBindIndexBuffer(cmd, ibo.handle, 0, VK10.VK_INDEX_TYPE_UINT32);
-                ByteBuffer push = stack.malloc(MASK_PUSH_BYTES);
-                viewProj.get(0, push);
-                for (int i = 0; i < drawCount; i++) {
-                    push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
-                    push.putFloat(80, colorRgba[i * 4]).putFloat(84, colorRgba[i * 4 + 1])
-                            .putFloat(88, colorRgba[i * 4 + 2]).putFloat(92, colorRgba[i * 4 + 3]);
-                    VK10.vkCmdPushConstants(cmd, maskPipeline.layout,
-                            VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
-                    VK10.vkCmdDrawIndexed(cmd, indexCount[i], 1, firstIndex[i], 0, 0);
+                try {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, maskPipeline.handle);
+                    VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
+                    VK10.vkCmdBindIndexBuffer(cmd, ibo.handle, 0, VK10.VK_INDEX_TYPE_UINT32);
+                    ByteBuffer push = stack.malloc(MASK_PUSH_BYTES);
+                    viewProj.get(0, push);
+                    for (int i = 0; i < drawCount; i++) {
+                        push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
+                        push.putFloat(80, colorRgba[i * 4]).putFloat(84, colorRgba[i * 4 + 1])
+                                .putFloat(88, colorRgba[i * 4 + 2]).putFloat(92, colorRgba[i * 4 + 3]);
+                        VK10.vkCmdPushConstants(cmd, maskPipeline.layout,
+                                VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
+                        VK10.vkCmdDrawIndexed(cmd, indexCount[i], 1, firstIndex[i], 0, 0);
+                    }
+                } finally {
+                    RtWorldOverlay.endRendering(cmd);
                 }
-                RtWorldOverlay.endRendering(cmd);
             }
 
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // mask attachment writes visible to the composite's reads
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "glow entity composite")) {
                 RtWorldOverlay.beginColorRendering(cmd, stack, targetView, width, height, false);
-                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.handle);
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.layout, 0,
-                        stack.longs(compositeSet.set), null);
-                VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
-                RtWorldOverlay.endRendering(cmd);
+                try {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.handle);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.layout, 0,
+                            stack.longs(compositeSet.set), null);
+                    VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                } finally {
+                    RtWorldOverlay.endRendering(cmd);
+                }
             }
         }
     }

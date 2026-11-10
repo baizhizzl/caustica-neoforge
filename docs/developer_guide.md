@@ -53,25 +53,15 @@ cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Rele
 cmake --build build/cmake/ngx_shim/release
 ```
 
-On NixOS, enter the development shell from `flake.nix` instead of setting up
-the toolchain by hand:
-
-```bash
-nix develop
-cmake -S native/ngx_shim -B build/cmake/ngx_shim/release -DCMAKE_BUILD_TYPE=Release
-cmake --build build/cmake/ngx_shim/release
-```
-
 ## Native Bundling
 
-Gradle bundles NGX natives for the current host platform by default:
+Local Gradle builds package the checked-in NGX natives under `src/main/resources/caustica/natives/` by default:
 
 ```bash
 ./gradlew build
 ```
 
-Release builds that already have both platform shims available can request a
-cross-platform native bundle:
+When `DLSS_SDK` is set and the corresponding CMake shim artifact has been built under `build/native/ngx_shim/<config>`, pass `-PngxPlatforms` (`windows-x64`, `linux-x64`, or `all`) to replace the checked-in binaries for the selected platform(s):
 
 ```bash
 ./gradlew build -PngxPlatforms=windows-x64,linux-x64

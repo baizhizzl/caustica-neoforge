@@ -1,12 +1,14 @@
 package dev.comfyfluffy.caustica.rt.terrain;
 
 import dev.comfyfluffy.caustica.rt.RtFrameStats;
+import it.unimi.dsi.fastutil.longs.Long2ObjectFunction;
 import it.unimi.dsi.fastutil.longs.Long2ObjectLinkedOpenHashMap;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.block.BlockAndTintGetter;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.world.level.CardinalLighting;
+import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.ColorResolver;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -18,6 +20,10 @@ import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.levelgen.DebugLevelSource;
 import net.minecraft.world.level.lighting.LevelLightEngine;
 import net.minecraft.world.level.material.FluidState;
+import net.neoforged.neoforge.common.world.AuxiliaryLightManager;
+import net.neoforged.neoforge.model.data.ModelData;
+
+import java.lang.ref.WeakReference;
 
 /**
  * Persistent, render-thread-only cache of per-section palette snapshots for RT tessellation, replacing
@@ -43,19 +49,29 @@ final class RtSectionSnapshots {
     /** Cache/region marker for a section with no copyable states (all air, unloaded, or out of range). */
     private static final Object AIR = new Object();
 
-    private final Long2ObjectLinkedOpenHashMap<Object> cache = new Long2ObjectLinkedOpenHashMap<>();
+    private record CachedSection(WeakReference<LevelChunk> chunkRef, Object states) {
+    }
+
+    private final Long2ObjectLinkedOpenHashMap<CachedSection> cache = new Long2ObjectLinkedOpenHashMap<>();
 
     /** Snapshot the 3×3×3 neighbourhood of a section, reusing cached palette copies (render thread). */
     Region createRegion(ClientLevel level, int scx, int scy, int scz) {
         Object[] sections = new Object[27];
+        AuxiliaryLightManager[] auxLightManagers = new AuxiliaryLightManager[9];
         for (int z = -1; z <= 1; z++) {
-            for (int y = -1; y <= 1; y++) {
-                for (int x = -1; x <= 1; x++) {
-                    sections[(x + 1) + (y + 1) * 3 + (z + 1) * 9] = section(level, scx + x, scy + y, scz + z);
+            int cz = scz + z;
+            for (int x = -1; x <= 1; x++) {
+                int cx = scx + x;
+                LevelChunk chunk = level.getChunk(cx, cz);
+                auxLightManagers[(z + 1) * 3 + (x + 1)] = chunk.getAuxLightManager(new ChunkPos(cx, cz));
+                for (int y = -1; y <= 1; y++) {
+                    sections[(x + 1) + (y + 1) * 3 + (z + 1) * 9] = section(chunk, cx, scy + y, cz);
                 }
             }
         }
-        return new Region(level, scx - 1, scy - 1, scz - 1, sections);
+        Long2ObjectFunction<ModelData> modelDataSnapshot = level.getModelDataManager()
+                .snapshotSectionRegion(scx - 1, scy - 1, scz - 1, scx + 1, scy + 1, scz + 1);
+        return new Region(level, scx - 1, scy - 1, scz - 1, sections, modelDataSnapshot, auxLightManagers);
     }
 
     /** Drop a stale entry (edited section, or its column unloaded / left the window). Render thread. */
@@ -67,36 +83,34 @@ final class RtSectionSnapshots {
         cache.clear();
     }
 
-    private Object section(ClientLevel level, int scx, int scy, int scz) {
+    private Object section(LevelChunk chunk, int scx, int scy, int scz) {
         long key = RtTerrain.sectionKey(scx, scy, scz);
-        Object cached = cache.getAndMoveToLast(key);
-        if (cached != null) {
-            return cached;
+        if (chunk instanceof EmptyLevelChunk) {
+            cache.remove(key);
+            return AIR;
         }
-        Object copy = copySection(level, scx, scy, scz);
-        cache.putAndMoveToLast(key, copy);
+        LevelChunkSection[] chunkSections = chunk.getSections();
+        int index = chunk.getSectionIndexFromSectionY(scy);
+        if (index < 0 || index >= chunkSections.length) {
+            return AIR;
+        }
+        CachedSection cached = cache.getAndMoveToLast(key);
+        if (cached != null && cached.chunkRef.get() == chunk) {
+            return cached.states;
+        }
+        LevelChunkSection section = chunkSections[index];
+        Object copy;
+        if (section.hasOnlyAir()) {
+            copy = AIR;
+        } else {
+            RtFrameStats.FRAME.count("sectionCopies", 1);
+            copy = section.getStates().copy();
+        }
+        cache.putAndMoveToLast(key, new CachedSection(new WeakReference<>(chunk), copy));
         if (cache.size() > MAX_ENTRIES) {
             cache.removeFirst();
         }
         return copy;
-    }
-
-    private static Object copySection(ClientLevel level, int scx, int scy, int scz) {
-        LevelChunk chunk = level.getChunk(scx, scz);
-        if (chunk instanceof EmptyLevelChunk) {
-            return AIR;
-        }
-        LevelChunkSection[] sections = chunk.getSections();
-        int index = chunk.getSectionIndexFromSectionY(scy);
-        if (index < 0 || index >= sections.length) {
-            return AIR;
-        }
-        LevelChunkSection section = sections[index];
-        if (section.hasOnlyAir()) {
-            return AIR;
-        }
-        RtFrameStats.FRAME.count("sectionCopies", 1);
-        return section.getStates().copy();
     }
 
     /**
@@ -111,16 +125,21 @@ final class RtSectionSnapshots {
         private final int minSectionY;
         private final int minSectionZ;
         private final Object[] sections; // PalettedContainer<BlockState> or AIR, x-then-y-then-z minor
+        private final Long2ObjectFunction<ModelData> modelDataSnapshot;
+        private final AuxiliaryLightManager[] auxLightManagers;
         private final CardinalLighting cardinalLighting;
         private final LevelLightEngine lightEngine;
         private final boolean debug;
 
-        Region(ClientLevel level, int minSectionX, int minSectionY, int minSectionZ, Object[] sections) {
+        Region(ClientLevel level, int minSectionX, int minSectionY, int minSectionZ, Object[] sections,
+               Long2ObjectFunction<ModelData> modelDataSnapshot, AuxiliaryLightManager[] auxLightManagers) {
             this.level = level;
             this.minSectionX = minSectionX;
             this.minSectionY = minSectionY;
             this.minSectionZ = minSectionZ;
             this.sections = sections;
+            this.modelDataSnapshot = modelDataSnapshot;
+            this.auxLightManagers = auxLightManagers;
             this.cardinalLighting = level.cardinalLighting();
             this.lightEngine = level.getLightEngine();
             this.debug = level.isDebug();
@@ -185,6 +204,21 @@ final class RtSectionSnapshots {
         @Override
         public int getHeight() {
             return level.getHeight();
+        }
+
+        @Override
+        public ModelData getModelData(BlockPos pos) {
+            return modelDataSnapshot.get(pos.asLong());
+        }
+
+        @Override
+        public AuxiliaryLightManager getAuxLightManager(ChunkPos pos) {
+            int dx = pos.x() - minSectionX;
+            int dz = pos.z() - minSectionZ;
+            if ((dx | dz) < 0 || dx >= 3 || dz >= 3) {
+                return null;
+            }
+            return auxLightManagers[dz * 3 + dx];
         }
     }
 }

@@ -51,6 +51,9 @@ import net.minecraft.world.item.ItemDisplayContext;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import net.minecraft.util.RandomSource;
+import net.neoforged.neoforge.client.extensions.common.IClientBlockExtensions;
+import net.neoforged.neoforge.client.model.quad.BakedColors;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 import org.joml.Matrix4f;
 import org.joml.Matrix4fc;
 import org.joml.Quaternionf;
@@ -93,6 +96,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private BlockAndTintGetter emittedBlockView;
     private BlockState emittedBlockState;
     private BlockPos emittedBlockPos;
+    private int[] emittedBlockTintLayers;
+    private final IntArrayList emittedBlockDynamicTints = new IntArrayList(4);
+    private boolean emittedBlockDynamicTintsLoaded;
     private float emittedBlockOffsetX, emittedBlockOffsetY, emittedBlockOffsetZ;
     private final RandomSource emittedBlockRandom = RandomSource.create();
     // Set by order(int) for the very next submitModel call (banner/shield pattern-layer stacking), then
@@ -319,11 +325,14 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // instead of the opaque DEFAULT variant. No BlockState reaches submitItem, so the layer is the
         // authoritative semantic available here; glass-model roughness/IOR are profile-independent.
         boolean transmissive = q.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
-        capture.currentAlphaBucket = alphaBucket(q.materialInfo().layer(), false);
+        boolean stochasticAlpha = !transmissive && isTranslucent(q.materialInfo().itemRenderType());
+        capture.currentAlphaBucket = alphaBucket(q.materialInfo().layer(), stochasticAlpha);
         setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
-                transmissive, false);
+                transmissive, stochasticAlpha);
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
-        capture.addBakedQuad(pose, q, tintColor(q.materialInfo().tintIndex(), tintLayers));
+        int color = ARGB.multiply(averageBakedColor(q), tintColor(q.materialInfo().tintIndex(), tintLayers));
+        float emission = q.materialInfo().lightEmission() / 15f;
+        capture.addBakedQuad(pose, q, color, emission);
     }
 
     /** Resolve block-atlas geometry through the same immutable material snapshot as terrain. */
@@ -346,7 +355,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     }
 
     /** Whether a render type is alpha-blended (translucent) — its pipeline's color target has a blend
-     *  function. Cutout/solid have none. Drives stochastic entity transparency in world.rahit. */
+     *  function. Cutout/solid have none. Drives stochastic entity transparency in any_hit.rahit. */
     private static ColorTargetState firstColorTarget(RenderPipeline pipeline) {
         var targets = pipeline.getColorTargetStates();
         return targets.isEmpty() ? null : targets.getFirst();
@@ -437,35 +446,67 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         return tintLayers[tintIndex] | 0xFF000000; // force opaque; capture uses only the rgb
     }
 
+    private static int averageBakedColor(BakedQuad quad) {
+        BakedColors bakedColors = quad.bakedColors();
+        if (bakedColors == BakedColors.DEFAULT) {
+            return -1;
+        }
+        int sr = 0, sg = 0, sb = 0;
+        for (int i = 0; i < 4; i++) {
+            int c = bakedColors.color(i);
+            sr += (c >> 16) & 0xFF;
+            sg += (c >> 8) & 0xFF;
+            sb += c & 0xFF;
+        }
+        return 0xFF000000 | (((sr + 2) >> 2) << 16) | (((sg + 2) >> 2) << 8) | ((sb + 2) >> 2);
+    }
+
     /** Re-mesh a contained block-model display through the vanilla model parts so model wrappers remain effective. */
-    public void captureBlockState(BlockState blockState, Matrix4fc transform, PoseStack poseStack) {
+    public boolean captureBlockState(BlockState blockState, Matrix4fc transform, int[] tintLayers,
+                                     PoseStack poseStack, int outlineColor) {
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
         if (capture == null || blockState.isAir()) {
-            return;
+            return false;
         }
         BlockStateModel model = Minecraft.getInstance().getModelManager().getBlockStateModelSet().get(blockState);
         if (model == null) {
+            return false;
+        }
+        int idxBefore = capture.idx.size();
+        poseStack.pushPose();
+        if (transform != null) {
+            poseStack.mulPose(transform);
+        }
+        try {
+            // Display models are isolated from the world and do not apply random block offsets.
+            emitBlockModel(poseStack.last().pose(), model, BlockAndTintGetter.EMPTY, BlockPos.ZERO,
+                    blockState, tintLayers, 42L, false);
+        } finally {
+            poseStack.popPose();
+        }
+        return capture.idx.size() > idxBefore;
+    }
+
+    /** Emit pre-resolved {@link BlockStateModelPart}s (such as fake-air item frame models) into the entity capture. */
+    public void captureBlockModelParts(List<BlockStateModelPart> parts, Matrix4fc transform, int[] tintLayers,
+                                       PoseStack poseStack, int outlineColor) {
+        if (capture == null || parts == null || parts.isEmpty()) {
             return;
+        }
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
         }
         poseStack.pushPose();
         if (transform != null) {
             poseStack.mulPose(transform);
         }
         try {
-            // Display models are isolated from the world and do not apply random block offsets, matching
-            // Fabric's BlockStateModelWrapper path.
-            emitBlockModel(poseStack.last().pose(), model, BlockAndTintGetter.EMPTY, BlockPos.ZERO,
-                    blockState, 42L, false);
+            submitMultiLayerBlockModel(poseStack, parts, false, tintLayers, 0, 0, outlineColor);
         } finally {
             poseStack.popPose();
         }
-    }
-
-    /** {@link #captureBlockState(BlockState, Matrix4fc, PoseStack)} carrying the entity's glow outline colour. */
-    public void captureBlockState(BlockState blockState, Matrix4fc transform, PoseStack poseStack, int outlineColor) {
-        if (outlineColor != 0) {
-            this.outlineColor = outlineColor;
-        }
-        captureBlockState(blockState, transform, poseStack);
     }
 
     @Override
@@ -677,8 +718,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
     }
 
-    // Falling blocks and moving piston blocks render here. Emit through FRAPI so connected textures,
-    // emissive overlays, and custom model geometry survive outside the ordinary chunk renderer.
+    // Falling blocks and moving piston blocks render here. Emit through the world BlockStateModel so
+    // connected textures, emissive overlays, and custom model geometry survive outside the chunk renderer.
     @Override
     public void submitMovingBlock(PoseStack poseStack, MovingBlockRenderState state, int outlineColor) {
         if (capture == null) {
@@ -695,34 +736,40 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         }
         // No local catch: failures propagate through the entity-capture handler like other entities.
         emitBlockModel(poseStack.last().pose(), model, state, state.blockPos, bs,
-                bs.getSeed(state.randomSeedPos), true);
+                null, bs.getSeed(state.randomSeedPos), true);
     }
 
     /** Synchronously emit one block model into the active entity capture through the vanilla model parts. */
     private void emitBlockModel(Matrix4f pose, BlockStateModel model, BlockAndTintGetter view, BlockPos pos,
-                                BlockState state, long seed, boolean applyBlockOffset) {
+                                BlockState state, int[] tintLayers, long seed, boolean applyBlockOffset) {
         Vec3 offset = applyBlockOffset ? state.getOffset(pos) : Vec3.ZERO;
         emittedBlockPose = pose;
         emittedBlockView = view;
         emittedBlockState = state;
         emittedBlockPos = pos;
+        emittedBlockTintLayers = tintLayers != null && tintLayers.length > 0 ? tintLayers : null;
+        emittedBlockDynamicTintsLoaded = false;
+        emittedBlockDynamicTints.clear();
         emittedBlockOffsetX = (float) offset.x;
         emittedBlockOffsetY = (float) offset.y;
         emittedBlockOffsetZ = (float) offset.z;
+        boolean cutoutLeaves = Minecraft.getInstance().options.cutoutLeaves().get();
         int idxStart = capture.idx.size();
         long started = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
             capture.clearUvRemap();
             emittedBlockRandom.setSeed(seed);
-            // Extended collectParts(level, pos, ...) so NeoForge model mods (NeoContinuity CTM) can emit
-            // their UV-remapped quads for dynamic blocks too; vanilla models fall back to the deprecated
-            // vanilla collectParts internally (see VanillaModelQuads).
-            modelQuads.emit(model, view, pos, state, emittedBlockRandom, NEVER_CULL, blockQuadSink);
+            // Extended collectParts(level, pos, ...) so position-dependent NeoForge models emit their
+            // UV-remapped quads for dynamic blocks too.
+            modelQuads.emit(model, view, pos, state, emittedBlockRandom, cutoutLeaves, NEVER_CULL, blockQuadSink);
         } finally {
             emittedBlockPose = null;
             emittedBlockView = null;
             emittedBlockState = null;
             emittedBlockPos = null;
+            emittedBlockTintLayers = null;
+            emittedBlockDynamicTintsLoaded = false;
+            emittedBlockDynamicTints.clear();
             RtFrameStats.FRAME.endStage("entity.capture.submit.bakedQuads", started);
             countBakedOutput(idxStart);
         }
@@ -741,7 +788,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     }
 
     private void addEmittedBlockQuad(BakedQuad quad, ChunkSectionLayer layer) {
-        addBakedModelQuad(emittedBlockPose, quad, layer, null, emittedBlockView, emittedBlockPos,
+        addBakedModelQuad(emittedBlockPose, quad, layer, emittedBlockTintLayers, emittedBlockView, emittedBlockPos,
                 emittedBlockState, emittedBlockOffsetX, emittedBlockOffsetY, emittedBlockOffsetZ);
     }
 
@@ -750,6 +797,25 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     @Override
     public void submitBlockModel(PoseStack poseStack, RenderType renderType, List<BlockStateModelPart> parts,
                                  int[] tintLayers, int lightCoords, int overlayCoords, int outlineColor) {
+        if (capture == null) {
+            return;
+        }
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
+        Matrix4f pose = poseStack.last().pose();
+        for (BlockStateModelPart part : parts) {
+            addQuads(pose, part.getQuads(null), tintLayers);
+            for (Direction d : DIRECTIONS) {
+                addQuads(pose, part.getQuads(d), tintLayers);
+            }
+        }
+    }
+
+    @Override
+    public void submitMultiLayerBlockModel(PoseStack poseStack, List<BlockStateModelPart> parts,
+                                           boolean hasTranslucency, int[] tintLayers,
+                                           int lightCoords, int overlayCoords, int outlineColor) {
         if (capture == null) {
             return;
         }
@@ -780,24 +846,21 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     }
 
     /** Capture one baked quad (block model / item) with its effective chunk layer, state-dependent
-     *  profile, overrides, and emission variant. Vanilla quads carry no authored per-vertex colour, so
-     *  the per-prim tint is the resolved tint layer (white when untinted). */
+     *  profile, overrides, baked colors, and emission variant. */
     private void addBakedModelQuad(Matrix4f pose, BakedQuad quad, ChunkSectionLayer layer, int[] tintLayers,
                                    BlockAndTintGetter view, BlockPos pos, BlockState state,
                                    float offsetX, float offsetY, float offsetZ) {
-        // Sprite resolution, aligned with Fabric upstream's spriteFinder.find(quad) on this path: the
-        // declared materialInfo().sprite() is the fast path, but connected-texture mods (Continuity /
-        // NeoContinuity) emit UV-remapped quads whose declared sprite is the base tile while the vertex
-        // UVs point into the connected variant's atlas region. When the UV centroid falls outside the
-        // declared sprite's rectangle, reverse-lookup the block atlas to recover the variant sprite
-        // (see AtlasSpriteFinder); the declared sprite is kept when the lookup finds nothing.
+        // Sprite resolution: materialInfo().sprite() is the fast path, while connected-texture models emit
+        // UV-remapped quads whose declared sprite is the base tile and whose vertex UVs point into the
+        // connected variant's atlas region. When the UV centroid falls outside the declared sprite's
+        // rectangle, reverse-lookup the block atlas to recover the variant sprite.
         TextureAtlasSprite sprite = resolveBlockAtlasSprite(quad);
         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(
                 sprite != null ? sprite.atlasLocation() : TextureAtlas.LOCATION_BLOCKS);
         // Chunk-layer translucency denotes a block-derived dielectric; a blended item render type denotes
         // ordinary stochastic alpha when the quad did not come from such a layer.
         boolean transmissive = layer == ChunkSectionLayer.TRANSLUCENT;
-        boolean stochasticAlpha = false; // item-mesh path removed with FRAPI; vanilla quads carry no item render type
+        boolean stochasticAlpha = !transmissive && isTranslucent(quad.materialInfo().itemRenderType());
         capture.currentAlphaBucket = alphaBucket(layer, stochasticAlpha);
         if (state != null) {
             setBlockSpriteMaterial(sprite, state, transmissive, stochasticAlpha);
@@ -816,16 +879,30 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             meshU[i] = Float.intBitsToFloat((int) (uv >>> 32));
             meshV[i] = Float.intBitsToFloat((int) uv);
         }
-        int tint = tintColor(quad.materialInfo().tintIndex(), tintLayers);
-        if (quad.materialInfo().tintIndex() >= 0 && tintLayers == null && state != null && view != null && pos != null) {
+        int tintIndex = quad.materialInfo().tintIndex();
+        int tint = tintColor(tintIndex, tintLayers);
+        if (tintIndex >= 0 && tintLayers == null && state != null && view != null && pos != null) {
             BlockTintSource source = Minecraft.getInstance().getBlockColors()
-                    .getTintSource(state, quad.materialInfo().tintIndex());
+                    .getTintSource(state, tintIndex);
             if (source != null) {
                 tint = source.colorInWorld(state, view, pos) | 0xFF000000;
+            } else {
+                if (!emittedBlockDynamicTintsLoaded) {
+                    emittedBlockDynamicTints.clear();
+                    IClientBlockExtensions.of(state).collectDynamicTintValues(
+                            state, view, pos, emittedBlockDynamicTints);
+                    emittedBlockDynamicTintsLoaded = true;
+                }
+                if (tintIndex < emittedBlockDynamicTints.size()) {
+                    tint = emittedBlockDynamicTints.getInt(tintIndex) | 0xFF000000;
+                }
             }
         }
-        int color = ARGB.multiply(-1, tint); // vanilla quads carry no authored per-vertex colour → white
-        float emission = state != null ? state.getLightEmission() / 15f : 0f;
+        int color = ARGB.multiply(averageBakedColor(quad), tint);
+        int stateEmission = state != null
+                ? (view != null && pos != null ? state.getLightEmission(view, pos) : state.getLightEmission())
+                : 0;
+        float emission = Math.max(stateEmission, quad.materialInfo().lightEmission()) / 15f;
         capture.addDirectQuad(meshX, meshY, meshZ, meshU, meshV, 0f, 0f, 0f, color, emission);
     }
 

@@ -24,7 +24,7 @@ import java.lang.foreign.ValueLayout;
 public final class RtDlssRr {
     public static final RtDlssRr INSTANCE = new RtDlssRr();
     public static boolean enabled() {
-        return CausticaConfig.Rt.DlssRr.ENABLED.value();
+        return CausticaConfig.Rt.DlssRr.ENABLED.value() && !INSTANCE.failed;
     }
 
     // DLSS feature flags. IsHDR (bit 0): color is scene-linear ACEScg HDR (rgba16f) — RR requires it ("HDR Color
@@ -71,6 +71,15 @@ public final class RtDlssRr {
     public void requestHistoryReset() {
         resetHistory = true;
         lastFrameNanos = 0;
+    }
+
+    /** Re-arm DLSS-RR after an explicit recovery action or when re-enabled in video settings. */
+    public void resetFailureLatch() {
+        if (failed) {
+            failed = false;
+            loggedAvailable = false;
+            requestHistoryReset();
+        }
     }
 
     public boolean isReady() {
@@ -132,11 +141,9 @@ public final class RtDlssRr {
     }
 
     /**
-     * Asks NGX what render resolution the current quality mode expects for the given display size.
-     * Returns {@code null} only when RR is off (or already disabled from an earlier failure elsewhere)
-     * — in that state there is no feature to query and the caller should trace at full resolution.
-     * Once RR is active, a failed query (stale shim, old driver, bad NGX result) throws instead of
-     * silently falling back, so a broken render/display sync is never masked.
+     * Queries NGX for the render resolution expected by the active DLSS-RR quality mode at the given
+     * display size. Returns {@code null} when RR is disabled, unavailable, or fails to query so the caller
+     * falls back cleanly to 1:1 native-resolution path tracing instead of aborting RT rendering.
      */
     public int[] queryOptimalRenderSize(int displayWidth, int displayHeight) {
         if (!enabled() || failed) {
@@ -145,25 +152,31 @@ public final class RtDlssRr {
         if (!(((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device)) {
             return null;
         }
-        ensureInitialized(device);
-        if (!lib.hasQueryOptimalDlssd()) {
-            throw new IllegalStateException("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim)");
-        }
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment outWidth = arena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outHeight = arena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outSharpness = arena.allocate(ValueLayout.JAVA_FLOAT);
-            int rc = lib.queryOptimalDlssd(displayWidth, displayHeight, quality(), outWidth, outHeight, outSharpness);
-            if (NgxRuntime.ngxFailed(rc)) {
-                throw new IllegalStateException("ngxshim_query_optimal_dlssd failed: 0x" + Integer.toHexString(rc));
+        try {
+            ensureInitialized(device);
+            if (!lib.hasQueryOptimalDlssd()) {
+                throw new IllegalStateException("ngxshim is missing ngxshim_query_optimal_dlssd (stale native shim)");
             }
-            int renderWidth = outWidth.get(ValueLayout.JAVA_INT, 0);
-            int renderHeight = outHeight.get(ValueLayout.JAVA_INT, 0);
-            if (renderWidth <= 0 || renderHeight <= 0) {
-                throw new IllegalStateException(
-                        "ngxshim_query_optimal_dlssd returned invalid render size " + renderWidth + "x" + renderHeight);
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment outWidth = arena.allocate(ValueLayout.JAVA_INT);
+                MemorySegment outHeight = arena.allocate(ValueLayout.JAVA_INT);
+                MemorySegment outSharpness = arena.allocate(ValueLayout.JAVA_FLOAT);
+                int rc = lib.queryOptimalDlssd(displayWidth, displayHeight, quality(), outWidth, outHeight, outSharpness);
+                if (NgxRuntime.ngxFailed(rc)) {
+                    throw new IllegalStateException("ngxshim_query_optimal_dlssd failed: 0x" + Integer.toHexString(rc));
+                }
+                int renderWidth = outWidth.get(ValueLayout.JAVA_INT, 0);
+                int renderHeight = outHeight.get(ValueLayout.JAVA_INT, 0);
+                if (renderWidth <= 0 || renderHeight <= 0) {
+                    throw new IllegalStateException(
+                            "ngxshim_query_optimal_dlssd returned invalid render size " + renderWidth + "x" + renderHeight);
+                }
+                return new int[] { renderWidth, renderHeight };
             }
-            return new int[] { renderWidth, renderHeight };
+        } catch (Throwable t) {
+            failed = true;
+            CausticaMod.LOGGER.warn("DLSS-RR optimal render size query failed; falling back to native RT resolution", t);
+            return null;
         }
     }
 

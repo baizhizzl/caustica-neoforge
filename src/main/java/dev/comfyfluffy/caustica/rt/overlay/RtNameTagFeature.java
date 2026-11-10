@@ -62,18 +62,18 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private static final int TEXT_COLOR = -2130706433; // 0x80FFFFFF
     private static final int BACKGROUND_COLOR = 0x40000000; // ~25% opaque black; vanilla's default opacity
 
-    // Generous cap on distinct font-atlas pages seen in one session (default ASCII + unicode fallback +
-    // headroom) — see SampledImageSetPool's doc for why each page needs its own descriptor set rather than
-    // one shared set rewritten per page.
-    private static final int MAX_ATLAS_PAGES = 16;
+    // Initial descriptor-pool capacity for distinct font-atlas pages (ASCII + CJK/Unicode pages + custom
+    // pack fonts). If exceeded or invalidated by closed atlas views, prepare() idles and grows the pool
+    // before command recording begins.
+    private static final int INITIAL_ATLAS_PAGES = 128;
 
     private RtContext ctx;
     private RtOverlayPipelines.Pipeline pipeline;
     private RtOverlayPipelines.SampledImageSetPool imageSetPool;
     private long sampler;
+    private int allocatedSets;
 
-    // One descriptor set per distinct font-atlas page, allocated once and reused across frames (a page's
-    // GpuTextureView is stable for the session — see SampledImageSetPool).
+    // One descriptor set per distinct live font-atlas page, allocated once and reused across frames.
     private final Map<GpuTextureView, Long> pageSets = new IdentityHashMap<>();
     private final Map<GpuTextureView, PageBuilder> pages = new IdentityHashMap<>();
     private final GlyphCapture glyphCapture = new GlyphCapture();
@@ -82,7 +82,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
     private float camOffX, camOffY, camOffZ;
     private final List<DrawPage> drawPages = new ArrayList<>();
 
-    private record DrawPage(GpuTextureView view, RtBuffer vbo, int vertexCount) {
+    private record DrawPage(long set, RtBuffer vbo, int vertexCount) {
     }
 
     /** One font-atlas page's accumulated glyph quads this frame: x,y,z,u,v per vertex + a packed colour. */
@@ -122,12 +122,42 @@ final class RtNameTagFeature implements RtOverlayFeature {
             return false; // every tag shaped to zero glyphs (blank name — shouldn't normally happen)
         }
 
+        pageSets.keySet().removeIf(GpuTextureView::isClosed);
+        int neededNew = 0;
+        for (Map.Entry<GpuTextureView, PageBuilder> e : pages.entrySet()) {
+            GpuTextureView view = e.getKey();
+            if (e.getValue().vertexCount() == 0 || view == null || view.isClosed() || vkImageView(view) == 0L) {
+                continue;
+            }
+            if (!pageSets.containsKey(view)) {
+                neededNew++;
+            }
+        }
+        if (allocatedSets + neededNew > imageSetPool.capacity()) {
+            ctx.waitIdle();
+            int newCapacity = Math.max(imageSetPool.capacity() * 2, pages.size() * 2);
+            imageSetPool.resetPool(ctx, newCapacity, "name tag");
+            pageSets.clear();
+            allocatedSets = 0;
+        }
+
         drawPages.clear();
         for (Map.Entry<GpuTextureView, PageBuilder> e : pages.entrySet()) {
+            GpuTextureView view = e.getKey();
             PageBuilder b = e.getValue();
             int vertexCount = b.vertexCount();
-            if (vertexCount == 0) {
+            if (vertexCount == 0 || view == null || view.isClosed()) {
                 continue;
+            }
+            long viewHandle = vkImageView(view);
+            if (viewHandle == 0L) {
+                continue;
+            }
+            Long set = pageSets.get(view);
+            if (set == null) {
+                set = imageSetPool.allocateAndBind(ctx, viewHandle, sampler);
+                pageSets.put(view, set);
+                allocatedSets++;
             }
             RtBuffer vbo = pool.acquireVertex(ctx, (long) vertexCount * VERTEX_STRIDE, "name tag vbo");
             ByteBuffer buf = MemoryUtil.memByteBuffer(vbo.mapped, vertexCount * VERTEX_STRIDE).order(ByteOrder.LITTLE_ENDIAN);
@@ -139,7 +169,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
                 buf.putInt(ARGB.toABGR(b.colors.getInt(v))); // R8G8B8A8_UNORM memory order = ABGR-packed int
             }
             vbo.flush(0L, (long) vertexCount * VERTEX_STRIDE);
-            drawPages.add(new DrawPage(e.getKey(), vbo, vertexCount));
+            drawPages.add(new DrawPage(set, vbo, vertexCount));
         }
         if (drawPages.isEmpty()) {
             return false;
@@ -157,7 +187,8 @@ final class RtNameTagFeature implements RtOverlayFeature {
         if (pipeline != null) {
             return;
         }
-        imageSetPool = RtOverlayPipelines.sampledImageSetPool(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, MAX_ATLAS_PAGES, "name tag");
+        imageSetPool = RtOverlayPipelines.sampledImageSetPool(ctx, VK10.VK_SHADER_STAGE_FRAGMENT_BIT, INITIAL_ATLAS_PAGES, "name tag");
+        allocatedSets = 0;
         sampler = RtOverlayPipelines.createNearestClampSampler(ctx, "name tag font atlas");
         pipeline = new RtOverlayPipelines.Spec("name_tag/vertex.vert.spv", "name_tag/fragment.frag.spv")
                 .vertex(RtOverlayPipelines.VertexFormat.POSITION_TEX_COLOR)
@@ -173,21 +204,32 @@ final class RtNameTagFeature implements RtOverlayFeature {
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "name tags")) {
             RtWorldOverlay.beginColorRendering(cmd, stack, targetView, width, height, false);
-            VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-            ByteBuffer push = stack.malloc(PUSH_BYTES);
-            viewProj.get(0, push);
-            push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
-            VK10.vkCmdPushConstants(cmd, pipeline.layout, VK10.VK_SHADER_STAGE_VERTEX_BIT, 0, push);
-            for (DrawPage page : drawPages) {
-                long set = pageSets.computeIfAbsent(page.view,
-                        v -> imageSetPool.allocateAndBind(ctx, vkImageView(v), sampler));
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                        stack.longs(set), null);
-                VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(page.vbo.handle), stack.longs(0L));
-                VK10.vkCmdDraw(cmd, page.vertexCount, 1, 0, 0);
+            try {
+                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+                ByteBuffer push = stack.malloc(PUSH_BYTES);
+                viewProj.get(0, push);
+                push.putFloat(64, camOffX).putFloat(68, camOffY).putFloat(72, camOffZ);
+                VK10.vkCmdPushConstants(cmd, pipeline.layout, VK10.VK_SHADER_STAGE_VERTEX_BIT, 0, push);
+                for (DrawPage page : drawPages) {
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
+                            stack.longs(page.set), null);
+                    VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(page.vbo.handle), stack.longs(0L));
+                    VK10.vkCmdDraw(cmd, page.vertexCount, 1, 0, 0);
+                }
+            } finally {
+                RtWorldOverlay.endRendering(cmd);
             }
-            RtWorldOverlay.endRendering(cmd);
         }
+    }
+
+    @Override
+    public void onResourceReload() {
+        if (ctx != null && imageSetPool != null) {
+            ctx.waitIdle();
+            imageSetPool.resetPool(ctx, imageSetPool.capacity(), "name tag");
+        }
+        pageSets.clear();
+        allocatedSets = 0;
     }
 
     @Override
@@ -204,6 +246,7 @@ final class RtNameTagFeature implements RtOverlayFeature {
             imageSetPool = null;
         }
         pageSets.clear();
+        allocatedSets = 0;
         if (sampler != 0L) {
             VK10.vkDestroySampler(ctx.vk(), sampler, null);
             sampler = 0L;

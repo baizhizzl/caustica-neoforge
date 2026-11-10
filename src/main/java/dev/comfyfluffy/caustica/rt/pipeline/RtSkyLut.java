@@ -226,6 +226,11 @@ public final class RtSkyLut {
         return skyView.view;
     }
 
+    /** Force the static transmittance and multiple-scattering LUTs to bake again on the next recorded frame. */
+    public void invalidateStaticLuts() {
+        staticLutsBaked = false;
+    }
+
     /**
      * Record this frame's sky LUT work: the two static LUTs on the first frame, then the sky-view LUT.
      * Must be recorded before the trace, with a barrier after (the caller's) — the miss and raygen stages

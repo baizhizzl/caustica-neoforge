@@ -7,6 +7,7 @@ import dev.comfyfluffy.caustica.CausticaConfig.FloatSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.IntSetting;
 import dev.comfyfluffy.caustica.CausticaConfig.StringSetting;
 import dev.comfyfluffy.caustica.ngx.DlssSettings;
+import dev.comfyfluffy.caustica.rt.RtFramePresenter;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssRr;
 import java.util.ArrayList;
@@ -171,6 +172,9 @@ public final class RtVideoOptions {
             setting.value(),
             enabled -> {
                 setting.set(enabled);
+                if (enabled) {
+                    RtDlssRr.INSTANCE.resetFailureLatch();
+                }
                 RtDlssRr.INSTANCE.requestHistoryReset();
                 RtDlssFg.INSTANCE.requestHistoryReset();
             });
@@ -186,6 +190,7 @@ public final class RtVideoOptions {
             setting.value(),
             preset -> {
                 setting.set(preset);
+                RtDlssRr.INSTANCE.requestHistoryReset();
                 RtDlssFg.INSTANCE.requestHistoryReset();
             });
     }
@@ -203,6 +208,10 @@ public final class RtVideoOptions {
             setting.value(),
             enabled -> {
                 setting.set(enabled);
+                if (enabled) {
+                    RtDlssFg.INSTANCE.resetFailureLatch();
+                    RtFramePresenter.INSTANCE.resetFailureLatch();
+                }
                 applyFrameGenerationChange();
             });
     }

@@ -344,7 +344,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     // orientation instead of toggling parity per crossing, so one malformed face cannot desync the path.
     bool entering = dot(WorldRayDirection(), n) < 0.0;
 
-    // Lever B: per-triangle corner UVs in primitive order. uvs[3*pid + k] is a contiguous,
+    // Per-triangle corner UVs in primitive order. uvs[3*pid + k] is a contiguous,
     // directly-addressed load (no index buffer, no scattered vertex-UV gather), so it issues as soon as
     // pid is known and its latency overlaps the prim fetch instead of serialising behind an index load.
     // The index buffer remains BLAS-only; shading reads the expanded UV buffer directly.

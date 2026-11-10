@@ -59,7 +59,7 @@ if ($TargetPid -ne 0) {
 } else {
 	$candidates = @(
 		$processes | Where-Object {
-			$_.Command -match 'net\.fabricmc\.devlaunchinjector\.Main|net\.minecraft\.client\.main\.Main|Minecraft' -and
+			$_.Command -match 'cpw\.mods\.bootstraplauncher\.BootstrapLauncher|net\.minecraft\.client\.main\.Main|Minecraft' -and
 			$_.Command -notmatch 'Gradle|GradleDaemon|GradleWrapperMain|jdk\.jcmd|JCmd|JMC'
 		}
 	)

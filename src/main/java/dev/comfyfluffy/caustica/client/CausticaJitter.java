@@ -21,9 +21,13 @@ public final class CausticaJitter {
 	/** Advance one frame. Call once per frame before the level projection is built. */
 	public void prepare(int renderWidth, int renderHeight, int displayWidth) {
 		int phaseCount = jitterPhaseCount(renderWidth, displayWidth);
-		int index = (this.frameIndex++ % phaseCount) + 1; // Halton(0) is degenerate
+		int index = Integer.remainderUnsigned(this.frameIndex++, phaseCount) + 1; // Halton(0) is degenerate
 		this.pixelsX = halton(index, 2) - 0.5f;
 		this.pixelsY = halton(index, 3) - 0.5f;
+	}
+
+	void setFrameIndexForTest(int frameIndex) {
+		this.frameIndex = frameIndex;
 	}
 
 	/** Jitter offset in render-pixel space, applied to the primary ray and reported to RR evaluate. */

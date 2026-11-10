@@ -203,14 +203,19 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     .descriptorSetLayout(compositeSet.layout)
                     .build(ctx, "block outline composite");
         }
-        if (msaaImage == null || msaaImage.width != width || msaaImage.height != height) {
+        boolean resizeMsaa = msaaImage == null || msaaImage.width != width || msaaImage.height != height;
+        boolean resizeMask = resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height;
+        if ((resizeMsaa && msaaImage != null) || (resizeMask && resolvedMask != null)) {
+            ctx.waitIdle();
+        }
+        if (resizeMsaa) {
             if (msaaImage != null) {
                 msaaImage.destroy();
             }
             msaaImage = ctx.createTransientMsaaColorImage(width, height, RtWorldOverlay.TARGET_FORMAT,
                     RtDeviceBringup.overlayMsaaSamples(), "block outline msaa " + width + "x" + height);
         }
-        if (resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height) {
+        if (resizeMask) {
             if (resolvedMask != null) {
                 resolvedMask.destroy();
             }
@@ -225,35 +230,41 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline mask")) {
                 RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
-                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
-                        stack.longs(boundSet), null);
-                VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
-                float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
-                float lineWidth = RtDeviceBringup.wideLinesEnabled()
-                        ? Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()) : 1.0f;
-                VK10.vkCmdSetLineWidth(cmd, lineWidth);
-                ByteBuffer push = stack.malloc(PUSH_BYTES);
-                viewProj.get(0, push);
-                RtEntities entities = RtEntities.INSTANCE;
-                push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
-                        .putFloat(72, entities.glowCamOffsetZ());
-                push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
-                VK10.vkCmdPushConstants(cmd, pipeline.layout,
-                        VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
-                VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
-                RtWorldOverlay.endRendering(cmd);
+                try {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,
+                            stack.longs(boundSet), null);
+                    VK10.vkCmdBindVertexBuffers(cmd, 0, stack.longs(vbo.handle), stack.longs(0L));
+                    float desiredWidthPx = LINE_WIDTH_PX_AT_REFERENCE * (height / REFERENCE_HEIGHT);
+                    float lineWidth = RtDeviceBringup.wideLinesEnabled()
+                            ? Math.min(desiredWidthPx, RtDeviceBringup.maxLineWidth()) : 1.0f;
+                    VK10.vkCmdSetLineWidth(cmd, lineWidth);
+                    ByteBuffer push = stack.malloc(PUSH_BYTES);
+                    viewProj.get(0, push);
+                    RtEntities entities = RtEntities.INSTANCE;
+                    push.putFloat(64, entities.glowCamOffsetX()).putFloat(68, entities.glowCamOffsetY())
+                            .putFloat(72, entities.glowCamOffsetZ());
+                    push.putFloat(80, 0f).putFloat(84, 0f).putFloat(88, 0f).putFloat(92, OUTLINE_ALPHA);
+                    VK10.vkCmdPushConstants(cmd, pipeline.layout,
+                            VK10.VK_SHADER_STAGE_VERTEX_BIT | VK10.VK_SHADER_STAGE_FRAGMENT_BIT, 0, push);
+                    VK10.vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+                } finally {
+                    RtWorldOverlay.endRendering(cmd);
+                }
             }
 
             VulkanCommandEncoder.memoryBarrier(cmd, stack); // resolved mask writes visible to the composite's reads
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline composite")) {
                 RtWorldOverlay.beginColorRendering(cmd, stack, targetView, width, height, false);
-                VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.handle);
-                VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.layout, 0,
-                        stack.longs(compositeSet.set), null);
-                VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
-                RtWorldOverlay.endRendering(cmd);
+                try {
+                    VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.handle);
+                    VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, compositePipeline.layout, 0,
+                            stack.longs(compositeSet.set), null);
+                    VK10.vkCmdDraw(cmd, 3, 1, 0, 0);
+                } finally {
+                    RtWorldOverlay.endRendering(cmd);
+                }
             }
         }
     }

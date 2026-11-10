@@ -62,7 +62,7 @@ import java.util.Queue;
  * re-posed and captured ({@link RtEntityCollector} + {@link RtEntityCapture}) into a mesh in terrain's
  * vertex layout, uploaded, and given a per-entity BLAS built inline in the composite's frame command
  * buffer. One TLAS instance per entity places entity-local geometry at {@code anchor - rebase} and carries
- * the {@link #ENTITY_BIT} custom-index flag so {@code world.rchit} takes the
+ * the {@link #ENTITY_BIT} custom-index flag so hit shaders take the
  * entity path. A per-frame entity geometry table ({@code {primAddr, idxAddr, uvAddr, disp, triBase[]}})
  * gives the hit shader each entity's per-triangle data, motion-vector displacement, and the base needed
  * to map each BLAS geometry's local primitive index into the packed index/primitive arrays.
@@ -84,7 +84,7 @@ public final class RtEntities {
     public static final int ENTITY_BIT = 0x800000;
     /** Custom-index flag (bit 22) marking a particle billboard instance (shares the entity geom table). */
     public static final int PARTICLE_BIT = 0x400000;
-    // TLAS visibility-mask bits, ANDed against the per-ray cull mask in world.rgen. Bit 0 = secondary rays
+    // TLAS visibility-mask bits, ANDed against the per-ray cull mask in raygen shaders. Bit 0 = secondary rays
     // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY).
     private static final int MASK_SECONDARY = 0x01;
     private static final int MASK_PRIMARY = 0x02;
@@ -617,7 +617,15 @@ public final class RtEntities {
      */
     public FrameEntities beginFrame(RtContext ctx, List<RtAccel.Instance> base, int rbx, int rby, int rbz,
                                     double camX, double camY, double camZ, Matrix4f projection, Matrix4f viewRotation) {
+        setCamera(camX, camY, camZ, projection, viewRotation);
+        glowCamOffsetX = (float) (camX - rbx);
+        glowCamOffsetY = (float) (camY - rby);
+        glowCamOffsetZ = (float) (camZ - rbz);
+        glowBatches.clear();
+        nameTagBatches.clear();
         if (!enabled()) {
+            evictStaleAccels(ctx);
+            evictStaleBes(ctx);
             return new FrameEntities(base, List.of(), List.of(), 0L, null);
         }
         Minecraft mc = Minecraft.getInstance();
@@ -626,7 +634,6 @@ public final class RtEntities {
             return new FrameEntities(base, List.of(), List.of(), 0L, null);
         }
         float partial = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
-        setCamera(camX, camY, camZ, projection, viewRotation);
 
         FrameBuild build = new FrameBuild(base, ctx.gpuExecutor());
         try {
@@ -1990,9 +1997,46 @@ public final class RtEntities {
         tableCapacity = requiredCapacity;
     }
 
-    /** Drop CPU templates that retain resource-pack-owned model trees. */
-    public void onResourceReload() {
+    /** Retire all cached world-bound entity and block-entity GPU geometry on world/dimension switches or reloads. */
+    public void clearWorldCaches() {
+        RtContext ctx = RtContext.currentOrNull();
+        for (EntityAccel ea : entityAccels.values()) {
+            for (EntitySlot slot : ea.ring) {
+                if (slot != null) {
+                    if (ctx != null) {
+                        retireEntitySlot(ctx, slot);
+                    } else {
+                        destroyEntitySlot(slot);
+                    }
+                }
+            }
+            clearRefGeometry(ea);
+        }
+        entityAccels.clear();
+        for (BeEntry e : beCache.values()) {
+            if (ctx != null) {
+                retireBe(ctx, e);
+            } else {
+                RtAccel.destroyEntityAccel(e.accel, e.backing);
+                e.geometry.destroy();
+            }
+        }
+        beCache.clear();
+        prevVerts.clear();
+        curVerts.clear();
+        particlePrev.clear();
+        particleCur.clear();
+        particleDisp.clear();
+        glowBatches.clear();
+        nameTagBatches.clear();
+        beCandidates.clear();
+        beSelected.clear();
         collector.clearCaches();
+    }
+
+    /** Drop CPU templates and cached entity/block-entity meshes that retain resource-pack-owned model data. */
+    public void onResourceReload() {
+        clearWorldCaches();
     }
 
     /** Free the geometry-table ring and entity resources (teardown; caller has idled the device). */

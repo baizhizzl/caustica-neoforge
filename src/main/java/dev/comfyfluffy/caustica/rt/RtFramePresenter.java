@@ -81,13 +81,20 @@ public final class RtFramePresenter {
                 && RtDlssFg.INSTANCE.effectiveMultiFrameCount() > 0 && Minecraft.getInstance().level != null;
     }
 
+    /** Re-arm extra-frame presentation after an explicit recovery action. */
+    public void resetFailureLatch() {
+        failed = false;
+    }
+
     /**
      * Acquire {@code generatedCount} extra swapchain images and record a Y-flipped blit of {@code srcImage}
      * (the final rendered frame, GENERAL layout) into each, using Minecraft's command encoder {@code enc} so
      * the work rides MC's next {@code submit()}. The presents happen later in {@link #flushPendingPresents}.
      * Blits DLSSG's real interpolated output per generated frame, or a duplicate of the real frame when RT
-     * simply isn't producing frames this tick (routine). A genuine DLSSG failure latches FG off for the
-     * session — see {@link RtComposite#fgInterpolate}.
+     * isn't producing frames this tick or when the swapchain and source extents transiently differ mid-resize.
+     * Each swapchain image is acquired before recording interpolation so that if DLSSG fails mid-batch, the
+     * acquired image is still blitted from {@code srcImage} and presented cleanly without leaking swapchain
+     * ownership or acquire semaphores.
      *
      * @param hdrBackbuffer whether {@code backbufferView}/{@code srcImage} is the PQ HDR backbuffer
      *     ({@link RtComposite#hdrBackbufferView()}, already UI-composited) rather than the SDR main target —
@@ -101,22 +108,15 @@ public final class RtFramePresenter {
             return;
         }
         try {
-            ensureCapacity(device, swapchainImages.size() + 1, generatedCount);
+            // Keep enough binary acquire semaphores across multi-frame-in-flight batches (up to 4x-6x MFG)
+            // so the ring cursor cannot wrap onto a semaphore still pending on the graphics queue.
+            int minSemaphores = Math.max(swapchainImages.size() + 1, generatedCount * 4 + 2);
+            ensureCapacity(device, minSemaphores, generatedCount);
+            boolean extentsMatch = swapW > 0 && swapH > 0 && swapW == srcW && swapH == srcH;
+            if (!extentsMatch) {
+                RtDlssFg.INSTANCE.requestHistoryReset();
+            }
             for (int i = 0; i < generatedCount; i++) {
-                // null = no captured RT frame this tick (menu/loading/transition — routine, not a bug): fall
-                // back to duplicating the real frame for just this one frame. A genuine FG failure instead
-                // throws, caught below, which disables FG for the session.
-                RtImage interp = RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage,
-                        swapW, swapH, i + 1, generatedCount, hdrBackbuffer);
-                if (interp != null) {
-                    interpOkInWindow++;
-                } else {
-                    interpFallbackInWindow++;
-                }
-                long blitSrc = interp != null ? interp.image : srcImage;
-                int copyW = Math.min(swapW, interp != null ? interp.width : srcW);
-                int copyH = Math.min(swapH, interp != null ? interp.height : srcH);
-
                 long acquireSem = acquireSemaphores[acquireCursor];
                 acquireCursor = (acquireCursor + 1) % acquireSemaphores.length;
 
@@ -129,6 +129,28 @@ public final class RtFramePresenter {
                     }
                     imageIndex = pIndex.get(0);
                 }
+
+                RtImage interp = null;
+                boolean abortRemaining = false;
+                if (extentsMatch && !failed) {
+                    try {
+                        interp = RtComposite.INSTANCE.fgInterpolate(enc, backbufferView, srcImage,
+                                swapW, swapH, i + 1, generatedCount, hdrBackbuffer);
+                    } catch (Throwable t) {
+                        failed = true;
+                        abortRemaining = true;
+                        CausticaMod.LOGGER.error("DLSS-FG present-record failed; frame generation disabled", t);
+                    }
+                }
+                if (interp != null) {
+                    interpOkInWindow++;
+                } else {
+                    interpFallbackInWindow++;
+                }
+                long blitSrc = interp != null ? interp.image : srcImage;
+                int copyW = Math.min(swapW, interp != null ? interp.width : srcW);
+                int copyH = Math.min(swapH, interp != null ? interp.height : srcH);
+
                 long dstImage = swapchainImages.getLong(imageIndex);
                 long presentSem = presentSemaphores[imageIndex];
                 recordBlit(enc, blitSrc, dstImage, copyW, copyH, acquireSem, presentSem);
@@ -136,10 +158,12 @@ public final class RtFramePresenter {
                 pendingImageIndex[pendingCount] = imageIndex;
                 pendingPresentSem[pendingCount] = presentSem;
                 pendingCount++;
+                if (abortRemaining) {
+                    break;
+                }
             }
         } catch (Throwable t) {
             failed = true;
-            pendingCount = 0;
             CausticaMod.LOGGER.error("DLSS-FG present-record failed; frame generation disabled", t);
         }
     }
@@ -147,11 +171,12 @@ public final class RtFramePresenter {
     /**
      * Present the frames acquired in {@link #prepareExtraFrames} (call at {@code present()} HEAD, after MC's
      * {@code submit()} has flushed — so the present semaphores are signaled — and before MC presents the real
-     * frame, giving generated-then-real order).
+     * frame, giving generated-then-real order). Any already-acquired images in {@code pendingCount} must still
+     * be presented even if {@code failed} latched mid-batch.
      */
     public void flushPendingPresents(long swapchain, VkQueue presentQueue) {
         int presentedThisFrame = 0;
-        if (!failed && pendingCount != 0) {
+        if (pendingCount != 0) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
                 for (int i = 0; i < pendingCount; i++) {
                     VkPresentInfoKHR present = VkPresentInfoKHR.calloc(stack).sType$Default();
@@ -175,10 +200,9 @@ public final class RtFramePresenter {
     }
 
     /**
-     * Debug diagnostic (2026-07-01): tracks real vs generated {@code vkQueuePresentKHR} calls per second,
-     * separate from MC's own fps counter — that counter only reflects simulated/rendered frames
-     * (blitFromTexture calls), so it would NOT show an increase from FG's extra presents even if the display
-     * is genuinely receiving more frames. Logged only when {@code caustica.rt.fg} is enabled.
+     * Tracks real vs generated {@code vkQueuePresentKHR} calls per second, separate from MC's own fps
+     * counter — that counter only reflects simulated/rendered frames (blitFromTexture calls), so it does
+     * not reflect extra presents from frame generation. Logged only when {@code caustica.rt.fg} is enabled.
      */
     private void logPresentRate(int generatedThisFrame) {
         realFramesInWindow++;
@@ -264,6 +288,9 @@ public final class RtFramePresenter {
         }
         if (acquireSemaphores.length >= semaphoreCount) {
             return;
+        }
+        if (acquireSemaphores.length > 0) {
+            VK10.vkDeviceWaitIdle(device.vkDevice());
         }
         destroy(device);
         acquireSemaphores = new long[semaphoreCount];
