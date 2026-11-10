@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     dlssSdk = {
-      url = "github:NVIDIA/DLSS/v310.7.0";
+      url = "github:NVIDIA/DLSS/374959484e79a640feaba44c93ac8cfb0a03f5b5";
       flake = false;
     };
   };
