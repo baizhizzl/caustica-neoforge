@@ -215,47 +215,52 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int primStart = capture.prim.size();
         RtCuboidEmitter.ModelTemplate directTemplate = cuboidEmitter.prepare(model);
         long directCubeCounts = 0L;
-        long drawStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
         try {
-            if (directTemplate != null) {
-                directCubeCounts = cuboidEmitter.emit(directTemplate, poseStack, capture, color);
-            } else {
-                model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
-            }
-        } finally {
-            RtFrameStats.FRAME.endStage(directTemplate != null
-                    ? "entity.capture.submit.modelDraw.direct"
-                    : "entity.capture.submit.modelDraw.fallback", drawStart);
-            RtFrameStats.FRAME.endStage("entity.capture.submit.modelDraw", drawStart);
-        }
-        int addedVertices = (capture.verts.size() - vertStart) / 3;
-        int addedQuads = (capture.idx.size() - idxStart) / 6;
-        if (profileDynamicEntity) {
-            RtFrameStats.FRAME.count("entityModelVertices", addedVertices);
-            RtFrameStats.FRAME.count("entityModelQuads", addedQuads);
-            RtFrameStats.FRAME.count(directTemplate != null ? "entityDirectSubmissions" : "entityDirectFallbacks", 1);
-            if (directTemplate != null) {
-                RtFrameStats.FRAME.count("entityDirectVertices", addedVertices);
-                RtFrameStats.FRAME.count("entityDirectQuads", addedQuads);
-                RtFrameStats.FRAME.count("entitySpecializedCuboids", directCubeCounts >>> 32);
-                RtFrameStats.FRAME.count("entityGenericCuboids", directCubeCounts & 0xffffffffL);
-            }
-        }
-
-        if (CausticaConfig.Rt.Entities.CAPTURE_PARITY.value()) {
-            parityCapture.reset(addedVertices);
-            capture.copySubmissionStateTo(parityCapture);
-            long parityStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
+            long drawStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
             try {
-                model.renderToBuffer(poseStack, parityCapture, lightCoords, overlayCoords, color);
-                capture.assertSubmissionBitwiseIdentical(vertStart, idxStart, uvStart, primStart,
-                        parityCapture, "model " + model.getClass().getName());
-                if (profileDynamicEntity) {
-                    RtFrameStats.FRAME.count("entityParityChecks", 1);
+                if (directTemplate != null) {
+                    directCubeCounts = cuboidEmitter.emit(directTemplate, poseStack, capture, color);
+                } else {
+                    model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
                 }
             } finally {
-                RtFrameStats.FRAME.endStage("entity.capture.submit.parity", parityStart);
+                RtFrameStats.FRAME.endStage(directTemplate != null
+                        ? "entity.capture.submit.modelDraw.direct"
+                        : "entity.capture.submit.modelDraw.fallback", drawStart);
+                RtFrameStats.FRAME.endStage("entity.capture.submit.modelDraw", drawStart);
             }
+            int addedVertices = (capture.verts.size() - vertStart) / 3;
+            int addedQuads = (capture.idx.size() - idxStart) / 6;
+            if (profileDynamicEntity) {
+                RtFrameStats.FRAME.count("entityModelVertices", addedVertices);
+                RtFrameStats.FRAME.count("entityModelQuads", addedQuads);
+                RtFrameStats.FRAME.count(directTemplate != null ? "entityDirectSubmissions" : "entityDirectFallbacks", 1);
+                if (directTemplate != null) {
+                    RtFrameStats.FRAME.count("entityDirectVertices", addedVertices);
+                    RtFrameStats.FRAME.count("entityDirectQuads", addedQuads);
+                    RtFrameStats.FRAME.count("entitySpecializedCuboids", directCubeCounts >>> 32);
+                    RtFrameStats.FRAME.count("entityGenericCuboids", directCubeCounts & 0xffffffffL);
+                }
+            }
+
+            if (CausticaConfig.Rt.Entities.CAPTURE_PARITY.value()) {
+                parityCapture.reset(addedVertices);
+                capture.copySubmissionStateTo(parityCapture);
+                long parityStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
+                try {
+                    model.renderToBuffer(poseStack, parityCapture, lightCoords, overlayCoords, color);
+                    capture.assertSubmissionBitwiseIdentical(vertStart, idxStart, uvStart, primStart,
+                            parityCapture, "model " + model.getClass().getName());
+                    if (profileDynamicEntity) {
+                        RtFrameStats.FRAME.count("entityParityChecks", 1);
+                    }
+                } finally {
+                    RtFrameStats.FRAME.endStage("entity.capture.submit.parity", parityStart);
+                }
+            }
+        } finally {
+            // A sprite remap applies only to this submission; a later model/item path must not inherit it.
+            capture.clearUvRemap();
         }
     }
 
@@ -305,7 +310,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     /** Capture one baked quad, resolving its atlas (block vs item) to a bindless slot stamped per-prim. */
     private void addQuad(Matrix4f pose, BakedQuad q, int[] tintLayers) {
-        TextureAtlasSprite sprite = q.materialInfo().sprite();
+        TextureAtlasSprite sprite = resolveBlockAtlasSprite(q);
         capture.currentTexSlot = sprite != null
                 ? RtEntityTextures.INSTANCE.slotForAtlas(sprite.atlasLocation())
                 : 0;
@@ -453,6 +458,14 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         } finally {
             poseStack.popPose();
         }
+    }
+
+    /** {@link #captureBlockState(BlockState, Matrix4fc, PoseStack)} carrying the entity's glow outline colour. */
+    public void captureBlockState(BlockState blockState, Matrix4fc transform, PoseStack poseStack, int outlineColor) {
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
+        captureBlockState(blockState, transform, poseStack);
     }
 
     @Override
@@ -671,6 +684,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
         Minecraft mc = Minecraft.getInstance();
         BlockState bs = state.blockState;
         BlockStateModel model = mc.getModelManager().getBlockStateModelSet().get(bs);
@@ -737,6 +753,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
         Matrix4f pose = poseStack.last().pose();
         for (BlockStateModelPart part : parts) {
             addQuads(pose, part.getQuads(null), tintLayers);
@@ -754,6 +773,9 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (capture == null) {
             return;
         }
+        if (outlineColor != 0) {
+            this.outlineColor = outlineColor;
+        }
         addQuads(poseStack.last().pose(), quads.all(), tintLayers);
     }
 
@@ -769,27 +791,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         // UVs point into the connected variant's atlas region. When the UV centroid falls outside the
         // declared sprite's rectangle, reverse-lookup the block atlas to recover the variant sprite
         // (see AtlasSpriteFinder); the declared sprite is kept when the lookup finds nothing.
-        TextureAtlasSprite sprite = quad.materialInfo().sprite();
-        if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
-            float cu = 0f, cv = 0f;
-            for (int i = 0; i < 4; i++) {
-                long uv = quad.packedUV(i);
-                cu += Float.intBitsToFloat((int) (uv >>> 32));
-                cv += Float.intBitsToFloat((int) uv);
-            }
-            cu *= 0.25f;
-            cv *= 0.25f;
-            if (cu < sprite.getU0() || cu > sprite.getU1() || cv < sprite.getV0() || cv > sprite.getV1()) {
-                AtlasSpriteFinder finder = AtlasSpriteFinder.of(Minecraft.getInstance()
-                        .getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS));
-                if (finder != null) {
-                    TextureAtlasSprite found = finder.find(cu, cv);
-                    if (found != null) {
-                        sprite = found;
-                    }
-                }
-            }
-        }
+        TextureAtlasSprite sprite = resolveBlockAtlasSprite(quad);
         capture.currentTexSlot = RtEntityTextures.INSTANCE.slotForAtlas(
                 sprite != null ? sprite.atlasLocation() : TextureAtlas.LOCATION_BLOCKS);
         // Chunk-layer translucency denotes a block-derived dielectric; a blended item render type denotes
@@ -825,6 +827,36 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int color = ARGB.multiply(-1, tint); // vanilla quads carry no authored per-vertex colour → white
         float emission = state != null ? state.getLightEmission() / 15f : 0f;
         capture.addDirectQuad(meshX, meshY, meshZ, meshU, meshV, 0f, 0f, 0f, color, emission);
+    }
+
+    /**
+     * The quad's authored sprite, or the connected-texture variant found at its UV centroid when that
+     * centroid lies outside the authored block-atlas sprite's rectangle.
+     */
+    private static TextureAtlasSprite resolveBlockAtlasSprite(BakedQuad quad) {
+        TextureAtlasSprite sprite = quad.materialInfo().sprite();
+        if (sprite == null || !TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
+            return sprite;
+        }
+        float cu = 0f, cv = 0f;
+        for (int i = 0; i < 4; i++) {
+            long uv = quad.packedUV(i);
+            cu += Float.intBitsToFloat((int) (uv >>> 32));
+            cv += Float.intBitsToFloat((int) uv);
+        }
+        cu *= 0.25f;
+        cv *= 0.25f;
+        if (cu < sprite.getU0() || cu > sprite.getU1() || cv < sprite.getV0() || cv > sprite.getV1()) {
+            AtlasSpriteFinder finder = AtlasSpriteFinder.of(Minecraft.getInstance()
+                    .getAtlasManager().getAtlasOrThrow(AtlasIds.BLOCKS));
+            if (finder != null) {
+                TextureAtlasSprite found = finder.find(cu, cv);
+                if (found != null) {
+                    return found;
+                }
+            }
+        }
+        return sprite;
     }
 
     @Override

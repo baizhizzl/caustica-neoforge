@@ -368,6 +368,9 @@ final class RtTerrainOmm {
             return OMM_CLASS_UNSAFE;
         }
         var image = ((SpriteContentsAccessor) contents).caustica$originalImage();
+        if (image == null) {
+            return OMM_CLASS_UNSAFE;
+        }
         int frameRowSize = Math.max(1, image.getWidth() / Math.max(1, width));
         var frames = contents.getUniqueFrames();
         boolean anyPass = false;

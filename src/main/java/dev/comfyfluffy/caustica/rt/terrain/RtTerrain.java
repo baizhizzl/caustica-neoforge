@@ -363,6 +363,22 @@ public final class RtTerrain {
         INSTANCE.fullClearRequested = true;
     }
 
+    /** Cancel in-flight section builds and join active worker tasks before a resource reload replaces textures. */
+    public static void onResourceReloadStart(RtContext ctx) {
+        requestFullClear();
+        if (ctx != null) {
+            INSTANCE.drainForReload(ctx);
+        }
+    }
+
+    private void drainForReload(RtContext ctx) {
+        terrainEpoch++;
+        lightGrid.cancelPending();
+        drainTasksForClear(ctx);
+        cancelAllDirtyGroups();
+        RtTerrainOmm.clearCache();
+    }
+
     private void tick(RtContext ctx) {
 
         Minecraft mc = Minecraft.getInstance();
