@@ -135,29 +135,39 @@ final class RtSectionTable {
         return slot;
     }
 
-    void removePublished(Long2ObjectOpenHashMap<SectionGeom> resident,
-                         LongOpenHashSet published, SectionGeom geom) {
+    /**
+     * Unpublish {@code geom} if it still owns its slot, returning the freed slot index or {@code -1} when
+     * {@code geom} was already superseded or neutralized. Callers may remove {@code geom} from {@code resident}
+     * before queueing it for retirement, so slot ownership is authoritative here rather than {@code resident}.
+     */
+    int removePublished(Long2ObjectOpenHashMap<SectionGeom> resident,
+                        LongOpenHashSet published, SectionGeom geom) {
         SectionGeom current = resident.get(geom.key);
         if (current == geom) {
             resident.remove(geom.key);
         }
-        published.remove(geom.key);
-        if (geom.instanceIndex >= 0) {
-            int removeIndex = geom.instanceIndex;
-            int lastIndex = instanceList.size() - 1;
-            if (removeIndex != lastIndex) {
-                RtAccel.Instance moved = instanceList.get(lastIndex);
-                instanceList.set(removeIndex, moved);
-                slots.get(moved.customIndex()).instanceIndex = removeIndex;
+        if (current == null || current == geom) {
+            published.remove(geom.key);
+        }
+        int freedSlot = -1;
+        if (geom.slot >= 0 && geom.slot < slots.size() && slots.get(geom.slot) == geom) {
+            if (geom.instanceIndex >= 0 && geom.instanceIndex < instanceList.size()) {
+                int removeIndex = geom.instanceIndex;
+                int lastIndex = instanceList.size() - 1;
+                if (removeIndex != lastIndex) {
+                    RtAccel.Instance moved = instanceList.get(lastIndex);
+                    instanceList.set(removeIndex, moved);
+                    slots.get(moved.customIndex()).instanceIndex = removeIndex;
+                }
+                instanceList.remove(lastIndex);
             }
-            instanceList.remove(lastIndex);
-            geom.instanceIndex = -1;
+            freedSlot = geom.slot;
+            slots.set(freedSlot, null);
+            freeSlots.add(freedSlot);
         }
-        if (geom.slot >= 0) {
-            slots.set(geom.slot, null);
-            freeSlots.add(geom.slot);
-            geom.slot = -1;
-        }
+        geom.instanceIndex = -1;
+        geom.slot = -1;
+        return freedSlot;
     }
 
     void write(SectionGeom geom) {

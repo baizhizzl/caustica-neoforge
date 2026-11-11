@@ -1521,12 +1521,10 @@ public final class RtTerrain {
         // between global-only and cell proposals. Track the actual light-record diff instead.
         boolean lightsChanged = false;
         for (SectionGeom g : removed) {
-            SectionGeom current = resident.get(g.key);
-            boolean removesPublishedLights = current == g && hasLights(g.lights);
-            int removedLightSlot = removesPublishedLights ? g.slot : -1;
-            table.removePublished(resident, published, g);
-            lightsChanged |= removesPublishedLights;
-            if (removedLightSlot >= 0) lightSections.remove(removedLightSlot);
+            int removedSlot = table.removePublished(resident, published, g);
+            if (removedSlot >= 0 && lightSections.remove(removedSlot) != null) {
+                lightsChanged = true;
+            }
         }
         retire(ctx, lastGraphicsUse, removed);
 
@@ -1554,6 +1552,8 @@ public final class RtTerrain {
             if (prev != null && prev.slot >= 0) {
                 g.slot = prev.slot;
                 g.instanceIndex = prev.instanceIndex;
+                prev.slot = -1;
+                prev.instanceIndex = -1;
                 table.slots.set(g.slot, g);
                 resident.put(ps.key(), g);
                 table.write(g);
@@ -1567,7 +1567,9 @@ public final class RtTerrain {
                 table.write(g);
                 table.instanceList.add(table.instanceFor(g, baseX, baseY, baseZ));
             }
-            if (sectionLightsChanged || prev == null) updateLightSection(g);
+            if (sectionLightsChanged || prev == null) {
+                lightsChanged |= updateLightSection(g);
+            }
             published.add(ps.key());
         }
         table.flushWrites();
@@ -1635,13 +1637,13 @@ public final class RtTerrain {
         return Arrays.equals(previous, current);
     }
 
-    private void updateLightSection(SectionGeom g) {
+    private boolean updateLightSection(SectionGeom g) {
         if (!hasLights(g.lights)) {
-            lightSections.remove(g.slot);
-            return;
+            return lightSections.remove(g.slot) != null;
         }
         lightSections.put(g.slot, new RtLightHierarchy.SectionInput(g.slot,
                 g.sx >> 4, g.sy >> 4, g.sz >> 4, g.lights));
+        return true;
     }
 
     private void markLightHierarchyDirty() {
