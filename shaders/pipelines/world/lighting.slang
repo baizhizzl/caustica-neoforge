@@ -7,6 +7,7 @@ import world_common;
 import world_core;
 import bindings;
 import math;
+import medium;
 import light_proposals;
 import trace;
 
@@ -231,7 +232,7 @@ public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd,
 
 public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n, float3 v, float3 rd,
                                     float3 diffAlb, float3 F0, float rough, float3 msScale,
-                                    bool twoSided, float sss) {
+                                    bool twoSided, float sss, Medium currentMedium) {
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -256,12 +257,15 @@ public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n,
     // Close-range points (inside the 1 mm tolerance) are unoccluded by construction: walls are kept at
     // least 0.05 m away by the collision volume and the emitter itself is culled by the mask.
     float traceDist = dist - 1.0e-3;
-    float3 vis = float3(1.0, 1.0, 1.0);
+    VisibilityResult vShadow;
+    vShadow.transmittance = float3(1.0, 1.0, 1.0);
+    vShadow.waterHitT = -1.0;
     if (traceDist > RAY_TMIN) {
         // The water caustic is a directional plane-wave Jacobian and is meaningless for a near-field point
         // light; shadow transmittance (including the water any-hit tint) is the physically consistent term.
-        vis = visibilityMasked(origin, dir, traceDist, s.shadowMask).transmittance;
+        vShadow = visibilityMasked(origin, dir, traceDist, s.shadowMask);
     }
+    float3 vis = vShadow.transmittance * waterShadowTransmittance(currentMedium, vShadow.waterHitT, dist);
     return contrib * vis * s.W;
 }
 

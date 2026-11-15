@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import org.joml.Matrix4fc;
 
 /**
  * Pure-CPU photometric classification, ACEScg colour conversion, temporal flame modulation, and
@@ -20,6 +21,8 @@ public final class RtDynamicLightSpecs {
     public static final int SHADOW_GROUP_BITS = 6;
     /** Mask bit of the first hardware dynamic-shadow group; each later group is one bit higher. */
     private static final int SHADOW_GROUP_BIT_BASE = 0x04;
+    /** Outward normal offset (blocks) from an item frame's entity anchor into the room. */
+    public static final double ITEM_FRAME_NORMAL_OFFSET = 0.15;
 
     /** Largest finite value representable by the half-float light lanes downstream. */
     private static final float HALF_FLOAT_MAX = 65504.0f;
@@ -388,6 +391,61 @@ public final class RtDynamicLightSpecs {
         out[0] = forwardX * reach;
         out[1] = forwardY * reach + rise;
         out[2] = forwardZ * reach;
+    }
+
+    /**
+     * Offset from an {@code ItemFrame}'s entity position along its supporting-face outward normal.
+     * Hanging-entity coordinates sit centred on the frame {@code 1/32} block off the wall, floor, or
+     * ceiling, so pushing along the facing vector keeps the spherical sample disc clear of the host
+     * block in every mounting orientation (including ceiling frames facing {@code DOWN}).
+     */
+    public static void itemFrameOffset(int stepX, int stepY, int stepZ, double[] out) {
+        out[0] = stepX * ITEM_FRAME_NORMAL_OFFSET;
+        out[1] = stepY * ITEM_FRAME_NORMAL_OFFSET;
+        out[2] = stepZ * ITEM_FRAME_NORMAL_OFFSET;
+    }
+
+    /**
+     * World-space offset from a {@code Display} entity's origin to a local model point {@code (localX,
+     * localY, localZ)} after applying its affine {@code transformMatrix} (nullable for identity) and
+     * {@code DisplayRenderer} YXZ orientation {@code (-rotYDeg, +rotXDeg, 0)}. Non-finite transforms
+     * fall back to zero offset.
+     */
+    public static void displayOffset(Matrix4fc transformMatrix, float rotYDeg, float rotXDeg,
+                                     float localX, float localY, float localZ, double[] out) {
+        double mx = localX;
+        double my = localY;
+        double mz = localZ;
+        if (transformMatrix != null) {
+            mx = Math.fma(transformMatrix.m00(), localX,
+                    Math.fma(transformMatrix.m10(), localY,
+                            Math.fma(transformMatrix.m20(), localZ, transformMatrix.m30())));
+            my = Math.fma(transformMatrix.m01(), localX,
+                    Math.fma(transformMatrix.m11(), localY,
+                            Math.fma(transformMatrix.m21(), localZ, transformMatrix.m31())));
+            mz = Math.fma(transformMatrix.m02(), localX,
+                    Math.fma(transformMatrix.m12(), localY,
+                            Math.fma(transformMatrix.m22(), localZ, transformMatrix.m32())));
+        }
+        double ry = (-Math.PI / 180.0) * rotYDeg;
+        double rx = (Math.PI / 180.0) * rotXDeg;
+        double cosX = Math.cos(rx);
+        double sinX = Math.sin(rx);
+        double y1 = my * cosX - mz * sinX;
+        double z1 = my * sinX + mz * cosX;
+        double cosY = Math.cos(ry);
+        double sinY = Math.sin(ry);
+        double x2 = mx * cosY + z1 * sinY;
+        double z2 = -mx * sinY + z1 * cosY;
+        if (!Double.isFinite(x2) || !Double.isFinite(y1) || !Double.isFinite(z2)) {
+            out[0] = 0.0;
+            out[1] = 0.0;
+            out[2] = 0.0;
+            return;
+        }
+        out[0] = x2;
+        out[1] = y1;
+        out[2] = z2;
     }
 
     private static float srgbToLinear(float c) {

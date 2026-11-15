@@ -54,8 +54,7 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
         if (marchDist > 0.1 && max(sigmaS.r, max(sigmaS.g, sigmaS.b)) > 1.0e-6
                 && luminance(celestialLight.illuminance) > 1.0e-4) {
             // Importance sample the density along the segment: t(u) = D * (0.4u + 0.6u^2). The PDF in t
-            // is 1 / (dt/du) with dt/du = D * (0.4 + 1.2u), so the Monte Carlo weight is dtDu; the old
-            // code divided by (0.4 + 1.2u)/D, which inverted the weight and biased shafts by ~(dt/du)^2.
+            // is 1 / (dt/du) with dt/du = D * (0.4 + 1.2u), so the unbiased Monte Carlo weight is dtDu.
             float u = rndf(seed);
             float tVol = marchDist * (0.4 * u + 0.6 * u * u);
             float dtDu = marchDist * (0.4 + 1.2 * u);
@@ -84,8 +83,8 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
         float heightFalloff = worldPush.visualParams1.y;
         float seaLevelY = worldPush.visualParams1.z;
         if (marchDist > 0.25 && baseSigma > 1.0e-7 && luminance(celestialLight.illuminance) > 1.0e-3) {
-            // t(u) = D * (0.35u + 0.65u^2), dt/du = D * (0.35 + 1.30u). As in the water branch the
-            // unbiased weight is dtDu, not 1 / ((0.35 + 1.30u) / D).
+            // t(u) = D * (0.35u + 0.65u^2), dt/du = D * (0.35 + 1.30u); the unbiased Monte Carlo weight
+            // for importance sampling this density is dtDu.
             float u = rndf(seed);
             float tVol = marchDist * (0.35 * u + 0.65 * u * u);
             float dtDu = marchDist * (0.35 + 1.30 * u);
@@ -118,8 +117,8 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
         float baseSigma = max(worldPush.visualParams1.x, 0.0) * volStrength;
         float heightFalloff = worldPush.visualParams1.y;
         float seaLevelY = worldPush.visualParams1.z;
-        float waterSigmaLuma = dot(waterScatteringCoeff(worldPush.waterParams.xyz,
-                worldPush.visualParams1.w * volStrength), ACESCG_LUMA);
+        float3 waterSigma = waterScatteringCoeff(worldPush.waterParams.xyz,
+                worldPush.visualParams1.w * volStrength);
         float3 chosenHalo = float3(0.0, 0.0, 0.0);
         float3 chosenSamplePos = ro;
         float3 chosenLightPos = ro;
@@ -155,19 +154,21 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
             // The halo density follows the local sample height exactly like the sun-shaft sampler; there
             // is no artificial floor, so haze-density == 0 (or volumetric-intensity == 0) means no glow.
             float3 trans = float3(1.0, 1.0, 1.0);
-            float localSigma = 0.0;
+            float3 localSigma = float3(0.0, 0.0, 0.0);
             if (currentMedium.water) {
                 trans = exp(-currentMedium.extinction * tSample);
-                localSigma = waterSigmaLuma;
+                localSigma = waterSigma;
             } else {
-                localSigma = airHazeScattering(samplePos.y, baseSigma, heightFalloff, seaLevelY) * 2.0;
-                trans = float3(exp(-airHazeOpticalDepth(ro, rd, tSample, baseSigma,
-                        heightFalloff, seaLevelY)));
+                float airSigma = airHazeScattering(samplePos.y, baseSigma, heightFalloff, seaLevelY) * 2.0;
+                localSigma = float3(airSigma, airSigma, airSigma);
+                float airTrans = exp(-airHazeOpticalDepth(ro, rd, tSample, baseSigma,
+                        heightFalloff, seaLevelY));
+                trans = float3(airTrans, airTrans, airTrans);
             }
             // Mild forward/isotropic phase blend keeps handheld mist soft rather than blinding near the eye.
             float3 toLightDir = normalize(center - samplePos);
             float phase = 0.65 * (1.0 / (4.0 * PI)) + 0.35 * hg(dot(rd, toLightDir), 0.35);
-            float3 contrib = trans * dl.intensityMask.xyz * (localSigma * phase * integral * rangeFade);
+            float3 contrib = trans * localSigma * dl.intensityMask.xyz * (phase * integral * rangeFade);
             float phat = luminance(contrib);
             if (phat <= 0.0) {
                 continue;
@@ -188,10 +189,14 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
             // 1 mm tolerance only; the emitter's own geometry is hardware-culled by chosenMask, so the
             // volume shadow ray still reaches walls behind the light and cannot leak a halo through them.
             float traceDist = dist - 1.0e-3;
-            float3 vis = float3(1.0, 1.0, 1.0);
+            VisibilityResult vShadow;
+            vShadow.transmittance = float3(1.0, 1.0, 1.0);
+            vShadow.waterHitT = -1.0;
             if (dist > 1.0e-4 && traceDist > RAY_TMIN) {
-                vis = visibilityMasked(chosenSamplePos, toL / dist, traceDist, chosenMask).transmittance;
+                vShadow = visibilityMasked(chosenSamplePos, toL / dist, traceDist, chosenMask);
             }
+            float3 vis = vShadow.transmittance * waterShadowTransmittance(
+                    currentMedium, vShadow.waterHitT, dist);
             Lvol += chosenHalo * vis * (haloWSum / chosenPhat);
         }
     }
@@ -278,8 +283,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
         if (payload.hitT < 0.0) {
             // An underwater ray that misses is NOT air and must not reveal sky or air shafts: the water
-            // volume simply has no known exit. Breaking here removes the bright fog wall that used to
-            // appear at underwater chunk boundaries.
+            // volume has no loaded exit surface along this direction, so terminate without sky contribution.
             if (medium.current.water) {
                 break;
             }
@@ -419,7 +423,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                                                  float3(1.0, 1.0, 1.0), true, 0.0, proposalSeed);
                 L += throughput * shadeDynamicReservoir(dr, hitPos, n, v, rd, albedo,
                                                         float3(0.0, 0.0, 0.0), 1.0,
-                                                        float3(1.0, 1.0, 1.0), true, 0.0);
+                                                        float3(1.0, 1.0, 1.0), true, 0.0, medium.current);
             }
 
             if (bounce >= maxBounces) {
@@ -511,7 +515,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             DynamicReservoir dr = risDynamic(hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
                                              activeSss, proposalSeed);
             L += throughput * shadeDynamicReservoir(dr, hitPos, n, v, rd, diffAlb, F0, rough, msScale,
-                                                    false, activeSss);
+                                                    false, activeSss, medium.current);
         }
 
         // Thin-surface SSS transmission from celestial light.

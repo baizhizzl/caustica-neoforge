@@ -1,5 +1,6 @@
 package dev.comfyfluffy.caustica.rt.light;
 
+import com.mojang.math.Transformation;
 import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.DynamicLight;
@@ -15,8 +16,10 @@ import it.unimi.dsi.fastutil.objects.Object2IntOpenHashMap;
 import it.unimi.dsi.fastutil.objects.Object2ObjectOpenHashMap;
 import java.util.ArrayList;
 import java.util.List;
+import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
@@ -45,6 +48,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4fc;
 
 /**
  * Per-frame client collector for dynamic ray-traced spherical area lights: local and remote handheld
@@ -271,6 +275,9 @@ public final class RtDynamicLights {
         scratchCandidates.clear();
         Entity cameraEntity = mc.getCameraEntity();
         int cameraEntityId = cameraEntity != null ? cameraEntity.getId() : Integer.MIN_VALUE;
+        Camera mainCamera = mc.gameRenderer.mainCamera();
+        float camXRot = mainCamera != null ? mainCamera.xRot() : 0.0f;
+        float camYRot = mainCamera != null ? mainCamera.yRot() : 0.0f;
 
         // 1. Local camera owner's handheld and head-worn lights (active in both first-person and third-person).
         if (allowHeld && cameraEntity instanceof LivingEntity localLiving && !localLiving.isSpectator()) {
@@ -280,10 +287,13 @@ public final class RtDynamicLights {
 
         // 2. World entities: remote players/mobs holding lights, dropped items, burning/glowing mobs, projectiles.
         for (Entity entity : level.entitiesForRendering()) {
-            if (entity.isRemoved()) {
+            if (entity.isRemoved() || entity.isSpectator()) {
                 continue;
             }
             int entityId = entity.getId();
+            // Invisible entities are omitted from the TLAS, so keep their shadow ownership unassigned
+            // instead of spending scarce hardware shadow-group bits on non-existent geometry.
+            int shadowOwnerId = entity.isInvisible() ? RtDynamicLightSpecs.NO_ENTITY : entityId;
             boolean isLocalCamera = entityId == cameraEntityId;
             double posX = entity.getX(partial);
             double posY = entity.getY(partial);
@@ -311,7 +321,7 @@ public final class RtDynamicLights {
                     long key = packKey(entityId, SLOT_ENTITY_CORE);
                     smoothAnchor(key, posX, posY + 0.28, posZ, alpha, frameSerial);
                     addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                            itemProfile, key, entityId, animSeconds, baselineCdM2, userIntensity,
+                            itemProfile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
                             allowFlicker, 1.0f);
                     continue;
                 }
@@ -325,9 +335,12 @@ public final class RtDynamicLights {
                 }
                 if (frameProfile != null) {
                     long key = packKey(entityId, SLOT_ENTITY_CORE);
-                    smoothAnchor(key, posX, posY + 0.35, posZ, alpha, frameSerial);
+                    Direction dir = frame.getDirection();
+                    RtDynamicLightSpecs.itemFrameOffset(dir.getStepX(), dir.getStepY(), dir.getStepZ(), handScratch);
+                    smoothAnchor(key, posX + handScratch[0], posY + handScratch[1], posZ + handScratch[2],
+                            alpha, frameSerial);
                     addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                            frameProfile, key, entityId, animSeconds, baselineCdM2, userIntensity,
+                            frameProfile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
                             allowFlicker, 1.0f);
                     continue;
                 }
@@ -339,9 +352,11 @@ public final class RtDynamicLights {
                         ? classifyStack(renderState.itemStack(), false) : null;
                 if (displayProfile != null) {
                     long key = packKey(entityId, SLOT_ENTITY_CORE);
-                    smoothAnchor(key, posX, posY + 0.35, posZ, alpha, frameSerial);
+                    writeDisplayOffset(itemDisplay, partial, camXRot, camYRot, 0.0f, 0.0f, 0.0f);
+                    smoothAnchor(key, posX + handScratch[0], posY + handScratch[1], posZ + handScratch[2],
+                            alpha, frameSerial);
                     addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                            displayProfile, key, entityId, animSeconds, baselineCdM2, userIntensity,
+                            displayProfile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
                             allowFlicker, 1.0f);
                     continue;
                 }
@@ -362,11 +377,17 @@ public final class RtDynamicLights {
             }
             if (entityProfile != null) {
                 long key = packKey(entityId, SLOT_ENTITY_CORE);
-                double centerY = posY + Math.max(entity.getBbHeight() * 0.55, 0.22);
-                smoothAnchor(key, posX, centerY, posZ, alpha, frameSerial);
+                if (entity instanceof Display.BlockDisplay blockDisplay) {
+                    writeDisplayOffset(blockDisplay, partial, camXRot, camYRot, 0.5f, 0.5f, 0.5f);
+                    smoothAnchor(key, posX + handScratch[0], posY + handScratch[1], posZ + handScratch[2],
+                            alpha, frameSerial);
+                } else {
+                    double centerY = posY + Math.max(entity.getBbHeight() * 0.55, 0.22);
+                    smoothAnchor(key, posX, centerY, posZ, alpha, frameSerial);
+                }
                 float selfPriority = isLocalCamera ? 2.5f : 1.0f;
                 addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                        entityProfile, key, entityId, animSeconds, baselineCdM2, userIntensity,
+                        entityProfile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
                         allowFlicker, selfPriority);
             }
         }
@@ -484,8 +505,7 @@ public final class RtDynamicLights {
             return;
         }
         // Quadrupeds and other non-humanoids carry luminous items at the mouth/head centre instead of
-        // off to the side of a humanoid hand. HumanoidMob no longer exists in this Minecraft version,
-        // so classify the mouth-carriers positively.
+        // off to the side of a humanoid hand, so classify the mouth-carriers positively.
         boolean mouthAnchored = usesMouthAnchor(living);
 
         boolean firstPersonLocal = isLocalCamera && Minecraft.getInstance().options.getCameraType().isFirstPerson();
@@ -514,41 +534,70 @@ public final class RtDynamicLights {
         boolean rightHanded = living.getMainArm() == HumanoidArm.RIGHT;
         double mainSide = mouthAnchored ? 0.0 : (rightHanded ? 1.0 : -1.0);
         float priorityBoost = isLocalCamera ? 4.0f : 1.25f;
+        int shadowOwnerId = living.isInvisible() ? RtDynamicLightSpecs.NO_ENTITY : living.getId();
 
         if (mainProfile != null) {
             writeHandOffset(mouthAnchored, yawDeg, posePitchDeg, mainSide, scale);
-            Vec3 target = clipOutOfWalls(level, living, eyePos, new Vec3(
-                    eyePos.x + handScratch[0], eyePos.y + handScratch[1], eyePos.z + handScratch[2]));
-            long key = packKey(living.getId(), SLOT_MAIN_HAND);
-            smoothAnchor(key, target.x, target.y, target.z, alpha, frameSerial);
-            addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                    mainProfile, key, living.getId(), animSeconds, baselineCdM2, userIntensity,
-                    allowFlicker, priorityBoost);
+            submitLivingSlotCandidate(level, living, eyePos, handScratch[0], handScratch[1], handScratch[2],
+                    camX, camY, camZ, mainProfile, SLOT_MAIN_HAND, shadowOwnerId, alpha, frameSerial,
+                    baselineCdM2, userIntensity, allowFlicker, priorityBoost);
         }
 
         if (offProfile != null) {
             writeHandOffset(mouthAnchored, yawDeg, posePitchDeg, -mainSide, scale);
-            Vec3 target = clipOutOfWalls(level, living, eyePos, new Vec3(
-                    eyePos.x + handScratch[0], eyePos.y + handScratch[1], eyePos.z + handScratch[2]));
-            long key = packKey(living.getId(), SLOT_OFF_HAND);
-            smoothAnchor(key, target.x, target.y, target.z, alpha, frameSerial);
-            addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                    offProfile, key, living.getId(), animSeconds, baselineCdM2, userIntensity,
-                    allowFlicker, priorityBoost);
+            submitLivingSlotCandidate(level, living, eyePos, handScratch[0], handScratch[1], handScratch[2],
+                    camX, camY, camZ, offProfile, SLOT_OFF_HAND, shadowOwnerId, alpha, frameSerial,
+                    baselineCdM2, userIntensity, allowFlicker, priorityBoost);
         }
 
         if (headProfile != null) {
             double reach = 0.28 * scale;
             double rise = 0.18 * scale;
-            Vec3 target = clipOutOfWalls(level, living, eyePos,
-                    new Vec3(eyePos.x + forwardX * reach, eyePos.y + forwardY * reach + rise,
-                            eyePos.z + forwardZ * reach));
-            long key = packKey(living.getId(), SLOT_HEAD);
-            smoothAnchor(key, target.x, target.y, target.z, alpha, frameSerial);
-            addCandidate(anchorScratch[0], anchorScratch[1], anchorScratch[2], camX, camY, camZ,
-                    headProfile, key, living.getId(), animSeconds, baselineCdM2, userIntensity,
-                    allowFlicker, priorityBoost);
+            submitLivingSlotCandidate(level, living, eyePos,
+                    forwardX * reach, forwardY * reach + rise, forwardZ * reach,
+                    camX, camY, camZ, headProfile, SLOT_HEAD, shadowOwnerId, alpha, frameSerial,
+                    baselineCdM2, userIntensity, allowFlicker, priorityBoost);
         }
+    }
+
+    /** Smooth the unclipped anchor first, then clip against walls from this frame's eye position. */
+    private void submitLivingSlotCandidate(ClientLevel level, LivingEntity living, Vec3 eyePos,
+                                           double offsetX, double offsetY, double offsetZ,
+                                           double camX, double camY, double camZ,
+                                           EmitterProfile profile, long slot, int shadowOwnerId,
+                                           float alpha, long frameSerial, float baselineCdM2,
+                                           float userIntensity, boolean allowFlicker, float priorityBoost) {
+        long key = packKey(living.getId(), slot);
+        smoothAnchor(key, eyePos.x + offsetX, eyePos.y + offsetY, eyePos.z + offsetZ, alpha, frameSerial);
+        Vec3 clipped = clipOutOfWalls(level, living, eyePos,
+                new Vec3(anchorScratch[0], anchorScratch[1], anchorScratch[2]));
+        addCandidate(clipped.x, clipped.y, clipped.z, camX, camY, camZ,
+                profile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
+                allowFlicker, priorityBoost);
+    }
+
+    private void writeDisplayOffset(Display display, float partial, float camXRot, float camYRot,
+                                    float localX, float localY, float localZ) {
+        Display.RenderState renderState = display.renderState();
+        float rotYDeg = display.getYRot(partial);
+        float rotXDeg = display.getXRot(partial);
+        Matrix4fc matrix = null;
+        if (renderState != null) {
+            switch (renderState.billboardConstraints()) {
+                case FIXED -> {
+                }
+                case HORIZONTAL -> rotXDeg = -camXRot;
+                case VERTICAL -> rotYDeg = camYRot - 180.0f;
+                case CENTER -> {
+                    rotYDeg = camYRot - 180.0f;
+                    rotXDeg = -camXRot;
+                }
+            }
+            Transformation transformation = renderState.transformation()
+                    .get(display.calculateInterpolationProgress(partial));
+            matrix = transformation.getMatrix();
+        }
+        RtDynamicLightSpecs.displayOffset(matrix, rotYDeg, rotXDeg, localX, localY, localZ, handScratch);
     }
 
     /**

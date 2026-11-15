@@ -828,13 +828,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     private void setBlockSpriteMaterial(TextureAtlasSprite sprite, BlockState state,
                                         boolean transmissive, boolean stochasticAlpha, boolean emitting) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
-            // Context-only emission (NeoForge getLightEmission(view, pos), held-item context) has no
-            // state-light bit to select the emitting variant, so resolve by profile with emitting forced.
-            int materialId = emitting && state != null && state.getLightEmission() == 0
-                    ? RtMaterialRegistry.INSTANCE.requireSnapshot()
-                            .resolve(sprite, RtMaterials.profile(state), transmissive, true)
-                    : RtMaterialRegistry.INSTANCE.requireSnapshot()
-                            .resolve(sprite, state, transmissive, emitting);
+            int materialId = RtMaterialRegistry.INSTANCE.requireSnapshot()
+                    .resolve(sprite, state, transmissive, emitting);
             capture.currentMaterialId = stochasticAlpha
                     ? RtMaterialRegistry.INSTANCE.withStochasticAlpha(materialId) : materialId;
         } else {

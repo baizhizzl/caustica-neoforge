@@ -66,12 +66,12 @@ bool finiteColor(float3 v) {
 // 5-tap neighbourhood min/max so DLSS-RR upscaled block textures gain crisp micro-detail with zero
 // specular ringing or dark halos, while scaling RGB uniformly to preserve exact ACEScg chromaticity.
 float3 sharpenExposed(int2 pix, int maxX, int maxY, float3 centerExposed, float exposure) {
+    if (!finiteColor(centerExposed)) {
+        return float3(0.0);
+    }
     float strength = clamp(pc.sharpness, 0.0, 1.0);
     if (strength <= 1.0e-4) {
         return centerExposed;
-    }
-    if (!finiteColor(centerExposed)) {
-        return float3(0.0);
     }
     float lC = perceptualLuma(centerExposed);
     if (lC <= 1.0e-5) {
@@ -113,15 +113,15 @@ float3 sharpenExposed(int2 pix, int maxX, int maxY, float3 centerExposed, float 
 // Scene-referred filmic log-contrast (pivoted at 18% mid-grey with soft highlight shoulder) and
 // luminance-preserving perceptual vibrance, shared identically by SDR and HDR10 PQ output transforms.
 float3 gradeSceneAcesCg(float3 color) {
-    bool neutralContrast = abs(pc.contrast - 1.0) <= 1.0e-4;
-    bool neutralVibrance = abs(pc.vibrance - 1.0) <= 1.0e-4;
-    // Strict pass-through at neutral defaults: ACEScg wide-gamut channels may be negative and the ACES 2.0
-    // LUT is specified on those unclipped values. Clamping here was silently destroying wide-gamut data.
-    if (neutralContrast && neutralVibrance) {
-        return color;
-    }
     if (!finiteColor(color)) {
         return float3(0.0);
+    }
+    bool neutralContrast = abs(pc.contrast - 1.0) <= 1.0e-4;
+    bool neutralVibrance = abs(pc.vibrance - 1.0) <= 1.0e-4;
+    // Strict identity pass-through at neutral defaults so the look-LUT output reaches the display
+    // transform untouched with zero numerical drift.
+    if (neutralContrast && neutralVibrance) {
+        return color;
     }
     float3 graded = max(color, float3(0.0));
     if (!neutralContrast) {
@@ -265,10 +265,15 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     }
 
     float4 rt = rtImage[pix];
-    float exposure = max(exposureImage[int2(0, 0)], 0.0);
-    float3 exposedAcesCg = sharpenExposed(pix, int(w) - 1, int(h) - 1,
-            max(rt.rgb * exposure, float3(0.0)), exposure);
-    exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
+    float rawExposure = exposureImage[int2(0, 0)];
+    float exposure = (rawExposure > 0.0 && rawExposure < 1.0e30) ? rawExposure : 0.0;
+    float3 rawExposed = rt.rgb * exposure;
+    float3 baseExposed = finiteColor(rawExposed) ? max(rawExposed, float3(0.0)) : float3(0.0);
+    float3 exposedAcesCg = sharpenExposed(pix, int(w) - 1, int(h) - 1, baseExposed, exposure);
+    float3 bloom = sampleBloom(pix, w, h);
+    if (finiteColor(bloom)) {
+        exposedAcesCg += max(bloom, float3(0.0)) * max(pc.bloomStrength, 0.0);
+    }
     float3 lookedAcesCg = gradeSceneAcesCg(applyLook(exposedAcesCg));
     outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
 

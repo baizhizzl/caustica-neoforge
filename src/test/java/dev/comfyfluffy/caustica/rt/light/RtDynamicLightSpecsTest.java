@@ -6,6 +6,9 @@ import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import org.joml.Matrix4f;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -206,6 +209,62 @@ final class RtDynamicLightSpecsTest {
         assertEquals(-0.30, mouth[0], 1.0e-5);
         assertEquals(-0.06, mouth[1], 1.0e-5);
         assertEquals(0.0, mouth[2], 1.0e-5);
+    }
+
+    @Test
+    void itemFrameOffsetFollowsOutwardNormalIncludingCeilingMount() {
+        double[] ceiling = new double[3];
+        double[] floor = new double[3];
+        double[] wall = new double[3];
+        RtDynamicLightSpecs.itemFrameOffset(0, -1, 0, ceiling);
+        RtDynamicLightSpecs.itemFrameOffset(0, 1, 0, floor);
+        RtDynamicLightSpecs.itemFrameOffset(0, 0, 1, wall);
+
+        // A ceiling frame sits at posY = blockY + 0.96875; offsetting downward keeps it below the ceiling.
+        double ceilingWorldY = 64.96875 + ceiling[1];
+        assertEquals(-RtDynamicLightSpecs.ITEM_FRAME_NORMAL_OFFSET, ceiling[1], 1.0e-9);
+        assertTrue(ceilingWorldY < 65.0, "ceiling frame anchor must stay clear of host ceiling block");
+        assertEquals(0.0, ceiling[0], 1.0e-9);
+        assertEquals(0.0, ceiling[2], 1.0e-9);
+
+        assertEquals(RtDynamicLightSpecs.ITEM_FRAME_NORMAL_OFFSET, floor[1], 1.0e-9);
+        assertEquals(RtDynamicLightSpecs.ITEM_FRAME_NORMAL_OFFSET, wall[2], 1.0e-9);
+    }
+
+    @Test
+    void displayOffsetCentersBlockDisplayAndMatchesJomlOrientationAndTransform() {
+        double[] blockDefault = new double[3];
+        RtDynamicLightSpecs.displayOffset(null, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f, blockDefault);
+        assertArrayEquals(new double[] {0.5, 0.5, 0.5}, blockDefault, 1.0e-9);
+
+        double[] itemDefault = new double[3];
+        RtDynamicLightSpecs.displayOffset(new Matrix4f(), 45.0f, -30.0f, 0.0f, 0.0f, 0.0f, itemDefault);
+        assertArrayEquals(new double[] {0.0, 0.0, 0.0}, itemDefault, 1.0e-9);
+
+        float rotYDeg = 37.0f;
+        float rotXDeg = -22.0f;
+        Matrix4f localTransform = new Matrix4f()
+                .translate(-1.0f, 0.25f, -1.0f)
+                .rotateY((float) Math.toRadians(15.0))
+                .scale(2.0f, 2.0f, 2.0f);
+        double[] transformed = new double[3];
+        RtDynamicLightSpecs.displayOffset(localTransform, rotYDeg, rotXDeg, 0.5f, 0.5f, 0.5f, transformed);
+
+        Vector3f expected = new Matrix4f()
+                .rotate(new Quaternionf().rotationYXZ(
+                        (float) (-Math.PI / 180.0) * rotYDeg,
+                        (float) (Math.PI / 180.0) * rotXDeg,
+                        0.0f))
+                .mul(localTransform)
+                .transformPosition(new Vector3f(0.5f, 0.5f, 0.5f));
+        assertEquals(expected.x, transformed[0], 1.0e-5);
+        assertEquals(expected.y, transformed[1], 1.0e-5);
+        assertEquals(expected.z, transformed[2], 1.0e-5);
+
+        Matrix4f nonFinite = new Matrix4f().m30(Float.NaN);
+        double[] fallback = new double[3];
+        RtDynamicLightSpecs.displayOffset(nonFinite, 0.0f, 0.0f, 0.5f, 0.5f, 0.5f, fallback);
+        assertArrayEquals(new double[] {0.0, 0.0, 0.0}, fallback, 1.0e-9);
     }
 
     @Test

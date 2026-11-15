@@ -160,9 +160,8 @@ public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterD
 
     // fG (the central 1/1.333 refraction focus) is the neutral caustic magnitude for every channel.
     // Only the red/blue dispersion offsets RELATIVE to it are kept, softened by 0.75 so the fringe lives
-    // in ACEScg AP1 without cross-talking the neutral luminance. With no dispersion (fR == fB == fG) all
-    // three channels are exactly equal; the old bt709ToAcesCg() on the focus vector mixed the channels
-    // as if they were a colour, which shifted hue and desaturated single-channel fold lines.
+    // in ACEScg AP1 without cross-talking neutral luminance. When dispersion vanishes (fR == fB == fG),
+    // all three channels remain strictly equal and neutral fold lines stay achromatic.
     float fG = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, 1.0 / WATER_IOR);
     float fR = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, WATER_CAUCHY_INV_IOR.x);
     float fB = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, WATER_CAUCHY_INV_IOR.z);

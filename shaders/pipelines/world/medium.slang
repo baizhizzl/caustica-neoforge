@@ -72,11 +72,7 @@ float airHazeSegmentOpticalDepth(float3 ro, float3 rd, float s0, float s1,
     return (f0 + 4.0 * fm + f1) * (segLen / 6.0);
 }
 
-// Integral of the height-dependent haze density along [0, dist].
-//
-// The 3-point Simpson rule used here previously is exact for only the cubic term of the profile; at the
-// largest configured falloff (0.25) over a 96-block vertical column its error reached ~300%. The
-// density is piecewise analytic, so the integral is now evaluated exactly:
+// Piecewise-analytic integral of the height-dependent haze density along [0, dist]:
 //   * horizontal rays (|rd.y| < 1e-7) have a constant-height density: sigma(y) * dist, exact to
 //     O((k*|rd.y|*dist)^2) < 1e-12, so even a grazing 96-block column stays within 0.003%;
 //   * rays that cross the sea-level plane are split at s = (seaY - ro.y) / rd.y, because the profile
@@ -200,4 +196,18 @@ public Medium makeDielectricMedium(bool isWater, float ior, float3 tint, float t
     m.extinction = isWater ? waterExtinction(tint) : volumeExtinction(tint, transmission);
     m.water = isWater;
     return m;
+}
+
+// Beer-Lambert water absorption along a finite shadow segment of length `dist`, given the nearest
+// water-interface crossing distance `waterHitT` (negative when no water interface was crossed).
+public float3 waterShadowTransmittance(Medium currentMedium, float waterHitT, float dist) {
+    if (currentMedium.water) {
+        float waterDist = waterHitT >= 0.0 ? min(waterHitT, dist) : dist;
+        return exp(-currentMedium.extinction * waterDist);
+    }
+    if (waterHitT >= 0.0) {
+        float waterDist = max(dist - waterHitT, 0.0);
+        return exp(-waterExtinction(worldPush.waterParams.xyz) * waterDist);
+    }
+    return float3(1.0, 1.0, 1.0);
 }
