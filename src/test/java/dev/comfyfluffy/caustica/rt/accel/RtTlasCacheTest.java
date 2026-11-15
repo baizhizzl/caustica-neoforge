@@ -205,6 +205,25 @@ final class RtTlasCacheTest {
     }
 
     @Test
+    void dynamicLightExclusionMaskChangesRewriteTheInstanceBufferAndForceABuild() {
+        Object source = new Object();
+        var withPrimary = instance(100, 0x800001, 0xFD, 4);   // first-person self: no primary ray
+        var excluded = instance(100, 0x800001, 0xF9, 4);      // 0xFD with dynamic shadow group 0x04 removed
+        RtTlasCache cache = new RtTlasCache();
+        cache.built(source, 3, 10, List.of(withPrimary), 0, false);
+        assertFalse(cache.needsBuild(source, 3, 10, List.of(withPrimary), 0));
+        assertTrue(cache.needsBuild(source, 3, 10, List.of(excluded), 0),
+                "a changed dynamic-light exclusion bit must rewrite dynamic instances");
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(excluded)),
+                "a TLAS refit must not be used when an instance mask changed");
+        cache.built(source, 3, 10, List.of(excluded), 0, false);
+        assertFalse(cache.needsBuild(source, 3, 10, List.of(excluded), 0));
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(excluded)));
+        assertTrue(cache.needsBuild(source, 3, 10, List.of(withPrimary), 0),
+                "releasing the torch must restore the original mask");
+    }
+
+    @Test
     void freshlyBuiltParticleBlasAddressChangeRejectsInPlaceTlasRefit() {
         Object source = new Object();
         RtTlasCache cache = new RtTlasCache();

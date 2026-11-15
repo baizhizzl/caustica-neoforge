@@ -77,6 +77,47 @@ final class RtVideoOptionsTest {
         }
     }
 
+    @Test
+    void visualSlidersCoverExactlyTheConfigRangeAndWriteBackTheDisplayedValue() throws ReflectiveOperationException {
+        record Slider(String factory, int min, int max, CausticaConfig.FloatSetting setting) {
+        }
+        List<Slider> sliders = List.of(
+                new Slider("dynamicLightIntensity", 0, 400, CausticaConfig.Rt.DynamicLights.INTENSITY),
+                new Slider("volumetricIntensity", 0, 300, CausticaConfig.Rt.Visuals.VOLUMETRIC_INTENSITY),
+                new Slider("causticsIntensity", 0, 300, CausticaConfig.Rt.Visuals.CAUSTICS_INTENSITY),
+                new Slider("bloomScale", 0, 300, CausticaConfig.Rt.Visuals.BLOOM_SCALE),
+                new Slider("contrast", 75, 150, CausticaConfig.Rt.Visuals.CONTRAST),
+                new Slider("vibrance", 50, 200, CausticaConfig.Rt.Visuals.VIBRANCE),
+                new Slider("sharpness", 0, 100, CausticaConfig.Rt.Visuals.SHARPNESS));
+        for (Slider slider : sliders) {
+            float previous = slider.setting().value();
+            try {
+                OptionInstance<Integer> option = intOption(slider.factory());
+                assertTrue(option.values().validateValue(slider.min()).isPresent(),
+                        slider.factory() + " min");
+                assertTrue(option.values().validateValue(slider.max()).isPresent(),
+                        slider.factory() + " max");
+                assertTrue(option.values().validateValue(slider.min() - 1).isEmpty(),
+                        slider.factory() + " below min");
+                assertTrue(option.values().validateValue(slider.max() + 1).isEmpty(),
+                        slider.factory() + " above max");
+                callback(option).valueChanged(slider.min());
+                assertEquals(slider.min() / 100.0f, slider.setting().value(), 1.0e-6f);
+                callback(option).valueChanged(slider.max());
+                assertEquals(slider.max() / 100.0f, slider.setting().value(), 1.0e-6f);
+            } finally {
+                slider.setting().set(previous);
+            }
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static OptionInstance<Integer> intOption(String factoryName) throws ReflectiveOperationException {
+        Method factory = RtVideoOptions.class.getDeclaredMethod(factoryName);
+        factory.setAccessible(true);
+        return (OptionInstance<Integer>) factory.invoke(null);
+    }
+
     @SuppressWarnings("unchecked")
     private static OptionInstance<Integer> multiplier(List<Integer> counts) throws ReflectiveOperationException {
         Method factory = RtVideoOptions.class.getDeclaredMethod("frameGenerationMultiplier", List.class, boolean.class);

@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import com.electronwill.nightconfig.core.CommentedConfig;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class CausticaConfigTest {
@@ -102,6 +103,74 @@ final class CausticaConfigTest {
         } finally {
             primary.set(previousPrimary);
             indirect.set(previousIndirect);
+        }
+    }
+
+    @Test
+    void visualEnhancementsDefaultToStrictlyNeutralAcesCalibration() {
+        assertTrue(CausticaConfig.Rt.DynamicLights.ENABLED.defaultValue());
+        assertFalse(CausticaConfig.Rt.Visuals.VOLUMETRIC_FOG.defaultValue());
+        assertFalse(CausticaConfig.Rt.Visuals.MULTISCATTER_GGX.defaultValue());
+        assertEquals(1.0f, CausticaConfig.Rt.Visuals.CAUSTICS_INTENSITY.defaultValue(), 1.0e-6f);
+        assertEquals(1.0f, CausticaConfig.Rt.Visuals.BLOOM_SCALE.defaultValue(), 1.0e-6f);
+        assertEquals(1.0f, CausticaConfig.Rt.Visuals.CONTRAST.defaultValue(), 1.0e-6f);
+        assertEquals(1.0f, CausticaConfig.Rt.Visuals.VIBRANCE.defaultValue(), 1.0e-6f);
+        assertEquals(0.0f, CausticaConfig.Rt.Visuals.SHARPNESS.defaultValue(), 1.0e-6f);
+    }
+
+    @Test
+    void visualSettingsClampToTheirDeclaredRangesAndPersist() {
+        var config = CommentedConfig.inMemory();
+        var contrast = CausticaConfig.Rt.Visuals.CONTRAST;
+        var vibrance = CausticaConfig.Rt.Visuals.VIBRANCE;
+        var bloom = CausticaConfig.Rt.Visuals.BLOOM_SCALE;
+        float prevContrast = contrast.value();
+        float prevVibrance = vibrance.value();
+        float prevBloom = bloom.value();
+        try {
+            contrast.set(9.0f);
+            assertEquals(1.5f, contrast.value(), 1.0e-6f);
+            contrast.set(0.1f);
+            assertEquals(0.75f, contrast.value(), 1.0e-6f);
+
+            vibrance.set(9.0f);
+            assertEquals(2.0f, vibrance.value(), 1.0e-6f);
+            vibrance.set(-1.0f);
+            assertEquals(0.5f, vibrance.value(), 1.0e-6f);
+
+            bloom.set(1.15f);
+            bloom.writeToFile(config);
+            assertEquals(1.15, config.<Number>get("visuals.bloom-scale").doubleValue(), 1.0e-5);
+        } finally {
+            contrast.set(prevContrast);
+            vibrance.set(prevVibrance);
+            bloom.set(prevBloom);
+        }
+    }
+
+    @Test
+    void dynamicLightAndVisualEnhancementSettingsRegisterClampAndRoundTrip() {
+        CausticaConfig.ensureRegistered();
+        var config = CommentedConfig.inMemory();
+        assertTrue(CausticaConfig.settings().contains(CausticaConfig.Rt.DynamicLights.ENABLED));
+        assertTrue(CausticaConfig.settings().contains(CausticaConfig.Rt.Visuals.VOLUMETRIC_FOG));
+        assertTrue(CausticaConfig.settings().contains(CausticaConfig.Rt.Visuals.CAUSTICS_INTENSITY));
+        assertTrue(CausticaConfig.settings().contains(CausticaConfig.Rt.Visuals.SHARPNESS));
+
+        float prevIntensity = CausticaConfig.Rt.DynamicLights.INTENSITY.value();
+        float prevSharpness = CausticaConfig.Rt.Visuals.SHARPNESS.value();
+        try {
+            CausticaConfig.Rt.DynamicLights.INTENSITY.set(99.0f);
+            assertEquals(4.0f, CausticaConfig.Rt.DynamicLights.INTENSITY.value());
+            CausticaConfig.Rt.DynamicLights.INTENSITY.set(-5.0f);
+            assertEquals(0.0f, CausticaConfig.Rt.DynamicLights.INTENSITY.value());
+
+            CausticaConfig.Rt.Visuals.SHARPNESS.set(0.45f);
+            CausticaConfig.Rt.Visuals.SHARPNESS.writeToFile(config);
+            assertEquals(0.45, config.<Number>get("visuals.sharpness").doubleValue(), 1.0e-5);
+        } finally {
+            CausticaConfig.Rt.DynamicLights.INTENSITY.set(prevIntensity);
+            CausticaConfig.Rt.Visuals.SHARPNESS.set(prevSharpness);
         }
     }
 }

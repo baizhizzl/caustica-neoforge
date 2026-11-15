@@ -18,6 +18,36 @@
 	"caustica.options.rt.maxBounces": "Path Bounces",
 	"caustica.options.rt.maxBounces.tooltip": "Maximum number of secondary path-tracing bounces after the primary hit. Higher captures more indirect light but costs more.",
 
+	"caustica.options.rt.dynamicLights": "Dynamic Lights",
+	"caustica.options.rt.dynamicLights.tooltip": "Ray-traced spherical area lights for handheld torches/lanterns, dropped glowing items, projectiles, and burning or bioluminescent entities.",
+
+	"caustica.options.rt.dynamicLightIntensity": "Dynamic Light Strength",
+	"caustica.options.rt.dynamicLightIntensity.tooltip": "Photometric intensity multiplier for dynamic handheld and entity lights.",
+
+	"caustica.options.rt.volumetricFog": "Volumetric Light",
+	"caustica.options.rt.volumetricFog.tooltip": "Enable ray-traced atmospheric sunbeams, stained-glass shafts, underwater caustic shafts, and misty dynamic-light halos.",
+
+	"caustica.options.rt.volumetricIntensity": "Volumetric Strength",
+	"caustica.options.rt.volumetricIntensity.tooltip": "Intensity of volumetric light shafts and dynamic emitter halos.",
+
+	"caustica.options.rt.causticsIntensity": "Water Caustics",
+	"caustica.options.rt.causticsIntensity.tooltip": "Strength of chromatic wave-refraction caustics on underwater surfaces and light shafts.",
+
+	"caustica.options.rt.multiscatterGgx": "Multi-Scatter Specular",
+	"caustica.options.rt.multiscatterGgx.tooltip": "Energy-preserving multiple-scattering GGX compensation so rough metals and wet PBR surfaces retain full sheen and color.",
+
+	"caustica.options.rt.bloomScale": "Bloom Strength",
+	"caustica.options.rt.bloomScale.tooltip": "Multiplier on scene-referred highlight bloom around bright lights, lava, and reflections.",
+
+	"caustica.options.rt.contrast": "Filmic Contrast",
+	"caustica.options.rt.contrast.tooltip": "Scene-referred log-space contrast pivoted at mid-grey before ACES output mapping.",
+
+	"caustica.options.rt.vibrance": "Vibrance",
+	"caustica.options.rt.vibrance.tooltip": "Luminance-preserving perceptual chroma boost that enriches muted colors without clipping saturated highlights.",
+
+	"caustica.options.rt.sharpness": "Adaptive Sharpness",
+	"caustica.options.rt.sharpness.tooltip": "Halo-free contrast-adaptive luminance sharpening for crisp block textures after DLSS Ray Reconstruction.",
+
 	"caustica.options.rt.entities": "Ray-Traced Entities",
 	"caustica.options.rt.entities.tooltip": "Include entities and block entities in the ray-traced scene.",
 

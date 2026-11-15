@@ -33,6 +33,10 @@ public uint payloadMaterial() { return payload.flags & PAYLOAD_MATERIAL_MASK; }
 // travelling into the volume (vs. out of it) at this hit's face.
 public bool payloadDielectricEntering() { return (payload.flags & PAYLOAD_DIELECTRIC_ENTERING) != 0u; }
 public bool payloadEmitterInList() { return (payload.flags & PAYLOAD_EMITTER_IN_LIST) != 0u; }
+// Set by world.rchit when the hit entity is one of this frame's dynamic emitters (see
+// ENTITY_FLAG_DYNAMIC_EMITTER). Raygen pairs this with its previous-bounce dynamic-NEE state so the
+// mesh's emission is counted exactly once.
+public bool payloadDynamicEmitter() { return (payload.flags & PAYLOAD_DYNAMIC_EMITTER) != 0u; }
 // LINEAR roughness, i.e. GGX alpha directly — NOT perceptual roughness. This is the one convention used
 // end to end: LabPBR defines roughness = (1 - perceptualSmoothness)^2 and RtLabPbr.decode stores exactly
 // that, RtMaterials.Profile carries the same units, and DLSS-RR wants linear roughness in its guide. So

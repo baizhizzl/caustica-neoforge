@@ -323,6 +323,12 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
                 emission, sss, header.params.z, header.params.w,
                 materialEmissionSource(header, emission));
         payloadSetDielectric(payload, material, entering);
+        // CPU tag: this entity is one of the frame's dynamic light emitters. Raygen uses the flag to
+        // suppress the mesh's own emission on the bounce immediately after it ran risDynamic NEE, so the
+        // torch/lantern is lit once by NEE rather than also emitted again by its own geometry.
+        if ((g.reserved.x & ENTITY_FLAG_DYNAMIC_EMITTER) != 0u) {
+            payload.flags |= PAYLOAD_DYNAMIC_EMITTER;
+        }
         return;
     }
 

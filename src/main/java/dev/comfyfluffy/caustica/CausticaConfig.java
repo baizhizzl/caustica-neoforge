@@ -58,7 +58,8 @@ public final class CausticaConfig {
         @SuppressWarnings("unused")
         Object[] touch = {
             Rt.ENABLED, Rt.Composite.SPP, Rt.Composite.MAX_BOUNCES, Rt.Terrain.ASYNC_DISPATCH_PER_PASS, Rt.Omm.ENABLED,
-            Rt.Lights.PRESAMPLING, Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES,
+            Rt.Lights.PRESAMPLING, Rt.DynamicLights.ENABLED, Rt.Visuals.VOLUMETRIC_FOG,
+            Rt.Entities.ENABLED, Rt.Entities.GLOW_ENABLED, Rt.EntityTextures.MAX_TEXTURES,
             Rt.Overlay.BLOCK_OUTLINE_ENABLED, Rt.DlssRr.ENABLED, Rt.Fg.ENABLED,
             Rt.Reflex.ENABLED, Rt.Exposure.MODE, Rt.Tonemap.GAMMA, Rt.FrameStats.ENABLED,
             Rt.Screenshots.EXR_ENABLED, Rt.Diagnostics.HEAVY_CRASH_DIAGNOSTICS, Rt.Hdr.ENABLED, Ngx.PATH,
@@ -107,6 +108,12 @@ public final class CausticaConfig {
                 " Controls direct lighting from glowing blocks such as torches, glowstone, and lava.\n"
                         + " Set ris-candidates to 0 to disable it. ris-candidates-indirect applies after the first bounce\n"
                         + " and is capped at ris-candidates. stats, dump, and dump-radius are debugging options.");
+        FILE.setComment("dynamic-lights",
+                " Real-time spherical area lights for handheld items, dropped glowing items, and luminous/burning entities.\n"
+                        + " smoothing sets position filter time constant in seconds; max-distance sets culling range in blocks.");
+        FILE.setComment("visuals",
+                " Atmospheric/underwater volumetric shafts, chromatic water caustics, multi-scatter GGX energy compensation,\n"
+                        + " scene-referred bloom scale, filmic contrast, perceptual vibrance, and adaptive texture sharpening.");
         FILE.setComment("tonemap",
                 " Controls the final image. gamma: 1 is neutral; lower values brighten midtones.");
         FILE.setComment("exposure",
@@ -821,6 +828,68 @@ public final class CausticaConfig {
                 return "auto";
             }
 
+        }
+
+        /** Real-time ray-traced spherical area lights for handheld items and dynamic entities. */
+        public static final class DynamicLights {
+            public static final BooleanSetting ENABLED =
+                    bool("caustica.rt.dynamicLights", "dynamic-lights.enabled", true);
+            public static final BooleanSetting HELD_ITEMS =
+                    bool("caustica.rt.dynamicLights.heldItems", "dynamic-lights.held-items", true);
+            public static final BooleanSetting ENTITIES =
+                    bool("caustica.rt.dynamicLights.entities", "dynamic-lights.entities", true);
+            public static final BooleanSetting FLICKER =
+                    bool("caustica.rt.dynamicLights.flicker", "dynamic-lights.flicker", true);
+            public static final FloatSetting INTENSITY =
+                    clampedFloat("caustica.rt.dynamicLights.intensity", "dynamic-lights.intensity",
+                            1.0f, 0.0f, 4.0f);
+            public static final FloatSetting MAX_DISTANCE =
+                    clampedFloat("caustica.rt.dynamicLights.maxDistance", "dynamic-lights.max-distance",
+                            48.0f, 8.0f, 128.0f);
+            public static final FloatSetting SMOOTHING =
+                    clampedFloat("caustica.rt.dynamicLights.smoothing", "dynamic-lights.smoothing",
+                            0.06f, 0.0f, 0.5f);
+
+            private DynamicLights() {
+            }
+        }
+
+        /** Participating-media volumetrics, chromatic caustics, multi-scatter GGX, and display grading. */
+        public static final class Visuals {
+            public static final BooleanSetting VOLUMETRIC_FOG =
+                    bool("caustica.rt.visuals.volumetricFog", "visuals.volumetric-fog", false);
+            public static final FloatSetting VOLUMETRIC_INTENSITY =
+                    clampedFloat("caustica.rt.visuals.volumetricIntensity", "visuals.volumetric-intensity",
+                            1.0f, 0.0f, 3.0f);
+            public static final FloatSetting HAZE_DENSITY =
+                    clampedFloat("caustica.rt.visuals.hazeDensity", "visuals.haze-density",
+                            0.0018f, 0.0f, 0.05f);
+            public static final FloatSetting HAZE_HEIGHT_FALLOFF =
+                    clampedFloat("caustica.rt.visuals.hazeHeightFalloff", "visuals.haze-height-falloff",
+                            0.022f, 0.0f, 0.25f);
+            public static final FloatSetting UNDERWATER_SCATTER =
+                    clampedFloat("caustica.rt.visuals.underwaterScatter", "visuals.underwater-scatter",
+                            1.0f, 0.0f, 3.0f);
+            public static final FloatSetting CAUSTICS_INTENSITY =
+                    clampedFloat("caustica.rt.visuals.causticsIntensity", "visuals.caustics-intensity",
+                            1.0f, 0.0f, 3.0f);
+            public static final BooleanSetting MULTISCATTER_GGX =
+                    bool("caustica.rt.visuals.multiscatterGgx", "visuals.multiscatter-ggx", false);
+            public static final FloatSetting BLOOM_SCALE =
+                    clampedFloat("caustica.rt.visuals.bloomScale", "visuals.bloom-scale",
+                            1.0f, 0.0f, 3.0f);
+            public static final FloatSetting CONTRAST =
+                    clampedFloat("caustica.rt.visuals.contrast", "visuals.contrast",
+                            1.0f, 0.75f, 1.50f);
+            public static final FloatSetting VIBRANCE =
+                    clampedFloat("caustica.rt.visuals.vibrance", "visuals.vibrance",
+                            1.0f, 0.50f, 2.00f);
+            public static final FloatSetting SHARPNESS =
+                    clampedFloat("caustica.rt.visuals.sharpness", "visuals.sharpness",
+                            0.0f, 0.0f, 1.0f);
+
+            private Visuals() {
+            }
         }
 
         /** Scene-referred look transform and baked SDR/HDR ACES display transforms. */

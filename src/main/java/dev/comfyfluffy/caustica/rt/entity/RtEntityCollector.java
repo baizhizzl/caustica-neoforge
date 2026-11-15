@@ -47,7 +47,9 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.util.ARGB;
 import net.minecraft.util.FormattedCharSequence;
 import net.minecraft.util.Mth;
+import dev.comfyfluffy.caustica.rt.light.RtDynamicLights;
 import net.minecraft.world.item.ItemDisplayContext;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import net.minecraft.util.RandomSource;
@@ -116,6 +118,16 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     // glowing) per submitModel call — see EntityRenderer.extractCommon's outlineColor. Every submitModel
     // call for one entity carries the same value, so the last non-zero one seen this entity is enough.
     private int outlineColor;
+    // Per-entity item stacks used to resolve direct-hit self-emission on held/dropped luminous items.
+    private ItemStack entityGroundStack = ItemStack.EMPTY;
+    private ItemStack entityMainHandStack = ItemStack.EMPTY;
+    private ItemStack entityRightHandStack = ItemStack.EMPTY;
+    private ItemStack entityLeftHandStack = ItemStack.EMPTY;
+    private ItemStack entityHeadStack = ItemStack.EMPTY;
+    private boolean capturingLivingEntity;
+    private BlockState entityBlockContext;
+    private BlockState activeSubmittedItemState;
+    private int activeSubmittedItemLight;
 
     /**
      * Point the collector at the capture buffer for the next {@code dispatcher.submit}, resetting the
@@ -125,10 +137,36 @@ public final class RtEntityCollector implements SubmitNodeCollector {
     public void begin(RtEntityCapture capture, boolean profileDynamicEntity) {
         this.capture = capture;
         this.profileDynamicEntity = capture != null && profileDynamicEntity;
+        this.entityGroundStack = ItemStack.EMPTY;
+        this.entityMainHandStack = ItemStack.EMPTY;
+        this.entityRightHandStack = ItemStack.EMPTY;
+        this.entityLeftHandStack = ItemStack.EMPTY;
+        this.entityHeadStack = ItemStack.EMPTY;
+        this.capturingLivingEntity = false;
+        this.entityBlockContext = null;
+        this.activeSubmittedItemState = null;
+        this.activeSubmittedItemLight = 0;
         if (capture != null) {
             this.outlineColor = 0;
             this.pendingOrder = 0;
         }
+    }
+
+    public void setGroundItemContext(ItemStack stack) {
+        this.entityGroundStack = stack != null ? stack : ItemStack.EMPTY;
+    }
+
+    /** Block state rendered by a falling block or {@code Display.BlockDisplay} for this entity. */
+    public void setEntityBlockContext(BlockState state) {
+        this.entityBlockContext = state;
+    }
+
+    public void setLivingItemContext(ItemStack mainHand, ItemStack rightHand, ItemStack leftHand, ItemStack head) {
+        this.capturingLivingEntity = true;
+        this.entityMainHandStack = mainHand != null ? mainHand : ItemStack.EMPTY;
+        this.entityRightHandStack = rightHand != null ? rightHand : ItemStack.EMPTY;
+        this.entityLeftHandStack = leftHand != null ? leftHand : ItemStack.EMPTY;
+        this.entityHeadStack = head != null ? head : ItemStack.EMPTY;
     }
 
     /** This entity's Glowing-effect outline colour (opaque ARGB), or 0 if it isn't glowing. */
@@ -327,11 +365,16 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         boolean transmissive = q.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
         boolean stochasticAlpha = !transmissive && isTranslucent(q.materialInfo().itemRenderType());
         capture.currentAlphaBucket = alphaBucket(q.materialInfo().layer(), stochasticAlpha);
-        setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
-                transmissive, stochasticAlpha);
+        if (activeSubmittedItemState != null) {
+            setBlockSpriteMaterial(sprite, activeSubmittedItemState, transmissive, stochasticAlpha,
+                    activeSubmittedItemLight > 0 || activeSubmittedItemState.getLightEmission() > 0);
+        } else {
+            setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
+                    transmissive, stochasticAlpha, activeSubmittedItemLight > 0);
+        }
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
         int color = ARGB.multiply(averageBakedColor(q), tintColor(q.materialInfo().tintIndex(), tintLayers));
-        float emission = q.materialInfo().lightEmission() / 15f;
+        float emission = Math.max(activeSubmittedItemLight, q.materialInfo().lightEmission()) / 15f;
         capture.addBakedQuad(pose, q, color, emission);
     }
 
@@ -342,15 +385,21 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     private void setSpriteMaterial(TextureAtlasSprite sprite, RtMaterials.Profile profile,
                                    boolean transmissive, boolean stochasticAlpha) {
+        setSpriteMaterial(sprite, profile, transmissive, stochasticAlpha, false);
+    }
+
+    private void setSpriteMaterial(TextureAtlasSprite sprite, RtMaterials.Profile profile,
+                                   boolean transmissive, boolean stochasticAlpha, boolean emitting) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
             int materialId = RtMaterialRegistry.INSTANCE.requireSnapshot()
-                    .resolve(sprite, profile, transmissive, false);
+                    .resolve(sprite, profile, transmissive, emitting);
             capture.currentMaterialId = stochasticAlpha
                     ? RtMaterialRegistry.INSTANCE.withStochasticAlpha(materialId) : materialId;
         } else if (sprite != null && RtEntityTextures.entityPbr()) {
-            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha);
+            capture.currentMaterialId =
+                    RtMaterialRegistry.INSTANCE.resolveEntitySprite(sprite, stochasticAlpha, emitting);
         } else {
-            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
+            capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha, emitting);
         }
     }
 
@@ -777,13 +826,19 @@ public final class RtEntityCollector implements SubmitNodeCollector {
 
     /** Resolve a dynamic block quad with its state-dependent profile, overrides, and emission variant. */
     private void setBlockSpriteMaterial(TextureAtlasSprite sprite, BlockState state,
-                                        boolean transmissive, boolean stochasticAlpha) {
+                                        boolean transmissive, boolean stochasticAlpha, boolean emitting) {
         if (sprite != null && TextureAtlas.LOCATION_BLOCKS.equals(sprite.atlasLocation())) {
-            int materialId = RtMaterialRegistry.INSTANCE.requireSnapshot().resolve(sprite, state, transmissive);
+            // Context-only emission (NeoForge getLightEmission(view, pos), held-item context) has no
+            // state-light bit to select the emitting variant, so resolve by profile with emitting forced.
+            int materialId = emitting && state != null && state.getLightEmission() == 0
+                    ? RtMaterialRegistry.INSTANCE.requireSnapshot()
+                            .resolve(sprite, RtMaterials.profile(state), transmissive, true)
+                    : RtMaterialRegistry.INSTANCE.requireSnapshot()
+                            .resolve(sprite, state, transmissive, emitting);
             capture.currentMaterialId = stochasticAlpha
                     ? RtMaterialRegistry.INSTANCE.withStochasticAlpha(materialId) : materialId;
         } else {
-            setSpriteMaterial(sprite, RtMaterials.profile(state), transmissive, stochasticAlpha);
+            setSpriteMaterial(sprite, RtMaterials.profile(state), transmissive, stochasticAlpha, emitting);
         }
     }
 
@@ -804,11 +859,23 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             this.outlineColor = outlineColor;
         }
         Matrix4f pose = poseStack.last().pose();
-        for (BlockStateModelPart part : parts) {
-            addQuads(pose, part.getQuads(null), tintLayers);
-            for (Direction d : DIRECTIONS) {
-                addQuads(pose, part.getQuads(d), tintLayers);
+        BlockState prevState = activeSubmittedItemState;
+        int prevLight = activeSubmittedItemLight;
+        BlockState contextState = entityBlockContext;
+        if (contextState != null) {
+            activeSubmittedItemState = contextState;
+            activeSubmittedItemLight = contextState.getLightEmission();
+        }
+        try {
+            for (BlockStateModelPart part : parts) {
+                addQuads(pose, part.getQuads(null), tintLayers);
+                for (Direction d : DIRECTIONS) {
+                    addQuads(pose, part.getQuads(d), tintLayers);
+                }
             }
+        } finally {
+            activeSubmittedItemState = prevState;
+            activeSubmittedItemLight = prevLight;
         }
     }
 
@@ -823,11 +890,23 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             this.outlineColor = outlineColor;
         }
         Matrix4f pose = poseStack.last().pose();
-        for (BlockStateModelPart part : parts) {
-            addQuads(pose, part.getQuads(null), tintLayers);
-            for (Direction d : DIRECTIONS) {
-                addQuads(pose, part.getQuads(d), tintLayers);
+        BlockState prevState = activeSubmittedItemState;
+        int prevLight = activeSubmittedItemLight;
+        BlockState contextState = entityBlockContext;
+        if (contextState != null) {
+            activeSubmittedItemState = contextState;
+            activeSubmittedItemLight = contextState.getLightEmission();
+        }
+        try {
+            for (BlockStateModelPart part : parts) {
+                addQuads(pose, part.getQuads(null), tintLayers);
+                for (Direction d : DIRECTIONS) {
+                    addQuads(pose, part.getQuads(d), tintLayers);
+                }
             }
+        } finally {
+            activeSubmittedItemState = prevState;
+            activeSubmittedItemLight = prevLight;
         }
     }
 
@@ -842,7 +921,24 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (outlineColor != 0) {
             this.outlineColor = outlineColor;
         }
-        addQuads(poseStack.last().pose(), quads.all(), tintLayers);
+        ItemStack contextStack = switch (displayContext) {
+            case THIRD_PERSON_RIGHT_HAND, FIRST_PERSON_RIGHT_HAND -> entityRightHandStack;
+            case THIRD_PERSON_LEFT_HAND, FIRST_PERSON_LEFT_HAND -> entityLeftHandStack;
+            case HEAD -> entityHeadStack;
+            // Fox/Panda/Villager/Witch/Dolphin mouth- and hand-held items render with HoldingEntityRenderState's
+            // GROUND context while the capture has no dedicated ground stack; fall back to the main hand.
+            case GROUND, FIXED -> entityGroundStack.isEmpty() && capturingLivingEntity
+                    ? entityMainHandStack : entityGroundStack;
+            default -> entityGroundStack;
+        };
+        activeSubmittedItemState = RtDynamicLights.resolveEmissiveBlockState(contextStack);
+        activeSubmittedItemLight = RtDynamicLights.resolveItemLightLevel(contextStack);
+        try {
+            addQuads(poseStack.last().pose(), quads.all(), tintLayers);
+        } finally {
+            activeSubmittedItemState = null;
+            activeSubmittedItemLight = 0;
+        }
     }
 
     /** Capture one baked quad (block model / item) with its effective chunk layer, state-dependent
@@ -862,11 +958,15 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         boolean transmissive = layer == ChunkSectionLayer.TRANSLUCENT;
         boolean stochasticAlpha = !transmissive && isTranslucent(quad.materialInfo().itemRenderType());
         capture.currentAlphaBucket = alphaBucket(layer, stochasticAlpha);
+        int stateEmission = state != null
+                ? (view != null && pos != null ? state.getLightEmission(view, pos) : state.getLightEmission())
+                : 0;
+        boolean emitting = stateEmission > 0;
         if (state != null) {
-            setBlockSpriteMaterial(sprite, state, transmissive, stochasticAlpha);
+            setBlockSpriteMaterial(sprite, state, transmissive, stochasticAlpha, emitting);
         } else {
             setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
-                    transmissive, stochasticAlpha);
+                    transmissive, stochasticAlpha, emitting);
         }
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
         for (int i = 0; i < 4; i++) {
@@ -899,9 +999,6 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             }
         }
         int color = ARGB.multiply(averageBakedColor(quad), tint);
-        int stateEmission = state != null
-                ? (view != null && pos != null ? state.getLightEmission(view, pos) : state.getLightEmission())
-                : 0;
         float emission = Math.max(stateEmission, quad.materialInfo().lightEmission()) / 15f;
         capture.addDirectQuad(meshX, meshY, meshZ, meshU, meshV, 0f, 0f, 0f, color, emission);
     }

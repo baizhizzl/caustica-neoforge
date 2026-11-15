@@ -33,7 +33,7 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
 /** Maps the display-res scene-linear ACEScg RT image to sRGB SDR and, when enabled, PQ/BT.2020 HDR. */
 public final class RtDisplayPipeline {
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/display/";
-    /** Push constants: output/look LUT state plus gamma and HDR peak nits. */
+    /** Push constants: output/look LUT state plus gamma, grading, sharpening, and HDR peak nits. */
     private static final int PUSH_BYTES = DisplayPushData.BYTE_SIZE;
 
     private final RtContext ctx;
@@ -204,13 +204,14 @@ public final class RtDisplayPipeline {
      */
     public void dispatch(VkCommandBuffer cmd, int width, int height, boolean hdrEnabled, int lutSize,
                          float gamma, float hdrPeakNits, boolean lookEnabled, int lookLutSize,
-                         float bloomStrength) {
+                         float bloomStrength, float contrast, float vibrance, float sharpness) {
         try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "display compute")) {
             VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipelineLayout, 0, stack.longs(descriptorSet), null);
             ByteBuffer push = stack.malloc(DisplayPushData.BYTE_SIZE);
             new DisplayPushData(hdrEnabled ? 1 : 0, (float) lutSize, gamma, hdrPeakNits,
-                    lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength).write(push);
+                    lookEnabled ? 1 : 0, (float) lookLutSize, bloomStrength,
+                    contrast, vibrance, sharpness).write(push);
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
             VK10.vkCmdDispatch(cmd, (width + 15) / 16, (height + 15) / 16, 1);
         }

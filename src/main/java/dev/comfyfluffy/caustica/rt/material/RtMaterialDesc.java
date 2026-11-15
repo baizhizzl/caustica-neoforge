@@ -37,6 +37,8 @@ public record RtMaterialDesc(
     public record EmissionSummary(float averageR, float averageG, float averageB,
                                   float integratedLuminance, float coverage) {
         public static final EmissionSummary NONE = new EmissionSummary(0, 0, 0, 0, 0);
+        /** Whole-surface uniform emitter with no authored mask. */
+        public static final EmissionSummary UNIFORM = new EmissionSummary(1, 1, 1, 1, 1);
 
         public boolean emissive() {
             return integratedLuminance > 0.0f && coverage > 0.0f;

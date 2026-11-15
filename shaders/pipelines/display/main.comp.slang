@@ -1,7 +1,8 @@
 // Maps the display-res scene-linear ACEScg RT image to sRGB SDR and, when enabled, PQ/BT.2020 HDR,
 // via baked ACES 2.0 display-transform LUTs (see tools/bake_display_lut.py). Tonemap seam: the path tracer and DLSS-RR use scene-linear
-// ACEScg; exposure is applied from the compositor-owned 1x1 image right here, followed by the selected
-// scene-referred ACES look (LMT), then the shared ACES 2.0 output transform for each display.
+// ACEScg; exposure is applied from the compositor-owned 1x1 image right here, followed by contrast-adaptive
+// luminance sharpening, bloom, the scene-referred ACES look (LMT), perceptual contrast/vibrance grading,
+// and the shared ACES 2.0 output transform for each display.
 
 import display_common;
 import bindings;
@@ -13,6 +14,8 @@ import bindings;
 // drift the LUT fetch reads the wrong shelf of the LUT everywhere, silently.
 static const float LUT_SHAPER_LO_STOPS = -12.0;
 static const float LUT_SHAPER_HI_STOPS = 12.0;
+static const float3 ACESCG_LUMA = float3(0.27222872, 0.67408177, 0.05368952);
+static const float MID_GREY_ACESCG = 0.18;
 
 float3 shaperEncode(float3 linearColor) {
     float3 stops = log2(max(linearColor, float3(1.0e-6)));
@@ -47,6 +50,116 @@ float3 applyLook(float3 exposedAcesCg) {
 float3 sampleBloom(int2 outputPixel, uint outputWidth, uint outputHeight) {
     float2 uv = (float2(outputPixel) + 0.5) / float2(outputWidth, outputHeight);
     return bloomImage.SampleLevel(uv, 0.0).rgb;
+}
+
+float perceptualLuma(float3 exposedColor) {
+    return sqrt(max(dot(exposedColor, ACESCG_LUMA), 0.0));
+}
+
+// False for +/-Inf AND for NaN: an ordered float comparison against NaN is false, and the magnitude
+// bound rejects infinities. (Do not use max() here, which may return the finite operand for a NaN pair.)
+bool finiteColor(float3 v) {
+    return abs(v.x) < 1.0e30 && abs(v.y) < 1.0e30 && abs(v.z) < 1.0e30;
+}
+
+// Contrast-adaptive 5-tap cross sharpening in perceptual sqrt-luminance space. Strictly clamped to the
+// 5-tap neighbourhood min/max so DLSS-RR upscaled block textures gain crisp micro-detail with zero
+// specular ringing or dark halos, while scaling RGB uniformly to preserve exact ACEScg chromaticity.
+float3 sharpenExposed(int2 pix, int maxX, int maxY, float3 centerExposed, float exposure) {
+    float strength = clamp(pc.sharpness, 0.0, 1.0);
+    if (strength <= 1.0e-4) {
+        return centerExposed;
+    }
+    if (!finiteColor(centerExposed)) {
+        return float3(0.0);
+    }
+    float lC = perceptualLuma(centerExposed);
+    if (lC <= 1.0e-5) {
+        return centerExposed;
+    }
+    float3 rawN = rtImage[int2(pix.x, max(pix.y - 1, 0))].rgb * exposure;
+    float3 rawS = rtImage[int2(pix.x, min(pix.y + 1, maxY))].rgb * exposure;
+    float3 rawW = rtImage[int2(max(pix.x - 1, 0), pix.y)].rgb * exposure;
+    float3 rawE = rtImage[int2(min(pix.x + 1, maxX), pix.y)].rgb * exposure;
+    // One NaN/Inf neighbour must not be smeared into a cross-shaped artefact. Fall back to the finite
+    // centre colour (or black if the centre itself is bad) instead of letting max() propagate garbage.
+    if (!finiteColor(rawN) || !finiteColor(rawS) || !finiteColor(rawW) || !finiteColor(rawE)) {
+        return centerExposed;
+    }
+    float3 cN = max(rawN, float3(0.0));
+    float3 cS = max(rawS, float3(0.0));
+    float3 cW = max(rawW, float3(0.0));
+    float3 cE = max(rawE, float3(0.0));
+
+    float lN = perceptualLuma(cN);
+    float lS = perceptualLuma(cS);
+    float lW = perceptualLuma(cW);
+    float lE = perceptualLuma(cE);
+
+    float minL = min(lC, min(min(lN, lS), min(lW, lE)));
+    float maxL = max(lC, max(max(lN, lS), max(lW, lE)));
+    // Compress into [0,1] shoulder so HDR highlights taper the negative lobe automatically.
+    float normMax = maxL / (1.0 + maxL);
+    float normMin = minL / (1.0 + maxL);
+    float amp = sqrt(clamp(min(normMin, max(1.0 - normMax, 0.0)) / max(normMax, 1.0e-4), 0.0, 1.0));
+    float peak = -1.0 / lerp(8.0, 4.5, strength);
+    float wTap = amp * peak;
+    float denom = max(1.0 + 4.0 * wTap, 1.0e-4);
+    float sharpL = clamp((lC + wTap * (lN + lS + lW + lE)) / denom, minL, maxL);
+    float ratio = (sharpL * sharpL) / max(lC * lC, 1.0e-8);
+    return centerExposed * ratio;
+}
+
+// Scene-referred filmic log-contrast (pivoted at 18% mid-grey with soft highlight shoulder) and
+// luminance-preserving perceptual vibrance, shared identically by SDR and HDR10 PQ output transforms.
+float3 gradeSceneAcesCg(float3 color) {
+    bool neutralContrast = abs(pc.contrast - 1.0) <= 1.0e-4;
+    bool neutralVibrance = abs(pc.vibrance - 1.0) <= 1.0e-4;
+    // Strict pass-through at neutral defaults: ACEScg wide-gamut channels may be negative and the ACES 2.0
+    // LUT is specified on those unclipped values. Clamping here was silently destroying wide-gamut data.
+    if (neutralContrast && neutralVibrance) {
+        return color;
+    }
+    if (!finiteColor(color)) {
+        return float3(0.0);
+    }
+    float3 graded = max(color, float3(0.0));
+    if (!neutralContrast) {
+        float y = dot(graded, ACESCG_LUMA);
+        if (y > 1.0e-6) {
+            float stops = log2(y / MID_GREY_ACESCG);
+            float delta = (pc.contrast - 1.0) / (1.0 + 0.06 * stops * stops);
+            float yAdjusted = MID_GREY_ACESCG * exp2(stops * (1.0 + delta));
+            graded *= yAdjusted / y;
+            if (!finiteColor(graded)) {
+                return float3(0.0);
+            }
+        }
+    }
+    if (!neutralVibrance) {
+        float luma = dot(graded, ACESCG_LUMA);
+        float maxC = max(graded.r, max(graded.g, graded.b));
+        float minC = min(graded.r, min(graded.g, graded.b));
+        float sat = (maxC - minC) / max(maxC, 1.0e-4);
+        float boost = pc.vibrance >= 1.0
+                ? 1.0 + (pc.vibrance - 1.0) * (1.0 - sat * 0.65)
+                : max(pc.vibrance, 0.0);
+        float3 vibr = float3(luma) + (graded - float3(luma)) * boost;
+        // Clamping a negative low channel would move ACEScg luma. When that happens, clamp to zero and
+        // uniformly rescale the remaining non-negative channels so the authored luminance is restored.
+        if (any(vibr < float3(0.0))) {
+            vibr = max(vibr, float3(0.0));
+            float luma2 = dot(vibr, ACESCG_LUMA);
+            if (luma2 > 1.0e-6 && luma > 0.0) {
+                vibr *= luma / luma2;
+            }
+        }
+        graded = vibr;
+        if (!finiteColor(graded)) {
+            return float3(0.0);
+        }
+    }
+    return graded;
 }
 
 // Artistic gamma after the view/display transform. Apply the curve to display luminance and scale
@@ -153,9 +266,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
 
     float4 rt = rtImage[pix];
     float exposure = max(exposureImage[int2(0, 0)], 0.0);
-    float3 exposedAcesCg = max(rt.rgb * exposure, float3(0.0));
+    float3 exposedAcesCg = sharpenExposed(pix, int(w) - 1, int(h) - 1,
+            max(rt.rgb * exposure, float3(0.0)), exposure);
     exposedAcesCg += sampleBloom(pix, w, h) * max(pc.bloomStrength, 0.0);
-    float3 lookedAcesCg = applyLook(exposedAcesCg);
+    float3 lookedAcesCg = gradeSceneAcesCg(applyLook(exposedAcesCg));
     outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
 
     if (pc.hdrEnabled != 0) {

@@ -1,4 +1,4 @@
-// Direct lighting: the emitter light grid, RIS reservoirs, and reservoir shading.
+// Direct lighting: the emitter light grid, RIS reservoirs, dynamic spherical area lights, and shading.
 // INDIRECT PASS ONLY — the primary pass shades nothing. Depends on trace and math.
 
 // contribution weight, M the effective sample count. wSum/phat are streaming scratch (not persisted).
@@ -34,6 +34,32 @@ public Reservoir resEmpty() {
     return r;
 }
 
+public struct DynamicReservoir {
+    public float3 pos;       // sampled point on the spherical emitter disk (rebased world space)
+    public float3 intensity; // linear ACEScg radiant intensity (cd = lm/sr)
+    public float  radius;    // spherical emitter radius (blocks)
+    public uint   shadowMask; // TLAS instance cull mask excluding this emitter's own geometry
+    public float  W;
+    public float  wSum;
+    public float  phat;
+};
+
+// Smallest emitter radius used by both the surface NEE reservoir and the volumetric halo integrator, so
+// their near-field falloff and equi-angular footprint agree instead of sampling different spheres.
+public static const float DYNAMIC_LIGHT_MIN_RADIUS = 0.02;
+
+public DynamicReservoir dynamicResEmpty() {
+    DynamicReservoir r;
+    r.pos = float3(0.0, 0.0, 0.0);
+    r.intensity = float3(0.0, 0.0, 0.0);
+    r.radius = 0.0;
+    r.shadowMask = CULL_SECONDARY;
+    r.W = 0.0;
+    r.wSum = 0.0;
+    r.phat = 0.0;
+    return r;
+}
+
 // Unshadowed contribution of a fixed light sample point at surface (hitPos,n,v); out p-hat = its
 // luminance (the resampling target). Evaluated from the UNBIASED hitPos — SURF_BIAS is applied only to
 // the shadow-ray origin in shadeReservoir, on whichever side the survivor sample lands. Three receiver
@@ -43,7 +69,7 @@ public Reservoir resEmpty() {
 //   - back hemisphere with sss>0 (LabPBR leaves/grass): HG transmission phase — cosT = dot(wi,rd) peaks
 //     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
 public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
-                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough,
+                         float3 v, float3 rd, float3 diffAlb, float3 F0, float rough, float3 msScale,
                          bool twoSided, float sss, out float phat) {
     phat = 0.0;
     float3 toL = sp - hitPos;
@@ -77,7 +103,9 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
             float D = ggxD(ndh, rough);
             float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
             float3 Fs = fresnelSchlick(vdh, F0);
-            brdf += (D * Gs) * Fs / (4.0 * ndv * ndl);
+            // msScale is a loop invariant at this shading point (F0, ndv, rough and the global strength
+            // do not change across RIS candidates), so it is computed once by the caller and passed in.
+            brdf += (D * Gs) * (Fs * msScale) / (4.0 * ndv * ndl);
         }
         contrib = brdf * le * (G * area);
     } else if (sss > 0.0) {
@@ -88,6 +116,153 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
     }
     phat = luminance(contrib);
     return contrib;
+}
+
+// Unshadowed contribution of a spherical dynamic emitter (handheld torch/lantern, dropped glowing item,
+// burning or bioluminescent entity). Non-singular (dist2 + r^2) falloff matches the irradiance of a
+// diffuse sphere of radius r while eliminating near-field 1/r^2 fireflies when a handheld light sits
+// close to cave walls.
+public float3 evalDynamicContrib(float3 sp, float3 intensity, float radius, float maxRange2,
+                                 float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
+                                 float3 F0, float rough, float3 msScale, bool twoSided, float sss,
+                                 out float phat) {
+    phat = 0.0;
+    float3 toL = sp - hitPos;
+    float dist2 = dot(toL, toL);
+    if (dist2 < 1.0e-6 || (maxRange2 > 0.0 && dist2 >= maxRange2)) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float window = maxRange2 > 0.0 ? clamp(1.0 - dist2 / maxRange2, 0.0, 1.0) : 1.0;
+    window *= window;
+    float atten = window / (dist2 + radius * radius);
+    float dist = sqrt(dist2);
+    float3 wi = toL / dist;
+    float ndl = dot(n, wi);
+    if (twoSided) {
+        ndl = abs(ndl);
+    }
+    float3 contrib = float3(0.0, 0.0, 0.0);
+    if (ndl > 0.0) {
+        float3 brdf = diffAlb * INV_PI;
+        if (!twoSided) {
+            float3 h = normalize(wi + v);
+            float ndh = max(0.0, dot(n, h));
+            float ndv = max(1.0e-4, dot(n, v));
+            float vdh = max(0.0, dot(v, h));
+            float D = ggxD(ndh, rough);
+            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+            float3 Fs = fresnelSchlick(vdh, F0);
+            // Same loop-invariant msScale as evalSampleContrib, computed once per shading point.
+            brdf += (D * Gs) * (Fs * msScale) / (4.0 * ndv * ndl);
+        }
+        contrib = brdf * intensity * (ndl * atten);
+    } else if (sss > 0.0) {
+        float backNdl = -ndl;
+        float cosT = dot(wi, rd);
+        contrib = diffAlb * sss * SSS_STRENGTH * hg(cosT, SSS_G) * intensity * (backNdl * atten);
+    }
+    phat = luminance(contrib);
+    return contrib;
+}
+
+// Exact target-proportional streaming reservoir over all active dynamic lights in WorldPush.
+// Selecting one survivor with probability phat_i / sum(phat) and weighting by W = sum(phat) / phat
+// yields an unbiased single-shadow-ray estimator across up to 16 simultaneous dynamic lights, with zero
+// selection variance when a single handheld light is active.
+public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
+                                   float3 F0, float rough, float3 msScale, bool twoSided, float sss,
+                                   inout uint seed) {
+    DynamicReservoir r = dynamicResEmpty();
+    uint count = min(worldPush.dynamicLightCount, 16u);
+    if (count == 0u) {
+        return r;
+    }
+    float maxRange = max(worldPush.visualParams0.y, 0.0);
+    float maxRange2 = maxRange * maxRange;
+    // msScale is a loop invariant at this shading point (F0, ndv, rough and the global strength are
+    // constant across candidates), so the caller computes it once and this loop only reuses it.
+    for (uint i = 0u; i < count; i++) {
+        DynamicLight dl = worldPush.dynamicLights[i];
+        float3 center = dl.posRadius.xyz;
+        float radius = max(dl.posRadius.w, DYNAMIC_LIGHT_MIN_RADIUS);
+        float3 toCenter = center - hitPos;
+        float centerDist2 = dot(toCenter, toCenter);
+        if (maxRange2 > 0.0 && centerDist2 >= maxRange2) {
+            continue;
+        }
+        // Decode the shadow cull mask once per candidate. It is the hardware instance mask that removes
+        // the emitter's own mesh from its shadow rays; no distance trim is applied anywhere.
+        uint shadowMask = clamp(uint(dl.intensityMask.w + 0.5), 1u, 255u);
+        float3 sp = center;
+        if (centerDist2 > 1.0e-4 && radius > 0.0) {
+            float centerDist = sqrt(centerDist2);
+            float3 axis = toCenter / centerDist;
+            float3 tangent;
+            float3 bitangent;
+            orthonormalBasis(axis, tangent, bitangent);
+            float effRadius = min(radius, centerDist * 0.65);
+            // Keep the sampled disk entirely on the receiver's side of the tangent plane. Without this
+            // clamp a sphere centre in front of the surface lets the disk edge cross behind the
+            // surface, flipping ndl in mid-sample and popping the near-field energy. SSS receivers use
+            // the absolute plane distance because their back hemisphere is legitimately lit.
+            float planeDist = (!twoSided && sss <= 0.0) ? dot(toCenter, n) : abs(dot(toCenter, n));
+            effRadius = min(effRadius, max(planeDist * 0.85, 0.0));
+            float2 disk = sampleConcentricDisk(rndf(seed), rndf(seed)) * effRadius;
+            sp = center + disk.x * tangent + disk.y * bitangent;
+        }
+        float phat;
+        evalDynamicContrib(sp, dl.intensityMask.xyz, radius, maxRange2, hitPos, n, v, rd,
+                diffAlb, F0, rough, msScale, twoSided, sss, phat);
+        if (phat <= 0.0) {
+            continue;
+        }
+        r.wSum += phat;
+        if (rndf(seed) * r.wSum < phat) {
+            r.pos = sp;
+            r.intensity = dl.intensityMask.xyz;
+            r.radius = radius;
+            r.shadowMask = shadowMask;
+            r.phat = phat;
+        }
+    }
+    r.W = r.phat > 0.0 ? (r.wSum / r.phat) : 0.0;
+    return r;
+}
+
+public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n, float3 v, float3 rd,
+                                    float3 diffAlb, float3 F0, float rough, float3 msScale,
+                                    bool twoSided, float sss) {
+    if (s.W <= 0.0 || s.phat <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float maxRange = max(worldPush.visualParams0.y, 0.0);
+    float phat;
+    float3 contrib = evalDynamicContrib(s.pos, s.intensity, s.radius, maxRange * maxRange,
+            hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, phat);
+    if (phat <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float side = dot(n, s.pos - hitPos) >= 0.0 ? 1.0 : -1.0;
+    float3 origin = hitPos + side * n * SURF_BIAS;
+    float3 toL = s.pos - origin;
+    float dist = length(toL);
+    if (dist <= 1.0e-5) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float3 dir = toL / dist;
+    // Only 1 mm of numerical tolerance: the ray must reach every wall behind the emitter. The emitter's
+    // own mesh is removed by s.shadowMask (hardware instance culling), never by shortening the ray, so a
+    // torch cannot leak light through a wall simply because the wall sits beyond a "trim" distance.
+    // Close-range points (inside the 1 mm tolerance) are unoccluded by construction: walls are kept at
+    // least 0.05 m away by the collision volume and the emitter itself is culled by the mask.
+    float traceDist = dist - 1.0e-3;
+    float3 vis = float3(1.0, 1.0, 1.0);
+    if (traceDist > RAY_TMIN) {
+        // The water caustic is a directional plane-wave Jacobian and is meaningless for a near-field point
+        // light; shadow transmittance (including the water any-hit tint) is the physically consistent term.
+        vis = visibilityMasked(origin, dir, traceDist, s.shadowMask).transmittance;
+    }
+    return contrib * vis * s.W;
 }
 
 // Resolve the current light-grid cell, including empty and out-of-bounds fallback.
@@ -254,7 +429,7 @@ LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateC
 // the per-vertex seed; the proposal PDF is the published mixture, whichever path produced the record.
 void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell, int3 gridCellCoord,
                    float localProbability, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                   float3 F0, float rough, bool twoSided, float sss, inout uint seed) {
+                   float3 F0, float rough, float3 msScale, bool twoSided, float sss, inout uint seed) {
     // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
     float s = rndf(seed) * 2.0 - 1.0;
     float t = rndf(seed) * 2.0 - 1.0;
@@ -262,7 +437,7 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
             + s * lg.halfU + t * lg.halfV;
     float phat;
     evalSampleContrib(sp, lg.normal, lg.radiance, lg.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, twoSided, sss, phat);
+            diffAlb, F0, rough, msScale, twoSided, sss, phat);
     if (phat <= 0.0) {
         return;
     }
@@ -282,12 +457,14 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones. The caller picks
 // M per vertex: the primary-terminal hit and later indirect hits use separately configured counts.
 public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, bool twoSided, float sss, uint candidateCount,
+                     float rough, float3 msScale, bool twoSided, float sss, uint candidateCount,
                      inout uint seed, inout uint proposalSeed) {
     Reservoir r = resEmpty();
     if (candidateCount == 0u || worldPush.lightCount == 0u || pc.lightBufAddr == 0) {
         return r;
     }
+    // msScale is computed once per shading vertex by the caller: F0, ndv, rough and the global
+    // compensation strength are constant for every candidate in this loop.
     LightGridCell gridCell;
     int3 gridCellCoord;
     float3 gridLookup = hitPos;
@@ -314,7 +491,7 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
             bool useLocal = hasGridCell && globalsAfter == globalsBefore;
             LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal, proposalSeed);
             risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
-                    diffAlb, F0, rough, twoSided, sss, seed);
+                    diffAlb, F0, rough, msScale, twoSided, sss, seed);
         }
     } else {
         for (uint first = 0u; first < candidateCount; first += RIS_LOAD_BATCH) {
@@ -326,7 +503,7 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
                 LightCandidate lg = decodeLightCandidate(batch.lights[k], worldPush.lightRebase.w,
                         pc.lightAliasAddr != 0);
                 risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
-                        diffAlb, F0, rough, twoSided, sss, seed);
+                        diffAlb, F0, rough, msScale, twoSided, sss, seed);
             }
         }
     }
@@ -339,13 +516,13 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
 // the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
 // sample's side of the surface.
 public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, bool twoSided, float sss) {
+                      float3 F0, float rough, float3 msScale, bool twoSided, float sss) {
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
     float phat;
     float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, twoSided, sss, phat);
+            diffAlb, F0, rough, msScale, twoSided, sss, phat);
     if (phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -365,8 +542,3 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
     float3 vis = shadow.transmittance;
     return contrib * vis * s.W;
 }
-
-// TLAS instance-mask bits (set on the Java side, ANDed against these per-ray cull masks):
-//   bit 0 (0x01) — secondary rays: shadows, GI bounces, reflections.
-//   bit 1 (0x02) — the primary camera ray.
-// Terrain / entities / block entities keep 0xFF (both bits). Particles use 0x02: primary-visible

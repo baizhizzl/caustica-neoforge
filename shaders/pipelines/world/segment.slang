@@ -25,11 +25,20 @@ public struct PathSegment {
     public uint seed;
     public int bounce;          // interfaces already consumed, so RR start and the bounce cap stay global
     public bool showCelestial;
+    // True while this segment belongs to the visually-primary chain: the camera prefix and everything
+    // before the first non-dielectric surface. The indirect pass evaluates volumetric scattering only on
+    // such segments, and keeps the flag across water/glass so shafts remain continuous through windows.
+    public bool primaryVisual;
+    // Only the main queue record returned to queue[pixelIndex] by primary.rgen stores the camera→first-
+    // dielectric distance here; the split record and all other continuations store 0. The indirect pass
+    // reconstructs the camera ray and integrates that prefix exactly once, with pixel weight 1.0.
+    public float preInterfaceDist;
 };
 
 public PathSegment makePathSegment(float3 ro, float3 rd, float3 throughput, MediumStack medium,
                             float rayConeWidth, float rayConeSpread, uint seed,
-                            int bounce, bool showCelestial) {
+                            int bounce, bool showCelestial, bool primaryVisual,
+                            float preInterfaceDist) {
     PathSegment s;
     s.ro = ro;
     s.rd = rd;
@@ -40,6 +49,8 @@ public PathSegment makePathSegment(float3 ro, float3 rd, float3 throughput, Medi
     s.seed = seed;
     s.bounce = bounce;
     s.showCelestial = showCelestial;
+    s.primaryVisual = primaryVisual;
+    s.preInterfaceDist = preInterfaceDist;
     return s;
 }
 // field is a uint, so Std430DataLayout gives this an exact 48-byte stride.
@@ -116,10 +127,18 @@ public PackedPathSegment packPathSegment(PathSegment seg, uint nextRecord) {
     p.mediumIors = packHalf2(float2(seg.medium.current.ior, seg.medium.outer.ior));
     p.rayCone = packHalf2(float2(seg.rayConeWidth, seg.rayConeSpread));
     p.seed = seg.seed;
+    // pathFlags stays a single uint, so PackedPathSegment remains exactly 48 bytes:
+    //   bits 0..3  bounce
+    //   bit 4      primaryVisual
+    //   bit 8      showCelestial
+    //   bit 9/10   current/outer medium is water
+    //   bits 16..31 fp16 preInterfaceDist (clamped to the largest finite half)
     p.pathFlags = (uint(seg.bounce) & 15u)
+            | (seg.primaryVisual ? 1u << 4u : 0u)
             | (seg.showCelestial ? 1u << 8u : 0u)
             | (seg.medium.current.water ? 1u << 9u : 0u)
-            | (seg.medium.outer.water ? 1u << 10u : 0u);
+            | (seg.medium.outer.water ? 1u << 10u : 0u)
+            | (f32tof16(clamp(seg.preInterfaceDist, 0.0, 65504.0)) << 16u);
     p.nextRecord = nextRecord;
     return p;
 }
@@ -138,9 +157,11 @@ public PathSegment unpackPathSegment(PackedPathSegment p) {
     medium.current = current;
     medium.outer = outer;
     float2 cone = unpackHalf2(p.rayCone);
+    float preInterfaceDist = f16tof32((p.pathFlags >> 16u) & 0xFFFFu);
     return makePathSegment(p.ro, octDecode(unpackUnorm16x2(p.rd)),
             unpackRgb9e5(p.throughput), medium, cone.x, cone.y, p.seed,
-            int(p.pathFlags & 15u), (p.pathFlags & (1u << 8u)) != 0u);
+            int(p.pathFlags & 15u), (p.pathFlags & (1u << 8u)) != 0u,
+            (p.pathFlags & (1u << 4u)) != 0u, preInterfaceDist);
 }
 
 // Walk only the visually-primary dielectric chain. The terminal non-dielectric/miss trace is repeated

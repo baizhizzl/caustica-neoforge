@@ -71,9 +71,19 @@ public final class RtVideoOptions {
             gamma(),
             spp(),
             maxBounces(),
+            dynamicLights(),
+            dynamicLightIntensity(),
+            volumetricFog(),
+            volumetricIntensity(),
+            waterWaves(),
+            causticsIntensity(),
+            multiscatterGgx(),
+            bloomScale(),
+            contrast(),
+            vibrance(),
+            sharpness(),
             entities(),
             particles(),
-            waterWaves(),
             dlssEnabled(),
             dlssQuality(),
             dlssModel(),
@@ -150,6 +160,71 @@ public final class RtVideoOptions {
             new OptionInstance.IntRange(2, 8),
             Math.clamp(setting.value(), 2, 8),
             setting::set);
+    }
+
+    private static OptionInstance<Boolean> dynamicLights() {
+        return bool("caustica.options.rt.dynamicLights", CausticaConfig.Rt.DynamicLights.ENABLED);
+    }
+
+    private static OptionInstance<Integer> dynamicLightIntensity() {
+        return percentSlider("caustica.options.rt.dynamicLightIntensity",
+                CausticaConfig.Rt.DynamicLights.INTENSITY, 0, 400);
+    }
+
+    private static OptionInstance<Boolean> volumetricFog() {
+        return bool("caustica.options.rt.volumetricFog", CausticaConfig.Rt.Visuals.VOLUMETRIC_FOG);
+    }
+
+    private static OptionInstance<Integer> volumetricIntensity() {
+        return percentSlider("caustica.options.rt.volumetricIntensity",
+                CausticaConfig.Rt.Visuals.VOLUMETRIC_INTENSITY, 0, 300);
+    }
+
+    private static OptionInstance<Integer> causticsIntensity() {
+        return percentSlider("caustica.options.rt.causticsIntensity",
+                CausticaConfig.Rt.Visuals.CAUSTICS_INTENSITY, 0, 300);
+    }
+
+    private static OptionInstance<Boolean> multiscatterGgx() {
+        return bool("caustica.options.rt.multiscatterGgx", CausticaConfig.Rt.Visuals.MULTISCATTER_GGX);
+    }
+
+    private static OptionInstance<Integer> bloomScale() {
+        return percentSlider("caustica.options.rt.bloomScale",
+                CausticaConfig.Rt.Visuals.BLOOM_SCALE, 0, 300);
+    }
+
+    private static OptionInstance<Integer> contrast() {
+        FloatSetting setting = CausticaConfig.Rt.Visuals.CONTRAST;
+        return new OptionInstance<>(
+            "caustica.options.rt.contrast",
+            OptionInstance.cachedConstantTooltip(Component.translatable("caustica.options.rt.contrast.tooltip")),
+            (caption, hundredths) -> Options.genericValueLabel(caption,
+                    Component.literal(String.format(Locale.ROOT, "%.2f", hundredths / 100.0f))),
+            new OptionInstance.IntRange(75, 150),
+            Math.clamp(Math.round(setting.value() * 100.0f), 75, 150),
+            hundredths -> setting.set(hundredths / 100.0f));
+    }
+
+    private static OptionInstance<Integer> vibrance() {
+        return percentSlider("caustica.options.rt.vibrance",
+                CausticaConfig.Rt.Visuals.VIBRANCE, 50, 200);
+    }
+
+    private static OptionInstance<Integer> sharpness() {
+        return percentSlider("caustica.options.rt.sharpness",
+                CausticaConfig.Rt.Visuals.SHARPNESS, 0, 100);
+    }
+
+    private static OptionInstance<Integer> percentSlider(String captionKey, FloatSetting setting,
+                                                         int minPercent, int maxPercent) {
+        return new OptionInstance<>(
+            captionKey,
+            OptionInstance.cachedConstantTooltip(Component.translatable(captionKey + ".tooltip")),
+            (caption, percent) -> Options.genericValueLabel(caption, Component.literal(percent + "%")),
+            new OptionInstance.IntRange(minPercent, maxPercent),
+            Math.clamp(Math.round(setting.value() * 100.0f), minPercent, maxPercent),
+            percent -> setting.set(percent / 100.0f));
     }
 
     private static OptionInstance<Boolean> entities() {

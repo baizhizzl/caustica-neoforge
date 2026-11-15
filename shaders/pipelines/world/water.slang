@@ -1,5 +1,5 @@
 // Water surface: the wave spectrum (with its analytic time derivative), the normal perturbation it
-// drives, and the caustic term that differentiates the same field. Depends on core.
+// drives, and the chromatic wave-refraction caustic term that differentiates the same field. Depends on core.
 
 
 // Animated surface waves — a directional wave spectrum, gradient-only (the surface stays geometrically
@@ -12,7 +12,7 @@
 //    chop), and the largest components' phase is modulated along their crest (chain-ruled into the
 //    gradient) so wavefronts wander instead of ruling straight periodic lines across the sea.
 // The domain is world-anchored (see applyWaterWaves) so the pattern is pinned in world space, and the
-// caustics (waterCaustic) differentiate this same field, so they stay in sync with the visible ripples.
+// caustics differentiate this same field, so they stay in sync with the visible ripples.
 
 import world_common;
 import world_core;
@@ -112,42 +112,64 @@ public float3 applyWaterWaves(float3 nGeo, float2 worldXZ, float t, float footpr
     return nGeo.y >= 0.0 ? up : -up;
 }
 
-// ---- Water caustics. Sunlight refracting through the waved surface converges/diverges before it
-// reaches an underwater receiver; the analytic wave field makes the true focusing factor computable
-// instead of faked with a scrolling texture. Where the shadow ray of an underwater NEE vertex crossed
-// water (returned by visibility() as VisibilityResult.waterHitT), evaluate the horizontal landing
-// position of the refracted sun ray as a function of surface position and finite-difference it. The
-// caustic intensity is the inverse Jacobian determinant of that surface→floor mapping (area compression = brightening, real
-// fold caustics where det → 0). Because this uses the SAME wave field as the visible surface normals,
-// the caustic pattern stays in sync with the ripples, and the per-sample sun-quad jitter (sampleSquare)
-// shifts the pattern per sample → caustics physically blur with depth under DLSS-RR accumulation.
-public static const float CAUSTIC_EPS = 0.25; // finite-difference step (m); also low-passes sub-step wave detail
+// ---- Water caustics. Light refracting through the waved surface converges/diverges before reaching an
+// underwater receiver. Evaluating the wave normal once at each finite-difference corner and refracting
+// with Cauchy's dispersion indices for water (n_R = 1.330, n_G = 1.334, n_B = 1.340) produces spectral
+// RGB caustics with subtle prismatic fringes along bright fold lines at no extra wave-spectrum cost.
+public static const float CAUSTIC_EPS = 0.22; // finite-difference step (m); resolves crisp wave ribbons
 public static const float CAUSTIC_MAX = 6.0;  // focusing clamp: keeps fold-line singularities from becoming fireflies
+public static const float3 WATER_CAUCHY_INV_IOR = float3(1.0 / 1.330, 1.0 / 1.334, 1.0 / 1.340);
 
-// Horizontal landing offset of a refracted sun ray entering the surface at world-stable xz, intersected
-// with the receiver plane h metres below. inc = sunlight travel direction (downward, unit).
-public float2 causticLanding(float2 xz, float t, float3 inc, float h) {
-    float2 g = waterWaveGrad(xz, t);
-    float3 nw = normalize(float3(-g.x, 1.0, -g.y));
-    float3 rdw = refract(inc, nw, 1.0 / WATER_IOR); // air→water: never TIR
+float2 causticLandingNormal(float2 xz, float3 nw, float3 inc, float h, float invIor) {
+    float3 rdw = refract(inc, nw, invIor); // air→water: never TIR
     return xz + rdw.xz * (h / max(-rdw.y, 0.05));
 }
 
-public float waterCaustic(float3 exitPos, float3 lightDir, float waterDist) {
-    // Grazing light: the receiver-plane intersection degenerates and caustics vanish in reality anyway
-    // (long slant paths absorb + the pattern smears out) — fade the effect to neutral 1.0.
+float causticChannelFocus(float2 base, float2 baseX, float2 baseZ,
+                          float3 nw0, float3 nwx, float3 nwz,
+                          float3 inc, float h, float invIor) {
+    float2 p0 = causticLandingNormal(base, nw0, inc, h, invIor);
+    float2 px = causticLandingNormal(baseX, nwx, inc, h, invIor);
+    float2 pz = causticLandingNormal(baseZ, nwz, inc, h, invIor);
+    float det = abs((px.x - p0.x) * (pz.y - p0.y) - (px.y - p0.y) * (pz.x - p0.x));
+    float focus = (CAUSTIC_EPS * CAUSTIC_EPS) / max(det, 1.0e-5);
+    return min(focus, CAUSTIC_MAX);
+}
+
+public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterDist, float intensity) {
+    if (intensity <= 0.0) {
+        return float3(1.0, 1.0, 1.0);
+    }
     float fade = smoothstep(0.06, 0.18, lightDir.y);
-    if (fade <= 0.0) return 1.0;
-    float h = max(waterDist * lightDir.y, 0.05); // vertical depth of the receiver below the exit point
+    if (fade <= 0.0) {
+        return float3(1.0, 1.0, 1.0);
+    }
+    float h = max(waterDist * lightDir.y, 0.05);
     float t = worldPush.waterParams.w;
     float3 inc = -lightDir;
-    float2 base = exitPos.xz + worldPush.waterAnchor.xy;  // world-stable wave domain (same as applyWaterWaves)
-    float2 p0 = causticLanding(base, t, inc, h);
-    float2 px = causticLanding(base + float2(CAUSTIC_EPS, 0.0), t, inc, h);
-    float2 pz = causticLanding(base + float2(0.0, CAUSTIC_EPS), t, inc, h);
-    float det = abs((px.x - p0.x) * (pz.y - p0.y) - (px.y - p0.y) * (pz.x - p0.x));
-    // Flat water ⇒ all landings displace identically ⇒ det = eps² ⇒ focus = 1 (energy-neutral); the
-    // clamp bounds the fold-line spikes whose energy the surrounding darkening already paid for.
-    float focus = (CAUSTIC_EPS * CAUSTIC_EPS) / max(det, 1.0e-5);
-    return lerp(1.0, min(focus, CAUSTIC_MAX), fade);
+    float2 base = exitPos.xz + worldPush.waterAnchor.xy;
+    float2 baseX = base + float2(CAUSTIC_EPS, 0.0);
+    float2 baseZ = base + float2(0.0, CAUSTIC_EPS);
+
+    float2 g0 = waterWaveGrad(base, t);
+    float2 gx = waterWaveGrad(baseX, t);
+    float2 gz = waterWaveGrad(baseZ, t);
+    float3 nw0 = normalize(float3(-g0.x, 1.0, -g0.y));
+    float3 nwx = normalize(float3(-gx.x, 1.0, -gx.y));
+    float3 nwz = normalize(float3(-gz.x, 1.0, -gz.y));
+
+    // fG (the central 1/1.333 refraction focus) is the neutral caustic magnitude for every channel.
+    // Only the red/blue dispersion offsets RELATIVE to it are kept, softened by 0.75 so the fringe lives
+    // in ACEScg AP1 without cross-talking the neutral luminance. With no dispersion (fR == fB == fG) all
+    // three channels are exactly equal; the old bt709ToAcesCg() on the focus vector mixed the channels
+    // as if they were a colour, which shifted hue and desaturated single-channel fold lines.
+    float fG = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, 1.0 / WATER_IOR);
+    float fR = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, WATER_CAUCHY_INV_IOR.x);
+    float fB = causticChannelFocus(base, baseX, baseZ, nw0, nwx, nwz, inc, h, WATER_CAUCHY_INV_IOR.z);
+    float3 focus = float3(fG, fG, fG) + float3(fR - fG, 0.0, fB - fG) * 0.75;
+    // No artificial dark floor; the final clamp is the only firefly ceiling so a high user intensity
+    // cannot bypass CAUSTIC_MAX.
+    float3 shaped = max(float3(1.0) + (focus - float3(1.0)) * intensity, float3(0.0));
+    shaped = min(shaped, float3(CAUSTIC_MAX));
+    return lerp(float3(1.0), shaped, fade);
 }

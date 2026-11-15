@@ -14,6 +14,7 @@ import dev.comfyfluffy.caustica.mixin.CommandEncoderAccessor;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushConstantsData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.BreakEntry;
+import dev.comfyfluffy.caustica.rt.gen.WorldPushData.DynamicLight;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float2;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float3;
 import dev.comfyfluffy.caustica.rt.gen.WorldPushData.Float4;
@@ -52,6 +53,7 @@ import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
 import dev.comfyfluffy.caustica.rt.accel.RtImage;
 import dev.comfyfluffy.caustica.rt.entity.RtEntities;
+import dev.comfyfluffy.caustica.rt.light.RtDynamicLights;
 import dev.comfyfluffy.caustica.rt.entity.RtEntityTextures;
 import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.material.RtEmissionSemantics;
@@ -538,6 +540,7 @@ public final class RtComposite {
         RtDlssRr.INSTANCE.requestHistoryReset();
         RtDlssFg.INSTANCE.requestHistoryReset();
         RtEntities.INSTANCE.clearWorldCaches();
+        RtDynamicLights.INSTANCE.reset();
         resetFailureLatch();
     }
 
@@ -1166,6 +1169,10 @@ public final class RtComposite {
                 // Graphics-timeline completion guards TLAS reuse and retired terrain generations.
                 // Entity BLASes are built inline below and merged into the per-frame TLAS. geomTableAddr
                 // feeds the hit shader entity path (per-prim normal/tint) and motion vectors.
+                // Dynamic lights run first: this frame's selected emitters assign the per-entity hardware
+                // shadow-group exclusion bits and active-emitter flags consumed by the entity TLAS build.
+                DynamicLight[] dynamicLights = RtDynamicLights.INSTANCE.collectFrame(
+                        terrain, camX, camY, camZ, frameCounter);
                 RtEntities.FrameEntities fe = RtEntities.INSTANCE.beginFrame(ctx, terrain.staticInstances(),
                         terrain.blockX, terrain.blockY, terrain.blockZ, camX, camY, camZ, frameProjection, frameViewRotation);
                 frameEntities = fe;
@@ -1174,6 +1181,20 @@ public final class RtComposite {
                 // not a block-atlas sprite — see ModelBakery.BREAKING_LOCATIONS/DESTROY_TYPES), so any newly
                 // resolved slot rides along with the uploadPending() call right below.
                 BreakEntry[] breaking = breakingEntries(terrain);
+                int worldSeaLevel = level != null ? level.getSeaLevel() : 63;
+                float volumetricStrength = CausticaConfig.Rt.Visuals.VOLUMETRIC_FOG.value()
+                        ? CausticaConfig.Rt.Visuals.VOLUMETRIC_INTENSITY.value() : 0.0f;
+                float msGgxStrength = CausticaConfig.Rt.Visuals.MULTISCATTER_GGX.value() ? 1.0f : 0.0f;
+                Float4 visualParams0 = new Float4(
+                        volumetricStrength,
+                        CausticaConfig.Rt.DynamicLights.MAX_DISTANCE.value(),
+                        CausticaConfig.Rt.Visuals.CAUSTICS_INTENSITY.value(),
+                        msGgxStrength);
+                Float4 visualParams1 = new Float4(
+                        CausticaConfig.Rt.Visuals.HAZE_DENSITY.value(),
+                        CausticaConfig.Rt.Visuals.HAZE_HEIGHT_FALLOFF.value(),
+                        (float) (worldSeaLevel - terrain.blockY),
+                        CausticaConfig.Rt.Visuals.UNDERWATER_SCATTER.value());
                 SkyPush sky = skyPush();
                 RtLightSamplePool.Plan lightPlan = RtLightSamplePool.plan(CausticaConfig.Rt.Lights.PRESAMPLING.value(),
                         terrain.lightCount(), CausticaConfig.Rt.Lights.RIS_CANDIDATES.value(),
@@ -1220,7 +1241,11 @@ public final class RtComposite {
                         CausticaConfig.Rt.Lights.indirectRisCandidates(),
                         // Must be the SAME value the exposure resolve divides out this frame (it reads it
                         // from the same RtExposure accessor), or the two stop cancelling.
-                        exposure.preExposure()
+                        exposure.preExposure(),
+                        dynamicLights.length,
+                        dynamicLights,
+                        visualParams0,
+                        visualParams1
                 ).write(push);
                 pushBuf.flush(0L, WORLD_PUSH_SIZE);
                 // Upload any entity textures registered this frame into the bindless set before the trace.
@@ -1330,9 +1355,14 @@ public final class RtComposite {
 
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
+                    float effectiveBloomStrength = (LOOK.bloom().strength()
+                            * CausticaConfig.Rt.Visuals.BLOOM_SCALE.value()) / bloomLevels.length;
                     displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                             sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
-                            true, lookLut.size, LOOK.bloom().strength() / bloomLevels.length);
+                            true, lookLut.size, effectiveBloomStrength,
+                            CausticaConfig.Rt.Visuals.CONTRAST.value(),
+                            CausticaConfig.Rt.Visuals.VIBRANCE.value(),
+                            CausticaConfig.Rt.Visuals.SHARPNESS.value());
                 }
                 hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
                 VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite

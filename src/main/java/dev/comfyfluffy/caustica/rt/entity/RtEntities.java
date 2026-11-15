@@ -22,6 +22,14 @@ import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.Display;
+import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.HumanoidArm;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.entity.decoration.ItemFrame;
+import net.minecraft.world.entity.item.FallingBlockEntity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ClipContext;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
@@ -41,6 +49,7 @@ import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUseWaiter;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
 import dev.comfyfluffy.caustica.rt.accel.RtBuffer;
+import dev.comfyfluffy.caustica.rt.light.RtDynamicLights;
 import dev.comfyfluffy.caustica.rt.pipeline.RtPipeline;
 
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
@@ -86,7 +95,6 @@ public final class RtEntities {
     public static final int PARTICLE_BIT = 0x400000;
     // TLAS visibility-mask bits, ANDed against the per-ray cull mask in raygen shaders. Bit 0 = secondary rays
     // (shadows / GI / reflections, CULL_SECONDARY); bit 1 = the primary camera ray (CULL_PRIMARY).
-    private static final int MASK_SECONDARY = 0x01;
     private static final int MASK_PRIMARY = 0x02;
     /** Default mask: visible to every ray (terrain and ordinary entities use this). */
     private static final int MASK_ALL = 0xFF;
@@ -713,7 +721,9 @@ public final class RtEntities {
                 continue;
             }
             boolean firstPersonSelf = entity == cameraEntity && firstPerson;
-            int mask = firstPersonSelf ? MASK_SECONDARY : MASK_ALL;
+            int baseMask = firstPersonSelf ? MASK_ALL & ~MASK_PRIMARY : MASK_ALL;
+            int excludeBit = RtDynamicLights.INSTANCE.excludeBitForEntity(entity.getId());
+            int mask = excludeBit != 0 ? baseMask & ~excludeBit : baseMask;
             float ix;
             float iy;
             float iz;
@@ -745,6 +755,30 @@ public final class RtEntities {
                     captureNameTag(level, state, ix, iy, iz, rbx, rby, rbz);
                 }
                 collector.begin(capture, true);
+                if (entity instanceof ItemFrame frame) {
+                    collector.setGroundItemContext(frame.getItem());
+                } else if (entity instanceof Display.ItemDisplay itemDisplay) {
+                    Display.ItemDisplay.ItemRenderState itemState = itemDisplay.itemRenderState();
+                    if (itemState != null) {
+                        collector.setGroundItemContext(itemState.itemStack());
+                    }
+                } else if (entity instanceof FallingBlockEntity falling) {
+                    collector.setEntityBlockContext(falling.getBlockState());
+                } else if (entity instanceof Display.BlockDisplay blockDisplay) {
+                    Display.BlockDisplay.BlockRenderState blockState = blockDisplay.blockRenderState();
+                    if (blockState != null) {
+                        collector.setEntityBlockContext(blockState.blockState());
+                    }
+                }
+                if (entity instanceof ItemEntity itemEntity) {
+                    collector.setGroundItemContext(itemEntity.getItem());
+                } else if (entity instanceof LivingEntity living) {
+                    boolean rightMain = living.getMainArm() == HumanoidArm.RIGHT;
+                    ItemStack rightStack = rightMain ? living.getMainHandItem() : living.getOffhandItem();
+                    ItemStack leftStack = rightMain ? living.getOffhandItem() : living.getMainHandItem();
+                    collector.setLivingItemContext(living.getMainHandItem(), rightStack, leftStack,
+                            living.getItemBySlot(EquipmentSlot.HEAD));
+                }
                 resetPoseStack(entityPoseStack);
                 // Capture around the entity anchor. Per-frame placement moves into the TLAS instance,
                 // so ordinary world translation no longer changes the mesh or its float precision.
@@ -1308,7 +1342,7 @@ public final class RtEntities {
         // passes null ⇒ dispAddr 0 ⇒ no MV. The disp buffer is a per-frame transient, so a BE that stops
         // animating reverts to MV 0 next frame.
         long dispAddr = uploadDisp(ctx, build, disp);
-        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris);
+        writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris, false);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
         float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
@@ -1460,7 +1494,8 @@ public final class RtEntities {
         }
         build.lists.usedEntitySlots.add(ea.refSlot);
         writeTableEntry(build, ea.refPrimAddr, ea.refIndexAddr, ea.refUvAddr,
-                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris);
+                motion.dispAddr, motion.rigidX, motion.rigidY, motion.rigidZ, ea.refBucketTris,
+                RtDynamicLights.INSTANCE.isActiveEmitterEntity(entityId));
         build.instances.add(new RtAccel.Instance(placeTransform(localTransform, placeX, placeY, placeZ),
                 ea.refAccel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
@@ -1614,7 +1649,7 @@ public final class RtEntities {
         build.pooledBlas.add(blas);
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), false);
 
         build.instances.add(new RtAccel.Instance(instanceTransform, blas.accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
@@ -1692,7 +1727,8 @@ public final class RtEntities {
         }
 
         writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
-                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris());
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(),
+                RtDynamicLights.INSTANCE.isActiveEmitterEntity(entityId));
         build.instances.add(new RtAccel.Instance(instanceTransform, accel.deviceAddress,
                 instanceBit | (build.count & 0x3FFFFF), mask, RtAccel.SBT_ENTITY_OFFSET));
 
@@ -1755,7 +1791,8 @@ public final class RtEntities {
 
     /** Write one std430 EntityGeom entry, including bases for the two packed BLAS geometries. */
     private void writeTableEntry(FrameBuild build, long primAddr, long idxAddr, long uvAddr, long dispAddr,
-                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris) {
+                                 float rigidX, float rigidY, float rigidZ, int[] bucketTris,
+                                 boolean dynamicEmitter) {
         if (bucketTris == null || bucketTris.length != RtAccel.ENTITY_BUCKETS) {
             throw new IllegalArgumentException("Missing entity BLAS bucket counts");
         }
@@ -1770,7 +1807,9 @@ public final class RtEntities {
         MemoryUtil.memPutFloat(entry + 44, 0f);
         MemoryUtil.memPutInt(entry + 48, 0);
         MemoryUtil.memPutInt(entry + 52, bucketTris[RtAccel.ENTITY_BUCKET_OPAQUE]);
-        MemoryUtil.memPutInt(entry + 56, 0);
+        // reserved.x marks a dynamic-emitter host so the hit shader does not add the entity's own mesh
+        // emission on top of the spherical dynamic light record (double-count guard).
+        MemoryUtil.memPutInt(entry + 56, dynamicEmitter ? 1 : 0);
         MemoryUtil.memPutInt(entry + 60, 0);
     }
 

@@ -44,6 +44,17 @@ public struct BreakEntry {
     public int4 posSlot;
 };
 
+// Per-frame dynamic spherical area light (32 B). Positions are in rebased world space.
+// posRadius.xyz = rebased world centre; posRadius.w = spherical emitter radius (blocks) for
+// contact-hardening soft shadows and non-singular near-field falloff. intensityMask.xyz holds linear
+// ACEScg radiant intensity (cd = lm/sr); intensityMask.w carries the uint shadow cullMask encoded as a
+// float (1..255). Culling the emitter's own instance is a hardware mask, not a distance trim, so a
+// shadow ray can never leak through a wall by stopping short of an occluder.
+public struct DynamicLight {
+    public float4 posRadius;      // xyz = rebased world pos, w = spherical emitter radius (blocks)
+    public float4 intensityMask;  // xyz = linear ACEScg intensity (cd), w = uint shadow cullMask encoded as float
+};
+
 // Per-frame world data, read through a 64-bit device address. WorldPushData.java is generated from this
 // reflected type, including its serializer, byte size, vector/matrix types, and fixed-array capacities.
 public struct WorldPush {
@@ -92,6 +103,14 @@ public struct WorldPush {
     // near mid-grey at any scene brightness; the display pass divides it back out, so the two cancel
     // exactly and this cannot change the image. 1.0 disables it.
     public float    preExposure;
+    public uint     dynamicLightCount;
+    public DynamicLight dynamicLights[16];
+    // x = volumetric fog intensity (0 = disabled), y = dynamic light max range (blocks),
+    // z = water caustics intensity multiplier, w = multi-scatter GGX energy compensation (0..1).
+    public float4   visualParams0;
+    // x = atmospheric haze base extinction (1/blocks), y = haze height falloff (1/blocks),
+    // z = sea level Y in rebased world space, w = underwater volumetric scatter strength.
+    public float4   visualParams1;
 };
 
 // 32-byte hot area-light record. Linear ACEScg radiance uses packed R11G11B10; the
@@ -199,7 +218,7 @@ public struct Payload {
     public float  hitT;        // >= 0 on hit, < 0 on miss.
     public half3  motionPrev;  // per-vertex world displacement since last frame.
     public half3  f0;          // specular F0.
-    public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source.
+    public uint   flags;       // bits 0..1 material, bit 2 celestial, bit 3 water-entering, bits 4..6 emission source, bit 7 emitter-in-list, bit 8 dynamic-emitter.
     public uint   roughMetal;  // packHalf2x16(roughness, metalness)
     public uint   emissionSss; // packHalf2x16(emission, sss)
     public uint   iorTransmission; // packHalf2x16(IOR, transmission factor)
@@ -210,6 +229,11 @@ public static const uint PAYLOAD_SHOW_CELESTIAL = 4u;
 // Set by world.rchit on a terrain hit whose prim carries TERRAIN_PRIM_IN_LIGHT_BUFFER: this emitter is
 // RIS-sampled, so raygen gates its direct-hit emission on diffuse continuation rays (no double count).
 public static const uint PAYLOAD_EMITTER_IN_LIST = 128u;
+// Set by world.rchit on an entity hit whose EntityGeom.reserved.x bit 0 is set (the CPU tagged this
+// entity as a dynamic emitter for the current frame). Raygen uses it with the previous bounce's dynamic-
+// NEE state to suppress the mesh's own emission exactly when that emission was already sampled as a
+// light by risDynamic, so a glowing torch/lantern entity is neither double counted nor extinguished.
+public static const uint PAYLOAD_DYNAMIC_EMITTER = 256u;
 // Set by world.rchit on any dielectric hit (water or glass/ice): true when the incoming ray travels
 // against the prim's outward face normal (entering the volume), false when it exits. Derived from face
 // orientation rather than toggled, so a stray or missing face cannot corrupt the medium for the rest of
@@ -303,12 +327,15 @@ public struct EntityGeom {
     public uint64_t dispAddr;
     public float4 rigidDisp;
     public uint triBase[2];
-    public uint2 reserved;
+    public uint2 reserved;           // x bit 0 = ENTITY_FLAG_DYNAMIC_EMITTER
 };
 
 // TLAS instance-custom-index encoding + terrain geometry buckets (shared by rahit/rchit).
 public static const uint ENTITY_BIT = 0x800000u;
 public static const uint PARTICLE_BIT = 0x400000u; // particles share the entity cutout path
+// EntityGeom.reserved.x bit 0: the CPU tagged this entity as a dynamic light emitter for the current
+// frame (it also appears in WorldPush.dynamicLights). world.rchit promotes it to PAYLOAD_DYNAMIC_EMITTER.
+public static const uint ENTITY_FLAG_DYNAMIC_EMITTER = 1u;
 public static const uint IDX_MASK = 0x3FFFFFu;     // low 22 bits = geom-table index
 public static const uint BUCKET_CUTOUT = 1u;
 public static const uint BUCKET_TRANSLUCENT = 2u;

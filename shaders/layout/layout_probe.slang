@@ -32,6 +32,10 @@ void main(uint3 id : SV_DispatchThreadID) {
     // Keep the parameter reachable without requiring a writable output resource.
     if (id.x == 0xFFFFFFFFu) {
         float sink = worldPushLayoutProbe[0].values[0].invViewProj[0][0]
+                + worldPushLayoutProbe[0].values[0].dynamicLights[0].posRadius.x
+                + worldPushLayoutProbe[0].values[0].dynamicLights[0].intensityMask.x
+                + worldPushLayoutProbe[0].values[0].visualParams0.x
+                + worldPushLayoutProbe[0].values[0].visualParams1.x
                 + materialHeaderLayoutProbe[0].values[0].params.x
                 + exposureStateLayoutProbe[0].values[0].previous
                 + float(pushConstantsLayoutProbe.frameIndex)
@@ -69,7 +73,8 @@ void probeExposureResolvePush(uint3 id : SV_DispatchThreadID) {
 [numthreads(1, 1, 1)]
 void probeDisplayPush(uint3 id : SV_DispatchThreadID) {
     if (id.x == 0xFFFFFFFFu) {
-        float sink = float(displayPushProbe.hdrEnabled) + displayPushProbe.hdrPeakNits;
+        float sink = float(displayPushProbe.hdrEnabled) + displayPushProbe.hdrPeakNits
+                + displayPushProbe.contrast + displayPushProbe.vibrance + displayPushProbe.sharpness;
     }
 }
 

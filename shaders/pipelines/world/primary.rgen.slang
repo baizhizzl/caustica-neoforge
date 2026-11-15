@@ -42,7 +42,7 @@ public PathSegment tracePrimary(PathSegment seg,
         int bounce = seg.bounce;
         PathSegment terminal = makePathSegment(ro, rd, throughput, medium,
                                                rayConeWidth, rayConeSpread, seed, bounce,
-                                               showCelestial);
+                                               showCelestial, true, 0.0);
         traceRadiance(CULL_PRIMARY, ro, 0.0, rd, 10000.0,
                       showCelestial, rayConeWidth, rayConeSpread);
 
@@ -88,8 +88,15 @@ public PathSegment tracePrimary(PathSegment seg,
                     float3 v = -rd;
                     gv_albedo = diffAlb;
                     gv_rough = rough;
+                    // Keep the DLSS-RR specular guide identical to what the image actually renders: the
+                    // multiple-scattering compensation is part of the shaded specular response, so the
+                    // guide must carry the same scale (Turquin factor) inside the same [0,1] clamp.
+                    float specNoV = max(1.0e-4, dot(n, v));
+                    float3 specGuide = rrSpecularAlbedo(payload.f0, rough, specNoV)
+                            * ggxMultiScatterScale(payload.f0, specNoV, rough,
+                                    worldPush.visualParams0.w);
                     gv_spec = makeSpecSurface(gv_hitCamRel, n, float3(payload.motionPrev), rough,
-                                              rrSpecularAlbedo(payload.f0, rough, dot(n, v)));
+                                              clamp(specGuide, float3(0.0), float3(1.0)));
                 }
             }
 
@@ -100,6 +107,22 @@ public PathSegment tracePrimary(PathSegment seg,
         // the record for the next trace. The terminal hit above is deliberately not consumed here.
         if (any(medium.current.extinction > 0.0)) {
             throughput *= exp(-medium.current.extinction * payload.hitT);
+        }
+        float preDist = max(payload.hitT, 0.0);
+        // Fold the pre-interface AIR haze extinction into the shared throughput before the Fresnel split.
+        // Both the reflected and deferred leaves then carry the exact same prefix attenuation, and
+        // indirect.rgen adds only the prefix's in-scattered radiance (once, with pixel weight 1.0). This is
+        // what makes the two leaves agree at the interface without any branch-specific bookkeeping.
+        // Only true air (not water, and not a non-water dielectric volume such as tinted glass or ice)
+        // contributes: such a solid already carries its own Beer-Lambert absorption along the segment, so
+        // adding air haze inside it would scatter light in a vacuum and attenuate it twice.
+        bool isAir = isAirMedium(medium.current);
+        if (isAir) {
+            float airBaseSigma = max(worldPush.visualParams1.x, 0.0)
+                    * max(worldPush.visualParams0.x, 0.0);
+            throughput *= exp(-airHazeOpticalDepth(ro, rd,
+                    min(preDist, MAX_AIR_VOLUMETRIC_DIST), airBaseSigma,
+                    worldPush.visualParams1.y, worldPush.visualParams1.z));
         }
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0),
                            RAY_CONE_MIN_WIDTH);
@@ -172,11 +195,13 @@ public PathSegment tracePrimary(PathSegment seg,
                 mediumPop(transmittedMedium);
             }
             float3 deferredDir = normalize(transmittedDir);
+            // The split record must NOT repeat the prefix volume: the main record below is the one that
+            // carries preInterfaceDist and integrates [camera, interface] exactly once for the pixel.
             PathSegment deferred = makePathSegment(
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
                     deferredDir, throughput * (1.0 - F), transmittedMedium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, true, 0.0);
             queue[splitRecord] = packPathSegment(deferred, PATH_NO_NEXT);
             nextRecord = splitRecord;
             float3 reflectedDir = reflect(rd, n);
@@ -184,7 +209,7 @@ public PathSegment tracePrimary(PathSegment seg,
                     offsetSurfaceOrigin(hitPos, geometricNormal, reflectedDir, SURF_BIAS),
                     reflectedDir, throughput * F, medium,
                     rayConeWidth, rayConeSpread, seed ^ 0xa511e9b3u, bounce + 1,
-                    true);
+                    true, true, preDist);
             return reflected;
         }
 
@@ -196,7 +221,7 @@ public PathSegment tracePrimary(PathSegment seg,
                     offsetSurfaceOrigin(hitPos, geometricNormal, reflectedDir, SURF_BIAS),
                     reflectedDir, throughput * F, medium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, true, preDist);
         } else {
             float3 deferredDir = normalize(transmittedDir);
             if (entering) {
@@ -208,7 +233,7 @@ public PathSegment tracePrimary(PathSegment seg,
                     offsetSurfaceOrigin(hitPos, geometricNormal, deferredDir, transmitBias),
                     deferredDir, throughput * (1.0 - F), medium,
                     rayConeWidth, rayConeSpread, seed, bounce + 1,
-                    true);
+                    true, true, preDist);
         }
         return continuation;
     }
@@ -242,7 +267,7 @@ void main() {
 
     seed = pcg(seed);
     PathSegment current = makePathSegment(origin, dir, float3(1.0, 1.0, 1.0),
-            cameraMedium, 0.0, rayConeSpread, seed, 0, true);
+            cameraMedium, 0.0, rayConeSpread, seed, 0, true, true, 0.0);
     uint nextRecord;
     PathSegment terminal = tracePrimary(
             current, queue, splitRecord, nextRecord);

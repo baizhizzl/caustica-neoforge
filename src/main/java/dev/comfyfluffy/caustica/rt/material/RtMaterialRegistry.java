@@ -99,8 +99,10 @@ public final class RtMaterialRegistry {
     private Map<Identifier, Integer> entityTextureIds = Map.of();
     private Map<Identifier, EntityTemplate> entityTemplates = Map.of();
     private final Map<EntitySpriteKey, Integer> entitySpriteIds = new HashMap<>();
+    private final Map<EntitySpriteKey, Integer> emissiveEntitySpriteIds = new HashMap<>();
     private final Map<Integer, Integer> stochasticAlphaIds = new HashMap<>();
     private int entityFallbackId;
+    private int entityEmissiveFallbackId;
     private int nextDynamicId;
     private int tableCapacity;
 
@@ -166,6 +168,11 @@ public final class RtMaterialRegistry {
                 albedoGridFor(sprites, spriteStats, "block/lava_still"));
         int nextEntityFallbackId = headers.size();
         add(headers, descriptions, grids, compileEntityDesc(0, true, RtMaterialDesc.EmissionSummary.NONE),
+                transparentWhiteAverage(), fallbackEntry, null);
+        // Neutral but uniformly emissive fallback for an entity/item sprite whose own template carries no
+        // LabPBR emission mask. Runtime atlas headers need a live emissive material without a compiled mask.
+        int nextEntityEmissiveFallbackId = headers.size();
+        add(headers, descriptions, grids, compileEntityEmissiveDesc(),
                 transparentWhiteAverage(), fallbackEntry, null);
 
         IdentityHashMap<TextureAtlasSprite, int[]> ids = new IdentityHashMap<>();
@@ -254,9 +261,10 @@ public final class RtMaterialRegistry {
 
         // Full entity textures have fixed [0,1] UVs and receive IDs above. Atlas sprites need a second,
         // append-only header with the actual stitched atlas rectangle, which is only known when the sprite
-        // first appears in capture. Reserve room for atlas and alpha-mode variants.
+        // first appears in capture. Reserve room for atlas and alpha-mode variants, including the
+        // emissive x stochasticAlpha combinations, with fixed headroom for large modpacks.
         int dynamicReserve = Math.max(64, Math.addExact(sprites.size(),
-                Math.multiplyExact(entityResources.size(), 3)));
+                Math.addExact(Math.multiplyExact(entityResources.size(), 6), 64)));
         int recordCapacity = Math.addExact(headers.size(), dynamicReserve);
         long byteSize = Math.multiplyExact((long) recordCapacity, MaterialHeaderData.BYTE_SIZE);
         if (byteSize > Integer.MAX_VALUE) {
@@ -298,8 +306,10 @@ public final class RtMaterialRegistry {
         entityTextureIds = Collections.unmodifiableMap(nextEntityTextureIds);
         entityTemplates = Collections.unmodifiableMap(nextEntityTemplates);
         entitySpriteIds.clear();
+        emissiveEntitySpriteIds.clear();
         stochasticAlphaIds.clear();
         entityFallbackId = nextEntityFallbackId;
+        entityEmissiveFallbackId = nextEntityEmissiveFallbackId;
         nextDynamicId = headers.size();
         tableCapacity = recordCapacity;
         table = nextTable;
@@ -349,7 +359,17 @@ public final class RtMaterialRegistry {
     }
 
     public int entityFallbackId(boolean stochasticAlpha) {
-        return stochasticAlpha ? withStochasticAlpha(entityFallbackId) : entityFallbackId;
+        return entityFallbackId(stochasticAlpha, false);
+    }
+
+    /**
+     * Neutral entity fallback, optionally with whole-surface uniform emission. Emissive entity geometry
+     * (held/dropped glowing items, luminous display blocks) needs a material whose header carries the
+     * look-package emission baseline even when the sprite has no authored emission mask.
+     */
+    public int entityFallbackId(boolean stochasticAlpha, boolean emitting) {
+        int id = emitting ? entityEmissiveFallbackId : entityFallbackId;
+        return stochasticAlpha ? withStochasticAlpha(id) : id;
     }
 
     /** Return an append-only material-instance variant with stochastic coverage enabled. */
@@ -391,17 +411,45 @@ public final class RtMaterialRegistry {
      * atlas-to-local UV transform is appended now. Existing IDs and page contents are never modified.
      */
     public synchronized int resolveEntitySprite(TextureAtlasSprite sprite, boolean stochasticAlpha) {
-        if (sprite == null) return entityFallbackId(stochasticAlpha);
+        return resolveEntitySprite(sprite, stochasticAlpha, false);
+    }
+
+    /**
+     * Resolve a block-entity atlas sprite, optionally overriding its emission source. Emitting sprites use
+     * a separate cache: a template with an authored {@code LAB_PBR} emission mask keeps it, while an
+     * un-authored template gets a uniform state-emission header at the look-package baseline.
+     */
+    public synchronized int resolveEntitySprite(TextureAtlasSprite sprite, boolean stochasticAlpha,
+                                                boolean emitting) {
+        if (sprite == null) return entityFallbackId(stochasticAlpha, emitting);
         EntitySpriteKey key = EntitySpriteKey.of(sprite);
-        Integer current = entitySpriteIds.get(key);
+        if (!emitting) {
+            Integer current = entitySpriteIds.get(key);
+            if (current != null) return stochasticAlpha ? withStochasticAlpha(current) : current;
+            return appendEntitySpriteHeader(key, sprite, stochasticAlpha, false);
+        }
+        Integer current = emissiveEntitySpriteIds.get(key);
         if (current != null) return stochasticAlpha ? withStochasticAlpha(current) : current;
+        return appendEntitySpriteHeader(key, sprite, stochasticAlpha, true);
+    }
+
+    private int appendEntitySpriteHeader(EntitySpriteKey key, TextureAtlasSprite sprite,
+                                         boolean stochasticAlpha, boolean emitting) {
         EntityTemplate template = entityTemplates.get(key.name());
-        if (template == null) return entityFallbackId(stochasticAlpha);
+        if (template == null) return entityFallbackId(stochasticAlpha, emitting);
+        if (emitting && (template.desc().features() & FEATURE_SPEC) != 0) {
+            // Authored LabPBR emission already owns the surface; reuse the ordinary template header.
+            Integer authored = entitySpriteIds.get(key);
+            int id = authored != null ? authored : appendEntitySpriteHeader(key, sprite, false, false);
+            emissiveEntitySpriteIds.put(key, id);
+            return stochasticAlpha ? withStochasticAlpha(id) : id;
+        }
         if (nextDynamicId >= tableCapacity || table == null) {
             throw new IllegalStateException("RT entity material header reserve exhausted");
         }
         int id = nextDynamicId++;
-        MaterialHeaderData header = header(template.desc(), transparentWhiteAverage(), template.entry(),
+        RtMaterialDesc desc = emitting ? compileEntityEmissiveDesc(template.desc()) : template.desc();
+        MaterialHeaderData header = header(desc, transparentWhiteAverage(), template.entry(),
                 sprite.getU0(), sprite.getV0(),
                 RtBlockMaterials.inverseExtent(sprite.getU1() - sprite.getU0()),
                 RtBlockMaterials.inverseExtent(sprite.getV1() - sprite.getV0()));
@@ -410,7 +458,7 @@ public final class RtMaterialRegistry {
                 .order(ByteOrder.nativeOrder());
         header.write(target);
         table.flush(offset, MaterialHeaderData.BYTE_SIZE);
-        entitySpriteIds.put(key, id);
+        (emitting ? emissiveEntitySpriteIds : entitySpriteIds).put(key, id);
         return stochasticAlpha ? withStochasticAlpha(id) : id;
     }
 
@@ -420,8 +468,10 @@ public final class RtMaterialRegistry {
         entityTextureIds = Map.of();
         entityTemplates = Map.of();
         entitySpriteIds.clear();
+        emissiveEntitySpriteIds.clear();
         stochasticAlphaIds.clear();
         entityFallbackId = 0;
+        entityEmissiveFallbackId = 0;
         nextDynamicId = 0;
         tableCapacity = 0;
         if (table != null) {
@@ -496,6 +546,19 @@ public final class RtMaterialRegistry {
                 ? 0.0f : defaultEmissionLuminanceCdM2();
         return new RtMaterialDesc(MODEL_OPAQUE, source, features, RtMaterials.ENTITY_ROUGH, 0.0f,
                 1.0f, 0.0f, emissionSource, emissionStrength, emissionSummary);
+    }
+
+    /** Neutral entity material whose whole surface emits at the look-package baseline. */
+    private static RtMaterialDesc compileEntityEmissiveDesc(RtMaterialDesc base) {
+        int features = base.features() & ~FEATURE_HEURISTIC_EMISSION;
+        return new RtMaterialDesc(base.model(), base.source(), features, base.roughness(), base.metalness(),
+                base.ior(), base.transmission(),
+                RtMaterialDesc.EmissionSource.STATE_UNIFORM, defaultEmissionLuminanceCdM2(),
+                RtMaterialDesc.EmissionSummary.UNIFORM);
+    }
+
+    private static RtMaterialDesc compileEntityEmissiveDesc() {
+        return compileEntityEmissiveDesc(compileEntityDesc(0, true, RtMaterialDesc.EmissionSummary.NONE));
     }
 
     private static void add(List<MaterialHeaderData> headers, List<RtMaterialDesc> descriptions,
@@ -683,8 +746,16 @@ public final class RtMaterialRegistry {
         }
 
         public int resolve(TextureAtlasSprite sprite, BlockState state, boolean glass) {
+            return resolve(sprite, state, glass, state != null && state.getLightEmission() > 0);
+        }
+
+        /**
+         * Resolve with an explicit emitting bit. Context-dependent emission (NeoForge
+         * {@code getLightEmission(view, pos)}, held-item context) can exceed the default state emission;
+         * callers pass {@code true} so the material header actually carries the emission variant.
+         */
+        public int resolve(TextureAtlasSprite sprite, BlockState state, boolean glass, boolean emitting) {
             RtMaterials.Profile profile = RtMaterials.profile(state);
-            boolean emitting = state != null && state.getLightEmission() > 0;
             int variant = index(profile, glass, emitting);
             // Only block-conditional rules remain here; sprite-wide overrides were compiled into `ids`.
             for (CompiledOverride override : overrides) {

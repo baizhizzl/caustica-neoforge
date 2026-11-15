@@ -77,6 +77,9 @@ public struct DisplayPush {
     // SUM of every band, so RtComposite folds the 1/levelCount normalisation into this value: the authored
     // look-package strength then means the same thing whichever level count the resolution supports.
     public float bloomStrength;
+    public float contrast;      // scene-referred log-space contrast around mid-grey (1.0 = neutral)
+    public float vibrance;      // luminance-preserving perceptual vibrance (1.0 = neutral)
+    public float sharpness;     // contrast-adaptive luminance sharpening (0.0 = off .. 1.0 = max)
 };
 
 public struct BloomPush {

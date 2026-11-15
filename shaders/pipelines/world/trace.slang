@@ -96,7 +96,7 @@ public Payload makeShadowPayload() {
     return shadowPayload;
 }
 
-public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
+public VisibilityResult visibilityMasked(float3 origin, float3 dir, float tmax, uint cullMask) {
     // Vulkan requires an identical payload structure for every stage reachable by this trace. The shadow
     // path uses only the albedo view as accumulated transmittance and hitT as the nearest-water crossing.
     Payload shadowPayload = makeShadowPayload();
@@ -104,15 +104,24 @@ public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
     // and water tint that transmittance and pass through. Solid blocks terminate traversal. There is no
     // closest shader worth executing. The lightweight guide miss clears the flags sentinel so this path
     // needs only ordinary TraceRay and no invocation-reorder capability.
+    //
+    // cullMask is the hardware instance mask for this query. Dynamic-light shadow rays pass the light's
+    // own encoded mask (see DynamicLight.intensityMask.w) so the emitter's mesh is excluded by the TLAS
+    // rather than by shortening tmax — the ray still reaches any wall BEHIND the emitter, which is what
+    // makes a torched wall in the next room receive no light at all instead of a leaking halo.
     TraceRay(topLevelAS,
             RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
-            CULL_SECONDARY, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
+            cullMask, SBT_SHADOW, SBT_STRIDE_BUCKET, MISS_GUIDE,
             makeRay(origin, RAY_TMIN, dir, tmax), shadowPayload);
     VisibilityResult result;
     result.transmittance = shadowPayload.flags == 0u
             ? unpackAlbedo(shadowPayload) : float3(0.0, 0.0, 0.0);
     result.waterHitT = shadowPayload.hitT;
     return result;
+}
+
+public VisibilityResult visibility(float3 origin, float3 dir, float tmax) {
+    return visibilityMasked(origin, dir, tmax, CULL_SECONDARY);
 }
 
 // `valid` is false when the point projects behind the previous camera, where the perspective divide
