@@ -12,9 +12,9 @@ Caustica 是基于 Vulkan 硬件光线追踪的路径追踪渲染模组，用实
 
 ## 功能特性
 
-- **Vulkan 硬件路径追踪**：完整世界路径追踪渲染，包含方块光源直接光照（NEE）、大气散射天空、水体折射与吸收、动态实体渲染
+- **Vulkan 硬件路径追踪**：完整世界路径追踪渲染，包含方块光源直接光照（NEE）、手持与实体动态光源、体积光与水下色散焦散、多重散射高光补偿、大气散射天空、水体折射与吸收、动态实体渲染
 - **NVIDIA DLSS**：支持超分辨率（DLSS SR）、光线重建（Ray Reconstruction，支持 D / E / F 模型切换）与多帧生成（Frame Generation，最高 6x）
-- **色彩与后处理**：ACES 2.0 色调映射、自动曝光、Bloom、SDR 与 HDR10 输出、OpenEXR 截图导出
+- **色彩与后处理**：ACES 2.0 色调映射、自动曝光、胶片对比度 / 自然饱和度 / 自适应锐化、Bloom、SDR 与 HDR10 输出、OpenEXR 截图导出
 - **材质与加速**：支持 LabPBR 材质标准，支持 OMM（不透明度微贴图）与 SER（着色器执行重排序）硬件加速
 - **连接纹理兼容**：接入 NeoForge 模型扩展接口，兼容 [NeoContinuity](https://github.com/Argon4W/NeoContinuity) 等模组
 

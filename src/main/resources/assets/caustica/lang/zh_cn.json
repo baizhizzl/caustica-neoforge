@@ -2,21 +2,51 @@
 	"caustica.options.rt.header": "光线追踪",
 
 	"caustica.options.rt.exposureMode": "曝光",
-	"caustica.options.rt.exposureMode.tooltip": "决定如何将光线追踪图像映射到显示亮度。自动会适应场景亮度；手动会直接使用曝光值。",
+	"caustica.options.rt.exposureMode.tooltip": "决定如何将光线追踪图像映射到显示亮度。自动模式会适应场景亮度；手动模式则直接使用曝光值。",
 	"caustica.options.rt.exposureMode.auto": "自动",
 	"caustica.options.rt.exposureMode.manual": "手动",
 
 	"caustica.options.rt.manualEv": "曝光 EV",
-	"caustica.options.rt.manualEv.tooltip": "以档位为单位的曝光补偿。手动模式下这是固定曝光；自动模式下会让自动曝光更亮或更暗。",
+	"caustica.options.rt.manualEv.tooltip": "以档位（EV）为单位的曝光补偿。手动模式下作为固定曝光值；自动模式下会使自动曝光偏亮或偏暗。",
+
+	"caustica.options.rt.gamma": "伽马",
+	"caustica.options.rt.gamma.tooltip": "输出变换后的亮度伽马调节。低于 1.00 可提亮暗部与中间调，同时保持黑位、白位与色彩比例。",
 
 	"caustica.options.rt.spp": "每像素采样数",
 	"caustica.options.rt.spp.tooltip": "每帧对每个像素进行的路径追踪采样数。数值越高画面越干净，但负载也越高。",
 
 	"caustica.options.rt.maxBounces": "路径反弹",
-	"caustica.options.rt.maxBounces.tooltip": "主命中之后的二级路径追踪反弹最大次数。数值越高能捕捉更多间接光，但成本也越高。",
+	"caustica.options.rt.maxBounces.tooltip": "主命中之后的二级路径追踪反弹最大次数。数值越高能捕捉更多间接光，但开销也越大。",
 
-	"caustica.options.rt.sunSize": "太阳大小",
-	"caustica.options.rt.sunSize.tooltip": "太阳和月亮圆盘的角半径。圆盘越大，投射的半影越柔和。",
+	"caustica.options.rt.dynamicLights": "动态光源",
+	"caustica.options.rt.dynamicLights.tooltip": "为手持火把/灯笼、掉落的发光物品、投射物以及燃烧或发光生物启用硬件光线追踪球面区域光源。",
+
+	"caustica.options.rt.dynamicLightIntensity": "动态光源强度",
+	"caustica.options.rt.dynamicLightIntensity.tooltip": "手持与实体动态光源的光度强度倍率。",
+
+	"caustica.options.rt.volumetricFog": "体积光",
+	"caustica.options.rt.volumetricFog.tooltip": "启用光线追踪大气丁达尔光束、染色玻璃光柱、水下焦散光束以及动态光源雾气光晕。",
+
+	"caustica.options.rt.volumetricIntensity": "体积光强度",
+	"caustica.options.rt.volumetricIntensity.tooltip": "体积光束与动态光源雾气光晕的强度倍率。",
+
+	"caustica.options.rt.causticsIntensity": "水下焦散",
+	"caustica.options.rt.causticsIntensity.tooltip": "水下表面与光束上波浪折射色散焦散的强度。",
+
+	"caustica.options.rt.multiscatterGgx": "多重散射高光",
+	"caustica.options.rt.multiscatterGgx.tooltip": "能量守恒的多重散射 GGX 补偿，使粗糙金属与湿润 PBR 表面保持饱满的光泽与色彩。",
+
+	"caustica.options.rt.bloomScale": "泛光强度",
+	"caustica.options.rt.bloomScale.tooltip": "明亮光源、熔岩与高光反射周围场景线性泛光（Bloom）的强度倍率。",
+
+	"caustica.options.rt.contrast": "胶片对比度",
+	"caustica.options.rt.contrast.tooltip": "ACES 输出映射前以中灰为支点的场景线性对数对比度。",
+
+	"caustica.options.rt.vibrance": "自然饱和度",
+	"caustica.options.rt.vibrance.tooltip": "保持亮度的感知色度增强，在丰富低饱和色彩的同时避免高饱和高光过曝溢出。",
+
+	"caustica.options.rt.sharpness": "自适应锐化",
+	"caustica.options.rt.sharpness.tooltip": "无光晕的对比度自适应亮度锐化，在 DLSS 光线重建后呈现清晰的方块纹理细节。",
 
 	"caustica.options.rt.entities": "光追实体",
 	"caustica.options.rt.entities.tooltip": "将实体和方块实体加入光追场景。",
@@ -31,16 +61,33 @@
 	"caustica.options.rt.waterWaves.tooltip": "对水面法线进行动画处理，以显示移动波浪高光。",
 
 	"caustica.options.rt.hdr": "HDR 输出",
-	"caustica.options.rt.hdr.tooltip": "当显示器支持时，以 HDR (ST.2084/PQ) 而不是 SDR 显示。重启游戏后生效。",
+	"caustica.options.rt.hdr.tooltip": "重建交换链以切换 HDR（ST.2084/PQ）或原生 SDR 输出，在下一帧边界立即生效。",
 
-	"caustica.options.rt.hdrPaperWhite": "HDR 纸白亮度",
-	"caustica.options.rt.hdrPaperWhite.tooltip": "SDR 等效场景亮度在 HDR 显示器上映射到的绝对亮度（nits）。",
+	"caustica.options.rt.hdrUiBrightness": "HDR 界面亮度",
+	"caustica.options.rt.hdrUiBrightness.tooltip": "在 HDR 显示器上为 SDR 界面（UI）分配的绝对亮度（nits）。",
 
 	"caustica.options.rt.hdrPeak": "HDR 峰值亮度",
 	"caustica.options.rt.hdrPeak.tooltip": "高光回落目标的绝对亮度（nits）。请设为显示器的 HDR 峰值亮度。",
 
+	"caustica.options.rt.dlssRr": "DLSS 光线重建",
+	"caustica.options.rt.dlssRr.tooltip": "使用 DLSS Ray Reconstruction 对光追画面进行降噪与超分辨率重建。需要受支持的 NVIDIA RTX 显卡。",
+
+	"caustica.options.rt.dlssModel": "光线重建模型",
+	"caustica.options.rt.dlssModel.tooltip": "自动将遵循 NVIDIA 默认模型；F 选用 RR2 Transformer 模型。更改在下一帧生效；NVIDIA App 覆盖设置可能优先。此项选择的是光线重建（RR）模型，而非超分辨率（SR）L/M 预设。",
+	"caustica.options.rt.dlssModel.0": "自动",
+	"caustica.options.rt.dlssModel.4": "D (Transformer)",
+	"caustica.options.rt.dlssModel.5": "E (Transformer)",
+	"caustica.options.rt.dlssModel.6": "F (RR2)",
+
+	"caustica.options.rt.frameGeneration": "DLSS 帧生成",
+	"caustica.options.rt.frameGeneration.unavailableValue": "不可用",
+	"caustica.options.rt.frameGeneration.tooltip": "在真实渲染帧之间插入生成帧。需要兼容的显卡与驱动。请开启垂直同步（VSync）以确保显示器按序呈现所有生成帧。更改无需重启即可生效。",
+	"caustica.options.rt.frameGeneration.unavailable": "当前显卡、驱动、图形后端或窗口系统不支持帧生成。请查看游戏日志了解 NGX 详情；本次会话中相关选项已禁用。",
+	"caustica.options.rt.frameGenerationMultiplier": "帧生成倍率",
+	"caustica.options.rt.frameGenerationMultiplier.tooltip": "2x 表示每渲染 1 帧额外生成 1 帧；6x 表示每渲染 1 帧额外生成 5 帧。仅提供当前显卡/驱动支持且适配窗口系统的倍率（最高 6x）。此项不会提高游戏的逻辑模拟速率。",
+
 	"caustica.options.rt.dlssQuality": "DLSS 质量",
-	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction 质量模式。较低质量模式会渲染更少像素并进行更激进的升频，以获得更高帧率；较高质量模式会渲染更多像素，以获得更清晰的图像。仅在启用 DLSS Ray Reconstruction 时影响画面。",
+	"caustica.options.rt.dlssQuality.tooltip": "DLSS Ray Reconstruction 质量模式。较低质量模式会渲染更少像素并进行更激进的升频，以获得更高帧率；较高质量模式会渲染更多像素，以获得更清晰的图像。仅在启用 DLSS 光线重建时影响画面。",
 	"caustica.options.rt.dlssQuality.3": "超高性能",
 	"caustica.options.rt.dlssQuality.0": "性能",
 	"caustica.options.rt.dlssQuality.1": "平衡",
@@ -48,7 +95,7 @@
 	"caustica.options.rt.dlssQuality.5": "DLAA",
 
 	"caustica.options.rt.debugView": "调试视图",
-	"caustica.options.rt.debugView.tooltip": "显示光线追踪的中间缓冲区，而不是最终图像。",
+	"caustica.options.rt.debugView.tooltip": "在正常帧渲染完成后查看光线追踪缓冲区与曝光诊断视图。",
 	"caustica.options.rt.debugView.0": "关闭",
 	"caustica.options.rt.debugView.1": "法线",
 	"caustica.options.rt.debugView.2": "反照率",
@@ -57,6 +104,6 @@
 	"caustica.options.rt.debugView.5": "运动",
 	"caustica.options.rt.debugView.6": "高光",
 	"caustica.options.rt.debugView.7": "高光运动",
-	"caustica.options.rt.debugView.8": "发光遮罩",
-	"caustica.options.rt.debugView.9": "发光源"
+	"caustica.options.rt.debugView.8": "曝光伪彩",
+	"caustica.options.rt.debugView.9": "测光权重"
 }
