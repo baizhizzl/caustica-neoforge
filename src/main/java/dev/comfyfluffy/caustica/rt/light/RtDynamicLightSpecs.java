@@ -183,6 +183,16 @@ public final class RtDynamicLightSpecs {
      * Returns {@code null} when the entity itself is non-emissive.
      */
     public static EmitterProfile classifyEntity(String entityPath, boolean onFire, int containedBlockLight) {
+        return classifyEntity(entityPath, onFire, null, containedBlockLight);
+    }
+
+    /**
+     * Classify an intrinsic, block-carrying, or burning entity emitter. When {@code containedBlockPath} is
+     * provided alongside a positive {@code containedBlockLight}, the carried block's own colour temperature
+     * and flame behaviour are preserved via {@link #classifyItem}.
+     */
+    public static EmitterProfile classifyEntity(String entityPath, boolean onFire,
+                                                String containedBlockPath, int containedBlockLight) {
         if (entityPath != null && !entityPath.isEmpty()) {
             String id = entityPath.toLowerCase(Locale.ROOT);
             switch (id) {
@@ -219,8 +229,14 @@ public final class RtDynamicLightSpecs {
             }
         }
         if (containedBlockLight > 0) {
-            return new EmitterProfile(1.00f, 0.78f, 0.48f, Math.clamp(containedBlockLight, 1, 15),
-                    1.0f, 0.25f, false);
+            int level = Math.clamp(containedBlockLight, 1, 15);
+            if (containedBlockPath != null && !containedBlockPath.isEmpty()) {
+                EmitterProfile byBlock = classifyItem(containedBlockPath, level);
+                if (byBlock != null) {
+                    return byBlock;
+                }
+            }
+            return new EmitterProfile(1.00f, 0.78f, 0.48f, level, 1.0f, 0.25f, false);
         }
         if (onFire) {
             return new EmitterProfile(1.00f, 0.54f, 0.18f, 14, 1.05f, 0.26f, true);
@@ -347,6 +363,57 @@ public final class RtDynamicLightSpecs {
             return 0;
         }
         return SHADOW_GROUP_BIT_BASE << groupIndex;
+    }
+
+    /**
+     * Reconcile {@code slotOwners} (length {@link #SHADOW_GROUP_BITS}) against the highest-priority
+     * {@code selectedCount} candidates in {@code priorityOrdered}: the first {@link #SHADOW_GROUP_BITS}
+     * distinct non-{@link #NO_ENTITY} owners always receive a slot, while any owner that survived inside
+     * that top-6 set retains its exact previous slot index so its TLAS instance mask does not change.
+     */
+    public static void updateShadowGroupOwners(List<Candidate> priorityOrdered, int selectedCount, int[] slotOwners) {
+        updateShadowGroupOwners(priorityOrdered, selectedCount, slotOwners, new int[SHADOW_GROUP_BITS]);
+    }
+
+    /** Allocation-free variant of {@link #updateShadowGroupOwners(List, int, int[])} using caller scratch. */
+    public static void updateShadowGroupOwners(List<Candidate> priorityOrdered, int selectedCount,
+                                               int[] slotOwners, int[] topOwnersScratch) {
+        int topCount = 0;
+        int limit = Math.clamp(selectedCount, 0, priorityOrdered.size());
+        for (int i = 0; i < limit && topCount < SHADOW_GROUP_BITS; i++) {
+            int owner = priorityOrdered.get(i).ownerEntityId();
+            if (owner == NO_ENTITY || containsOwner(topOwnersScratch, topCount, owner)) {
+                continue;
+            }
+            topOwnersScratch[topCount++] = owner;
+        }
+        for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
+            int incumbent = slotOwners[slot];
+            if (incumbent != NO_ENTITY && !containsOwner(topOwnersScratch, topCount, incumbent)) {
+                slotOwners[slot] = NO_ENTITY;
+            }
+        }
+        for (int i = 0; i < topCount; i++) {
+            int owner = topOwnersScratch[i];
+            if (containsOwner(slotOwners, SHADOW_GROUP_BITS, owner)) {
+                continue;
+            }
+            for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
+                if (slotOwners[slot] == NO_ENTITY) {
+                    slotOwners[slot] = owner;
+                    break;
+                }
+            }
+        }
+    }
+
+    private static boolean containsOwner(int[] owners, int length, int target) {
+        for (int i = 0; i < length; i++) {
+            if (owners[i] == target) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**

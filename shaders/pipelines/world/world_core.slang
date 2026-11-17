@@ -16,7 +16,18 @@ public static Payload payload = {};
 public struct VisibilityResult {
     public float3 transmittance;
     public float waterHitT;
+    public float waterSignedT;
+    public int waterNetEntries;
 };
+
+public VisibilityResult makeUnoccludedVisibility() {
+    VisibilityResult r;
+    r.transmittance = float3(1.0, 1.0, 1.0);
+    r.waterHitT = -1.0;
+    r.waterSignedT = 0.0;
+    r.waterNetEntries = 0;
+    return r;
+}
 
 
 

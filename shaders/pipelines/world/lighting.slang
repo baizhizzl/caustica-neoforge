@@ -97,7 +97,7 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
         // IS the Fresnel effect), so skipping the term here — not just zeroing F0 — is what keeps
         // billboards from picking up a rim highlight they were never meant to have.
         if (!twoSided) {
-            float3 h = normalize(wi + v);
+            float3 h = safeHalfVector(wi, v, n);
             float ndh = max(0.0, dot(n, h));
             float ndv = max(1.0e-4, dot(n, v));
             float vdh = max(0.0, dot(v, h));
@@ -146,7 +146,7 @@ public float3 evalDynamicContrib(float3 sp, float3 intensity, float radius, floa
     if (ndl > 0.0) {
         float3 brdf = diffAlb * INV_PI;
         if (!twoSided) {
-            float3 h = normalize(wi + v);
+            float3 h = safeHalfVector(wi, v, n);
             float ndh = max(0.0, dot(n, h));
             float ndv = max(1.0e-4, dot(n, v));
             float vdh = max(0.0, dot(v, h));
@@ -214,7 +214,7 @@ public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd,
         float phat;
         evalDynamicContrib(sp, dl.intensityMask.xyz, radius, maxRange2, hitPos, n, v, rd,
                 diffAlb, F0, rough, msScale, twoSided, sss, phat);
-        if (phat <= 0.0) {
+        if (!(phat > 0.0)) {
             continue;
         }
         r.wSum += phat;
@@ -257,15 +257,13 @@ public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n,
     // Close-range points (inside the 1 mm tolerance) are unoccluded by construction: walls are kept at
     // least 0.05 m away by the collision volume and the emitter itself is culled by the mask.
     float traceDist = dist - 1.0e-3;
-    VisibilityResult vShadow;
-    vShadow.transmittance = float3(1.0, 1.0, 1.0);
-    vShadow.waterHitT = -1.0;
+    VisibilityResult vShadow = makeUnoccludedVisibility();
     if (traceDist > RAY_TMIN) {
         // The water caustic is a directional plane-wave Jacobian and is meaningless for a near-field point
         // light; shadow transmittance (including the water any-hit tint) is the physically consistent term.
         vShadow = visibilityMasked(origin, dir, traceDist, s.shadowMask);
     }
-    float3 vis = vShadow.transmittance * waterShadowTransmittance(currentMedium, vShadow.waterHitT, dist);
+    float3 vis = vShadow.transmittance * waterShadowTransmittance(currentMedium, vShadow, dist);
     return contrib * vis * s.W;
 }
 
@@ -442,7 +440,7 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
     float phat;
     evalSampleContrib(sp, lg.normal, lg.radiance, lg.area, hitPos, n, v, rd,
             diffAlb, F0, rough, msScale, twoSided, sss, phat);
-    if (phat <= 0.0) {
+    if (!(phat > 0.0)) {
         return;
     }
     float sourcePdf = proposalPdf(lg, gridCell, gridCellCoord, localProbability);

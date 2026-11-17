@@ -198,16 +198,19 @@ public Medium makeDielectricMedium(bool isWater, float ior, float3 tint, float t
     return m;
 }
 
-// Beer-Lambert water absorption along a finite shadow segment of length `dist`, given the nearest
-// water-interface crossing distance `waterHitT` (negative when no water interface was crossed).
-public float3 waterShadowTransmittance(Medium currentMedium, float waterHitT, float dist) {
-    if (currentMedium.water) {
-        float waterDist = waterHitT >= 0.0 ? min(waterHitT, dist) : dist;
-        return exp(-currentMedium.extinction * waterDist);
+// Beer-Lambert water absorption along a finite shadow segment [0, dist], reconstructed from the
+// starting medium state and the signed water-interface boundary crossings accumulated by any_hit:
+//   waterDist = endInWater * dist + sum(t_exit) - sum(t_enter),  endInWater = startInWater + N_enter - N_exit.
+// Thin water columns in air (waterfalls, streams) contribute only their true thickness t_exit - t_enter.
+public float3 waterShadowTransmittance(Medium currentMedium, VisibilityResult shadow, float dist) {
+    int startInWater = currentMedium.water ? 1 : 0;
+    int endInWater = clamp(startInWater + shadow.waterNetEntries, 0, 1);
+    float waterDist = clamp(float(endInWater) * dist + shadow.waterSignedT, 0.0, max(dist, 0.0));
+    if (waterDist <= 0.0) {
+        return float3(1.0, 1.0, 1.0);
     }
-    if (waterHitT >= 0.0) {
-        float waterDist = max(dist - waterHitT, 0.0);
-        return exp(-waterExtinction(worldPush.waterParams.xyz) * waterDist);
-    }
-    return float3(1.0, 1.0, 1.0);
+    float3 ext = currentMedium.water
+            ? currentMedium.extinction
+            : waterExtinction(worldPush.waterParams.xyz);
+    return exp(-ext * waterDist);
 }

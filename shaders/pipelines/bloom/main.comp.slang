@@ -30,8 +30,13 @@ static const int MODE_PREFILTER = 0;
 static const int MODE_DOWNSAMPLE = 1;
 static const int MODE_UPSAMPLE = 2;
 
+bool finiteColor(float3 v) {
+    return abs(v.x) < 1.0e30 && abs(v.y) < 1.0e30 && abs(v.z) < 1.0e30;
+}
+
 float3 tap(float2 uv, float2 offset) {
-    return srcImage.SampleLevel(uv + offset, 0.0).rgb;
+    float3 c = srcImage.SampleLevel(uv + offset, 0.0).rgb;
+    return finiteColor(c) ? max(c, float3(0.0)) : float3(0.0);
 }
 
 float rollOffBloomContribution(float contribution) {
@@ -50,6 +55,9 @@ float rollOffBloomContribution(float contribution) {
 // `threshold + knee` the full excess passes, and the transition is C1 so a highlight sliding across the
 // threshold does not pop. The result scales the ORIGINAL colour, so hue is untouched.
 float3 prefilter(float3 color) {
+    if (!finiteColor(color)) {
+        return float3(0.0);
+    }
     color = clamp(color, float3(0.0), float3(HALF_MAX));
     float luminance = dot(color, ACESCG_LUMA);
     float knee = max(pc.softKnee, 1.0e-6);
@@ -129,7 +137,8 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     if (pc.mode == MODE_PREFILTER) {
         // The pyramid works on EXPOSED values so the threshold is a display-referred decision (how far
         // above mid-grey a highlight has to be), not one that drifts with the scene's absolute level.
-        float exposure = max(exposureImage[int2(0, 0)], 0.0);
+        float rawExposure = exposureImage[int2(0, 0)];
+        float exposure = (rawExposure > 0.0 && rawExposure < 1.0e30) ? rawExposure : 0.0;
         float3 color = downsample(uv, srcTexel, true) * exposure;
         dstImage[pixel] = float4(prefilter(color), 1.0);
     } else if (pc.mode == MODE_DOWNSAMPLE) {

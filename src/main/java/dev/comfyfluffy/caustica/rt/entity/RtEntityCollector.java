@@ -916,16 +916,18 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         if (outlineColor != 0) {
             this.outlineColor = outlineColor;
         }
-        ItemStack contextStack = switch (displayContext) {
-            case THIRD_PERSON_RIGHT_HAND, FIRST_PERSON_RIGHT_HAND -> entityRightHandStack;
-            case THIRD_PERSON_LEFT_HAND, FIRST_PERSON_LEFT_HAND -> entityLeftHandStack;
-            case HEAD -> entityHeadStack;
-            // Fox/Panda/Villager/Witch/Dolphin mouth- and hand-held items render with HoldingEntityRenderState's
-            // GROUND context while the capture has no dedicated ground stack; fall back to the main hand.
-            case GROUND, FIXED -> entityGroundStack.isEmpty() && capturingLivingEntity
-                    ? entityMainHandStack : entityGroundStack;
-            default -> entityGroundStack;
-        };
+        ItemStack contextStack = capturingLivingEntity
+                ? switch (displayContext) {
+                    case THIRD_PERSON_RIGHT_HAND, FIRST_PERSON_RIGHT_HAND -> entityRightHandStack;
+                    case THIRD_PERSON_LEFT_HAND, FIRST_PERSON_LEFT_HAND -> entityLeftHandStack;
+                    case HEAD -> entityHeadStack;
+                    // Fox/Panda/Villager/Witch/Dolphin mouth- and hand-held items render with
+                    // HoldingEntityRenderState's GROUND context while the capture has no dedicated ground stack;
+                    // fall back to the main hand.
+                    case GROUND, FIXED -> entityGroundStack.isEmpty() ? entityMainHandStack : entityGroundStack;
+                    default -> entityGroundStack;
+                }
+                : entityGroundStack;
         activeSubmittedItemState = RtDynamicLights.resolveEmissiveBlockState(contextStack);
         activeSubmittedItemLight = RtDynamicLights.resolveItemLightLevel(contextStack);
         try {

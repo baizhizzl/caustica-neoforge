@@ -96,7 +96,12 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
             packAlbedo(payload, unpackAlbedo(payload)
                     * lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
                     * clamp(materialHeader.params.w, 0.0, 1.0));
-            payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
+            float hitT = RayTCurrent();
+            float3x3 entityO2w = (float3x3)ObjectToWorld3x4();
+            bool enteringWater = dot(WorldRayDirection(), mul(entityO2w, epr.normal.xyz)) < 0.0;
+            payload.hitT = payload.hitT < 0.0 ? hitT : min(payload.hitT, hitT);
+            payload.roughMetal = asuint(asfloat(payload.roughMetal) + (enteringWater ? -hitT : hitT));
+            payload.iorTransmission += enteringWater ? 1u : 0x10000u;
             IgnoreHit();
         }
         return;
@@ -112,10 +117,14 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
         float3 tint = bt709ToAcesCg(srgbToLinear(pr.tint.rgb));
         packAlbedo(payload, unpackAlbedo(payload) * lerp(float3(1.0), tint, WATER_SHADOW_TINT));
-        // Record the NEAREST water crossing (any-hit order is arbitrary) in the shadow payload's hitT
-        // lane. For an underwater shading point this is the exit point of its sun shadow ray, where
-        // world.rgen evaluates the wave-refraction caustic. visibility() seeds the -1 sentinel.
-        payload.hitT = payload.hitT < 0.0 ? RayTCurrent() : min(payload.hitT, RayTCurrent());
+        // Record the nearest water crossing in hitT for underwater caustics, and accumulate signed
+        // entry/exit boundary crossings in roughMetal/iorTransmission (order-independent under
+        // NO_DUPLICATE_ANY_HIT_INVOCATION) so finite-range shadow rays recover exact water thickness.
+        float hitT = RayTCurrent();
+        bool enteringWater = dot(WorldRayDirection(), pr.normal.xyz) < 0.0;
+        payload.hitT = payload.hitT < 0.0 ? hitT : min(payload.hitT, hitT);
+        payload.roughMetal = asuint(asfloat(payload.roughMetal) + (enteringWater ? -hitT : hitT));
+        payload.iorTransmission += enteringWater ? 1u : 0x10000u;
         IgnoreHit();
     }
 

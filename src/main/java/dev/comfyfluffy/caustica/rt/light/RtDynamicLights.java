@@ -91,6 +91,7 @@ public final class RtDynamicLights {
     // the same slot across frames keeps its instance mask bit-for-bit stable, so the TLAS can refit
     // instead of doing a full rebuild when two nearby emitters swap priority ranks.
     private final int[] activeSlotOwners = new int[SHADOW_GROUP_BITS];
+    private final int[] topOwnersScratch = new int[SHADOW_GROUP_BITS];
     private final float[] acesScratch = new float[3];
     private final double[] anchorScratch = new double[3];
     private final double[] handScratch = new double[3];
@@ -305,6 +306,9 @@ public final class RtDynamicLights {
             if (!isLocalCamera && distSq > cullDistSq) {
                 continue;
             }
+            if (entity instanceof Display display && !display.shouldRenderAtSqrDistance(distSq)) {
+                continue;
+            }
 
             if (!isLocalCamera && allowHeld && entity instanceof LivingEntity living && !living.isInvisible()) {
                 collectLivingEquipment(level, living, partial, camX, camY, camZ, false,
@@ -363,7 +367,8 @@ public final class RtDynamicLights {
             }
 
             boolean darkened = isTemporarilyDarkened(entity);
-            int containedBlockLight = resolveContainedBlockLight(entity);
+            BlockState containedBlock = resolveContainedBlockState(entity);
+            int containedBlockLight = containedBlock != null ? containedBlock.getLightEmission() : 0;
             boolean onFire = entity.isOnFire();
             if (darkened && !onFire && containedBlockLight == 0) {
                 continue;
@@ -372,8 +377,11 @@ public final class RtDynamicLights {
             EmitterProfile entityProfile = darkened ? null : info.intrinsic();
             if (entityProfile == null && (onFire || containedBlockLight > 0)) {
                 // A darkened glow squid falls back to its fire/contained-block light, not its intrinsic glow.
+                Identifier blockKey = containedBlockLight > 0
+                        ? BuiltInRegistries.BLOCK.getKey(containedBlock.getBlock()) : null;
                 entityProfile = RtDynamicLightSpecs.classifyEntity(
-                        darkened ? null : info.path(), onFire, containedBlockLight);
+                        darkened ? null : info.path(), onFire,
+                        blockKey != null ? blockKey.getPath() : null, containedBlockLight);
             }
             if (entityProfile != null) {
                 long key = packKey(entityId, SLOT_ENTITY_CORE);
@@ -407,27 +415,8 @@ public final class RtDynamicLights {
                 activeEmitterEntityIds.add(ownerEntityId);
             }
         }
-        // A slot is only valid while its owner remains among this frame's selected emitters.
-        for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
-            int owner = activeSlotOwners[slot];
-            if (owner != RtDynamicLightSpecs.NO_ENTITY && !activeEmitterEntityIds.contains(owner)) {
-                activeSlotOwners[slot] = RtDynamicLightSpecs.NO_ENTITY;
-            }
-        }
-        // Surviving owners keep their previous slot (and therefore their exact instance mask); new owners
-        // take the first free slot in priority order. Never wrap: a seventh owner gets no exclusion bit
-        // rather than sharing one and culling the first six owners' shadows.
-        for (int i = 0; i < selectedCount; i++) {
-            int ownerEntityId = scratchCandidates.get(i).ownerEntityId();
-            if (ownerEntityId == RtDynamicLightSpecs.NO_ENTITY || slotOf(ownerEntityId) >= 0) {
-                continue;
-            }
-            int freeSlot = firstFreeSlot();
-            if (freeSlot < 0) {
-                break;
-            }
-            activeSlotOwners[freeSlot] = ownerEntityId;
-        }
+        RtDynamicLightSpecs.updateShadowGroupOwners(
+                scratchCandidates, selectedCount, activeSlotOwners, topOwnersScratch);
         emitterExcludeBits.clear();
         for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
             int owner = activeSlotOwners[slot];
@@ -457,26 +446,6 @@ public final class RtDynamicLights {
                             (float) shadowCullMask));
         }
         return result;
-    }
-
-    /** Slot currently owned by {@code ownerEntityId}, or -1 when the entity has no hardware group. */
-    private int slotOf(int ownerEntityId) {
-        for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
-            if (activeSlotOwners[slot] == ownerEntityId) {
-                return slot;
-            }
-        }
-        return -1;
-    }
-
-    /** First unassigned hardware shadow-group slot, or -1 when all six are owned. */
-    private int firstFreeSlot() {
-        for (int slot = 0; slot < SHADOW_GROUP_BITS; slot++) {
-            if (activeSlotOwners[slot] == RtDynamicLightSpecs.NO_ENTITY) {
-                return slot;
-            }
-        }
-        return -1;
     }
 
     private EntityLightInfo entityLightInfo(Entity entity) {
@@ -647,17 +616,18 @@ public final class RtDynamicLights {
         return entity instanceof GlowSquid glowSquid && glowSquid.getDarkTicksRemaining() > 0;
     }
 
-    private static int resolveContainedBlockLight(Entity entity) {
-        BlockState state = null;
+    private static BlockState resolveContainedBlockState(Entity entity) {
         if (entity instanceof FallingBlockEntity falling) {
-            state = falling.getBlockState();
-        } else if (entity instanceof Display.BlockDisplay blockDisplay) {
-            Display.BlockDisplay.BlockRenderState renderState = blockDisplay.blockRenderState();
-            state = renderState != null ? renderState.blockState() : null;
-        } else if (entity instanceof AbstractMinecart minecart) {
-            state = minecart.getDisplayBlockState();
+            return falling.getBlockState();
         }
-        return state != null ? state.getLightEmission() : 0;
+        if (entity instanceof Display.BlockDisplay blockDisplay) {
+            Display.BlockDisplay.BlockRenderState renderState = blockDisplay.blockRenderState();
+            return renderState != null ? renderState.blockState() : null;
+        }
+        if (entity instanceof AbstractMinecart minecart) {
+            return minecart.getDisplayBlockState();
+        }
+        return null;
     }
 
     private void addCandidate(double wx, double wy, double wz,

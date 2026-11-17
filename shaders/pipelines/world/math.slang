@@ -34,6 +34,14 @@ public float3 fresnelSchlick(float cosT, float3 f0) {
     return f0 + (1.0 - f0) * (m2 * m2 * m);
 }
 
+// Degenerate-safe microfacet half-vector: opposing grazing vectors (l + v == 0) fall back to the surface
+// normal instead of dividing zero by zero inside normalize().
+public float3 safeHalfVector(float3 l, float3 v, float3 fallbackNormal) {
+    float3 s = l + v;
+    float len2 = dot(s, s);
+    return len2 > 1.0e-12 ? s * rsqrt(len2) : fallbackNormal;
+}
+
 // Directional hemisphere albedo E_ss(mu, alpha) for single-scattering Smith GGX at F0 = 1:
 //
 //   E_ss = E_{h ~ VNDF(mu, alpha)}[ 1(n.l > 0) * G1(n.l, alpha) ]

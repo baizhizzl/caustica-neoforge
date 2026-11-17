@@ -284,4 +284,78 @@ final class RtDynamicLightSpecsTest {
         }
         assertEquals(24, all.size(), "test input must not be mutated");
     }
+
+    @Test
+    void shadowGroupSlotsEvictLowPriorityIncumbentForNewTopEmitterWhileKeepingSurvivingSlotsStable() {
+        int[] slots = new int[RtDynamicLightSpecs.SHADOW_GROUP_BITS];
+        for (int i = 0; i < slots.length; i++) {
+            slots[i] = RtDynamicLightSpecs.NO_ENTITY;
+        }
+
+        // Frame 1: six distant emitters (ids 10..15) take slots 0..5.
+        List<Candidate> frame1 = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            frame1.add(new Candidate(30.0 + i, 64.0, 0.0, 0.1f, 50.0f, 40.0f, 20.0f,
+                    10 + i, 10.0f - i, 100L + i));
+        }
+        RtDynamicLightSpecs.sortCandidatesByPriority(frame1);
+        RtDynamicLightSpecs.updateShadowGroupOwners(frame1, frame1.size(), slots);
+        assertArrayEquals(new int[] {10, 11, 12, 13, 14, 15}, slots);
+
+        // Frame 2: the same six owners permute priority ranks -> zero slot movement (stable TLAS masks).
+        List<Candidate> frame2 = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            frame2.add(new Candidate(30.0 + i, 64.0, 0.0, 0.1f, 50.0f, 40.0f, 20.0f,
+                    10 + i, 1.0f + i, 100L + i));
+        }
+        RtDynamicLightSpecs.sortCandidatesByPriority(frame2);
+        RtDynamicLightSpecs.updateShadowGroupOwners(frame2, frame2.size(), slots);
+        assertArrayEquals(new int[] {10, 11, 12, 13, 14, 15}, slots);
+
+        // Frame 3: local player (id 999) equips main-hand, off-hand, and head lights at rank #1..#3 while
+        // all six incumbents remain in Top-16 (9 selected total). Owner 10 is now 7th distinct (lowest
+        // score 1.0f in frame2 order) -> evicted from slot 0, replaced by 999, while 11..15 keep slots 1..5.
+        List<Candidate> frame3 = new ArrayList<>(frame2);
+        frame3.add(new Candidate(0.0, 64.0, 0.0, 0.1f, 200.0f, 150.0f, 80.0f, 999, 900.0f, 1L));
+        frame3.add(new Candidate(0.0, 64.0, 0.0, 0.1f, 200.0f, 150.0f, 80.0f, 999, 890.0f, 2L));
+        frame3.add(new Candidate(0.0, 64.0, 0.0, 0.1f, 200.0f, 150.0f, 80.0f, 999, 880.0f, 3L));
+        RtDynamicLightSpecs.sortCandidatesByPriority(frame3);
+        RtDynamicLightSpecs.updateShadowGroupOwners(frame3, frame3.size(), slots);
+        assertArrayEquals(new int[] {999, 11, 12, 13, 14, 15}, slots);
+    }
+
+    @Test
+    void containedBlockEntitiesPreserveBlockSpectrumAndFlicker() {
+        EmitterProfile soulDisplay = RtDynamicLightSpecs.classifyEntity(
+                "block_display", false, "soul_lantern", 10);
+        assertNotNull(soulDisplay);
+        assertEquals(10, soulDisplay.lightLevel());
+        assertTrue(soulDisplay.srgbB() > soulDisplay.srgbR(), "soul lantern display must stay cyan-blue");
+        assertTrue(soulDisplay.flickers());
+
+        EmitterProfile seaFalling = RtDynamicLightSpecs.classifyEntity(
+                "falling_block", false, "sea_lantern", 15);
+        assertNotNull(seaFalling);
+        assertEquals(15, seaFalling.lightLevel());
+        assertTrue(seaFalling.srgbB() > seaFalling.srgbR(), "sea lantern falling block must stay cyan");
+        assertFalse(seaFalling.flickers());
+
+        EmitterProfile bulbMinecart = RtDynamicLightSpecs.classifyEntity(
+                "minecart", false, "copper_bulb", 15);
+        assertNotNull(bulbMinecart);
+        assertTrue(bulbMinecart.srgbG() > bulbMinecart.srgbR(), "copper bulb minecart must stay green-tinted");
+        assertFalse(bulbMinecart.flickers());
+
+        EmitterProfile redstoneDisplay = RtDynamicLightSpecs.classifyEntity(
+                "block_display", false, "redstone_torch", 7);
+        assertNotNull(redstoneDisplay);
+        assertEquals(7, redstoneDisplay.lightLevel());
+        assertTrue(redstoneDisplay.srgbR() > redstoneDisplay.srgbG());
+        assertFalse(redstoneDisplay.flickers());
+
+        EmitterProfile fallback = RtDynamicLightSpecs.classifyEntity("block_display", false, null, 12);
+        assertNotNull(fallback);
+        assertEquals(12, fallback.lightLevel());
+        assertTrue(fallback.srgbR() > fallback.srgbB());
+    }
 }

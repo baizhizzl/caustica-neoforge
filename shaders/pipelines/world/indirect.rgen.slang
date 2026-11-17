@@ -166,11 +166,11 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
                 trans = float3(airTrans, airTrans, airTrans);
             }
             // Mild forward/isotropic phase blend keeps handheld mist soft rather than blinding near the eye.
-            float3 toLightDir = normalize(center - samplePos);
+            float3 toLightDir = d2 > 1.0e-12 ? (center - samplePos) * rsqrt(d2) : rd;
             float phase = 0.65 * (1.0 / (4.0 * PI)) + 0.35 * hg(dot(rd, toLightDir), 0.35);
             float3 contrib = trans * localSigma * dl.intensityMask.xyz * (phase * integral * rangeFade);
             float phat = luminance(contrib);
-            if (phat <= 0.0) {
+            if (!(phat > 0.0)) {
                 continue;
             }
             haloWSum += phat;
@@ -189,14 +189,12 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
             // 1 mm tolerance only; the emitter's own geometry is hardware-culled by chosenMask, so the
             // volume shadow ray still reaches walls behind the light and cannot leak a halo through them.
             float traceDist = dist - 1.0e-3;
-            VisibilityResult vShadow;
-            vShadow.transmittance = float3(1.0, 1.0, 1.0);
-            vShadow.waterHitT = -1.0;
+            VisibilityResult vShadow = makeUnoccludedVisibility();
             if (dist > 1.0e-4 && traceDist > RAY_TMIN) {
                 vShadow = visibilityMasked(chosenSamplePos, toL / dist, traceDist, chosenMask);
             }
             float3 vis = vShadow.transmittance * waterShadowTransmittance(
-                    currentMedium, vShadow.waterHitT, dist);
+                    currentMedium, vShadow, dist);
             Lvol += chosenHalo * vis * (haloWSum / chosenPhat);
         }
     }
@@ -483,7 +481,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             }
             if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                 float3 brdf = diffAlb * INV_PI;
-                float3 h = normalize(lightDir + v);
+                float3 h = safeHalfVector(lightDir, v, n);
                 float ndh = max(0.0, dot(n, h));
                 float ndv = max(1.0e-4, dot(n, v));
                 float vdh = max(0.0, dot(v, h));

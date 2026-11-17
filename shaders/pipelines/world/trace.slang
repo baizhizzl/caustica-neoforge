@@ -117,6 +117,9 @@ public VisibilityResult visibilityMasked(float3 origin, float3 dir, float tmax, 
     result.transmittance = shadowPayload.flags == 0u
             ? unpackAlbedo(shadowPayload) : float3(0.0, 0.0, 0.0);
     result.waterHitT = shadowPayload.hitT;
+    result.waterSignedT = asfloat(shadowPayload.roughMetal);
+    result.waterNetEntries = int(shadowPayload.iorTransmission & 0xFFFFu)
+            - int(shadowPayload.iorTransmission >> 16u);
     return result;
 }
 

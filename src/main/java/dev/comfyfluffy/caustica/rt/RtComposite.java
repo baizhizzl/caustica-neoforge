@@ -1681,6 +1681,7 @@ public final class RtComposite {
         materialBindingsReady = false;
         materialEpochTraceGate = false;
         RtMaterialRegistry.INSTANCE.destroy();
+        RtDynamicLights.INSTANCE.reset();
         if (pushRing != null) {
             for (PushSlot slot : pushRing) {
                 if (slot != null) {
