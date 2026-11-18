@@ -62,39 +62,35 @@ bool finiteColor(float3 v) {
     return abs(v.x) < 1.0e30 && abs(v.y) < 1.0e30 && abs(v.z) < 1.0e30;
 }
 
+// 16x16 workgroup tile plus a 1-pixel border for 5-tap cross sharpening. Stores perceptual sqrt-luma
+// directly (-1.0 sentinel for NaN/Inf) so a 256-thread group issues 324 HDR reads instead of 1,280.
+groupshared float tileLuma[18][18];
+
+float sampleTileLuma(int2 coord, int maxX, int maxY, float exposure) {
+    int2 clamped = clamp(coord, int2(0, 0), int2(maxX, maxY));
+    float3 rawExposed = rtImage[clamped].rgb * exposure;
+    if (!finiteColor(rawExposed)) {
+        return -1.0;
+    }
+    return perceptualLuma(max(rawExposed, float3(0.0)));
+}
+
 // Contrast-adaptive 5-tap cross sharpening in perceptual sqrt-luminance space. Strictly clamped to the
 // 5-tap neighbourhood min/max so DLSS-RR upscaled block textures gain crisp micro-detail with zero
 // specular ringing or dark halos, while scaling RGB uniformly to preserve exact ACEScg chromaticity.
-float3 sharpenExposed(int2 pix, int maxX, int maxY, float3 centerExposed, float exposure) {
-    if (!finiteColor(centerExposed)) {
-        return float3(0.0);
-    }
-    float strength = clamp(pc.sharpness, 0.0, 1.0);
-    if (strength <= 1.0e-4) {
-        return centerExposed;
-    }
-    float lC = perceptualLuma(centerExposed);
+float3 sharpenExposedFromTile(uint2 localId, float3 centerExposed, float lC, float strength) {
     if (lC <= 1.0e-5) {
         return centerExposed;
     }
-    float3 rawN = rtImage[int2(pix.x, max(pix.y - 1, 0))].rgb * exposure;
-    float3 rawS = rtImage[int2(pix.x, min(pix.y + 1, maxY))].rgb * exposure;
-    float3 rawW = rtImage[int2(max(pix.x - 1, 0), pix.y)].rgb * exposure;
-    float3 rawE = rtImage[int2(min(pix.x + 1, maxX), pix.y)].rgb * exposure;
-    // One NaN/Inf neighbour must not be smeared into a cross-shaped artefact. Fall back to the finite
-    // centre colour (or black if the centre itself is bad) instead of letting max() propagate garbage.
-    if (!finiteColor(rawN) || !finiteColor(rawS) || !finiteColor(rawW) || !finiteColor(rawE)) {
+    uint lx = localId.x + 1u;
+    uint ly = localId.y + 1u;
+    float lN = tileLuma[ly - 1u][lx];
+    float lS = tileLuma[ly + 1u][lx];
+    float lW = tileLuma[ly][lx - 1u];
+    float lE = tileLuma[ly][lx + 1u];
+    if (lN < 0.0 || lS < 0.0 || lW < 0.0 || lE < 0.0) {
         return centerExposed;
     }
-    float3 cN = max(rawN, float3(0.0));
-    float3 cS = max(rawS, float3(0.0));
-    float3 cW = max(rawW, float3(0.0));
-    float3 cE = max(rawE, float3(0.0));
-
-    float lN = perceptualLuma(cN);
-    float lS = perceptualLuma(cS);
-    float lW = perceptualLuma(cW);
-    float lE = perceptualLuma(cE);
 
     float minL = min(lC, min(min(lN, lS), min(lW, lE)));
     float maxL = max(lC, max(max(lN, lS), max(lW, lE)));
@@ -239,6 +235,18 @@ float3 displayGammaHdr(float3 pqColor) {
     return clamp(pqEncode(adjustedNits), 0.0, 1.0);
 }
 
+// Spatial Interleaved Gradient Noise mapped to a zero-mean symmetric triangular PDF on [-1, 1] (1 LSB
+// span in 8-bit UNORM). Kept spatially stationary so post-RR 8-bit SDR quantization eliminates sky,
+// volumetric-haze, and underwater gradient banding without introducing static shimmer into DLSS-FG.
+float3 ditherSdr8Bit(float3 sdrColor, int2 pix) {
+    if (all(sdrColor <= float3(0.0))) {
+        return sdrColor;
+    }
+    float u = frac(52.9829189 * frac(dot(float2(pix) + 0.5, float2(0.06711056, 0.00583715))));
+    float tri = u < 0.5 ? (sqrt(2.0 * u) - 1.0) : (1.0 - sqrt(2.0 * (1.0 - u)));
+    return clamp(sdrColor + tri * (1.0 / 255.0), 0.0, 1.0);
+}
+
 // Exposure -> log2 shaper -> trilinear LUT fetch. The LUT already bakes in ACES 2.0's gamut mapping to
 // BT.709 and the sRGB OETF, so its output goes straight to outputImage. Single mip (RtToneLut), so an
 // explicit level-0 SampleLevel is exact, not an approximation.
@@ -256,26 +264,75 @@ float3 tonemapHdr(float3 lookedAcesCg) {
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void main(uint3 dispatchId : SV_DispatchThreadID) {
-    int2 pix = int2(dispatchId.xy);
+void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupId : SV_GroupID,
+          uint3 localId : SV_GroupThreadID, uint groupIndex : SV_GroupIndex) {
     uint w, h;
     outputImage.GetDimensions(w, h);
-    if (pix.x >= int(w) || pix.y >= int(h)) {
+    if (w == 0u || h == 0u) {
         return;
     }
 
-    float4 rt = rtImage[pix];
+    int2 pix = int2(dispatchId.xy);
+    int maxX = int(w) - 1;
+    int maxY = int(h) - 1;
+    bool inBounds = pix.x <= maxX && pix.y <= maxY;
     float rawExposure = exposureImage[int2(0, 0)];
     float exposure = (rawExposure > 0.0 && rawExposure < 1.0e30) ? rawExposure : 0.0;
-    float3 rawExposed = rt.rgb * exposure;
-    float3 baseExposed = finiteColor(rawExposed) ? max(rawExposed, float3(0.0)) : float3(0.0);
-    float3 exposedAcesCg = sharpenExposed(pix, int(w) - 1, int(h) - 1, baseExposed, exposure);
-    float3 bloom = sampleBloom(pix, w, h);
-    if (finiteColor(bloom)) {
-        exposedAcesCg += max(bloom, float3(0.0)) * max(pc.bloomStrength, 0.0);
+    float strength = clamp(pc.sharpness, 0.0, 1.0);
+
+    float3 baseExposed = float3(0.0);
+    float centerLuma = -1.0;
+    if (inBounds) {
+        float3 rawExposed = rtImage[pix].rgb * exposure;
+        if (finiteColor(rawExposed)) {
+            baseExposed = max(rawExposed, float3(0.0));
+            centerLuma = perceptualLuma(baseExposed);
+        }
+    }
+
+    float3 exposedAcesCg = baseExposed;
+    // Uniform push-constant branch: all 256 threads participate in the haloed tile load + barrier together.
+    if (strength > 1.0e-4) {
+        int2 tileOrigin = int2(groupId.xy) * 16 - int2(1, 1);
+        tileLuma[localId.y + 1u][localId.x + 1u] = inBounds
+                ? centerLuma
+                : sampleTileLuma(pix, maxX, maxY, exposure);
+        if (groupIndex < 68u) {
+            uint tx;
+            uint ty;
+            if (groupIndex < 18u) {
+                tx = groupIndex;
+                ty = 0u;
+            } else if (groupIndex < 36u) {
+                tx = groupIndex - 18u;
+                ty = 17u;
+            } else if (groupIndex < 52u) {
+                tx = 0u;
+                ty = (groupIndex - 36u) + 1u;
+            } else {
+                tx = 17u;
+                ty = (groupIndex - 52u) + 1u;
+            }
+            tileLuma[ty][tx] = sampleTileLuma(tileOrigin + int2(int(tx), int(ty)), maxX, maxY, exposure);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (inBounds && centerLuma >= 0.0) {
+            exposedAcesCg = sharpenExposedFromTile(localId.xy, baseExposed, centerLuma, strength);
+        }
+    }
+
+    if (!inBounds) {
+        return;
+    }
+
+    if (pc.bloomStrength > 0.0) {
+        float3 bloom = sampleBloom(pix, w, h);
+        if (finiteColor(bloom)) {
+            exposedAcesCg += max(bloom, float3(0.0)) * pc.bloomStrength;
+        }
     }
     float3 lookedAcesCg = gradeSceneAcesCg(applyLook(exposedAcesCg));
-    outputImage[pix] = float4(tonemap(lookedAcesCg), 1.0);
+    outputImage[pix] = float4(ditherSdr8Bit(tonemap(lookedAcesCg), pix), 1.0);
 
     if (pc.hdrEnabled != 0) {
         hdrImage[pix] = float4(tonemapHdr(lookedAcesCg), 1.0);

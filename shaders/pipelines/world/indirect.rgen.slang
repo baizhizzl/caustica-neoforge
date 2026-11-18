@@ -33,24 +33,24 @@ static const float WATER_VOLUMETRIC_MIE_G = 0.76;
 //     for volumetric occlusion cones around doorways, pillars, and foliage.
 float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium currentMedium,
                                   bool waterWaves, inout uint seed) {
-    // volStrength scales the medium coefficients directly (air extinction/scattering and the water
-    // scattering strength), NOT the final radiance. This keeps the extinction used for throughput and
-    // the in-scattering used for the shaft sample derived from one physical density.
-    float volStrength = max(worldPush.visualParams0.x, 0.0);
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    float4 vp0 = wp[0].visualParams0;
+    float volStrength = max(vp0.x, 0.0);
     if (volStrength <= 0.0 || segDist <= 0.05) {
         return float3(0.0, 0.0, 0.0);
     }
 
     float3 Lvol = float3(0.0, 0.0, 0.0);
-    float causticsIntensity = worldPush.visualParams0.z;
+    float causticsIntensity = vp0.z;
+    float4 vp1 = wp[0].visualParams1;
     // A solid non-water dielectric (tinted glass, ice) is not air: its interior already carries its own
     // Beer-Lambert absorption, so it must not also receive air-haze scattering or a second air extinction.
     bool isAir = isAirMedium(currentMedium);
 
     if (currentMedium.water) {
         float marchDist = min(segDist, MAX_WATER_VOLUMETRIC_DIST);
-        float3 sigmaS = waterScatteringCoeff(worldPush.waterParams.xyz,
-                worldPush.visualParams1.w * volStrength);
+        float3 sigmaS = waterScatteringCoeff(wp[0].waterParams.xyz,
+                vp1.w * volStrength);
         if (marchDist > 0.1 && max(sigmaS.r, max(sigmaS.g, sigmaS.b)) > 1.0e-6
                 && luminance(celestialLight.illuminance) > 1.0e-4) {
             // Importance sample the density along the segment: t(u) = D * (0.4u + 0.6u^2). The PDF in t
@@ -79,9 +79,9 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
         }
     } else if (isAir) {
         float marchDist = min(segDist, MAX_AIR_VOLUMETRIC_DIST);
-        float baseSigma = max(worldPush.visualParams1.x, 0.0) * volStrength;
-        float heightFalloff = worldPush.visualParams1.y;
-        float seaLevelY = worldPush.visualParams1.z;
+        float baseSigma = max(vp1.x, 0.0) * volStrength;
+        float heightFalloff = vp1.y;
+        float seaLevelY = vp1.z;
         if (marchDist > 0.25 && baseSigma > 1.0e-7 && luminance(celestialLight.illuminance) > 1.0e-3) {
             // t(u) = D * (0.35u + 0.65u^2), dt/du = D * (0.35 + 1.30u); the unbiased Monte Carlo weight
             // for importance sampling this density is dtDu.
@@ -110,92 +110,93 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
 
     // Analytic equi-angular scattering for dynamic lights (handheld torches, lanterns, burning entities),
     // resampled into a single volumetric visibility query so pillars and doorways cast light cones.
-    uint dynCount = min(worldPush.dynamicLightCount, 16u);
+    uint dynCount = min(wp[0].dynamicLightCount, 16u);
     if (dynCount > 0u && (currentMedium.water || isAir)) {
-        float maxRange = max(worldPush.visualParams0.y, 4.0);
-        float haloReach = min(segDist, maxRange);
-        float baseSigma = max(worldPush.visualParams1.x, 0.0) * volStrength;
-        float heightFalloff = worldPush.visualParams1.y;
-        float seaLevelY = worldPush.visualParams1.z;
-        float3 waterSigma = waterScatteringCoeff(worldPush.waterParams.xyz,
-                worldPush.visualParams1.w * volStrength);
-        float3 chosenHalo = float3(0.0, 0.0, 0.0);
-        float3 chosenSamplePos = ro;
-        float3 chosenLightPos = ro;
-        uint chosenMask = CULL_SECONDARY;
-        float chosenPhat = 0.0;
-        float haloWSum = 0.0;
+        float baseSigma = max(vp1.x, 0.0) * volStrength;
+        float3 waterSigma = currentMedium.water
+                ? waterScatteringCoeff(wp[0].waterParams.xyz, vp1.w * volStrength)
+                : float3(0.0, 0.0, 0.0);
+        bool hasMediumDensity = currentMedium.water
+                ? max(waterSigma.r, max(waterSigma.g, waterSigma.b)) > 1.0e-7
+                : baseSigma > 1.0e-7;
+        if (hasMediumDensity) {
+            float maxRange = max(vp0.y, 4.0);
+            float haloReach = min(segDist, maxRange);
+            float heightFalloff = vp1.y;
+            float seaLevelY = vp1.z;
+            float3 chosenHalo = float3(0.0, 0.0, 0.0);
+            float3 chosenSamplePos = ro;
+            float3 chosenLightPos = ro;
+            uint chosenMask = CULL_SECONDARY;
+            float chosenPhat = 0.0;
+            float haloWSum = 0.0;
 
-        for (uint i = 0u; i < dynCount; i++) {
-            DynamicLight dl = worldPush.dynamicLights[i];
-            float3 center = dl.posRadius.xyz;
-            // Same minimum radius as risDynamic so the halo footprint and the surface NEE sphere agree.
-            float radius = max(dl.posRadius.w, DYNAMIC_LIGHT_MIN_RADIUS);
-            float3 toC = center - ro;
-            float centerDist2 = dot(toC, toC);
-            if (centerDist2 > (maxRange + haloReach) * (maxRange + haloReach)) {
-                continue;
+            for (uint i = 0u; i < dynCount; i++) {
+                DynamicLight dl = wp[0].dynamicLights[i];
+                float3 center = dl.posRadius.xyz;
+                // Same minimum radius as risDynamic so the halo footprint and the surface NEE sphere agree.
+                float radius = max(dl.posRadius.w, DYNAMIC_LIGHT_MIN_RADIUS);
+                float3 toC = center - ro;
+                float centerDist2 = dot(toC, toC);
+                if (centerDist2 > (maxRange + haloReach) * (maxRange + haloReach)) {
+                    continue;
+                }
+                float tc = dot(toC, rd);
+                float perp2 = max(centerDist2 - tc * tc, 0.0) + radius * radius;
+                float perp = sqrt(perp2);
+                float thetaA = atan((-tc) / perp);
+                float thetaB = atan((haloReach - tc) / perp);
+                float deltaTheta = max(thetaB - thetaA, 0.0);
+                if (deltaTheta <= 1.0e-5) {
+                    continue;
+                }
+                float integral = deltaTheta / perp;
+                float tSample = clamp(tc + perp * tan(lerp(thetaA, thetaB, rndf(seed))), 0.0, haloReach);
+                float3 samplePos = ro + rd * tSample;
+                float d2 = dot(center - samplePos, center - samplePos);
+                float rangeFade = clamp(1.0 - d2 / (maxRange * maxRange), 0.0, 1.0);
+                rangeFade *= rangeFade;
+                float3 trans = float3(1.0, 1.0, 1.0);
+                float3 localSigma = float3(0.0, 0.0, 0.0);
+                if (currentMedium.water) {
+                    trans = exp(-currentMedium.extinction * tSample);
+                    localSigma = waterSigma;
+                } else {
+                    float airSigma = airHazeScattering(samplePos.y, baseSigma, heightFalloff, seaLevelY) * 2.0;
+                    localSigma = float3(airSigma, airSigma, airSigma);
+                    float airTrans = exp(-airHazeOpticalDepth(ro, rd, tSample, baseSigma,
+                            heightFalloff, seaLevelY));
+                    trans = float3(airTrans, airTrans, airTrans);
+                }
+                float3 toLightDir = d2 > 1.0e-12 ? (center - samplePos) * rsqrt(d2) : rd;
+                float phase = 0.65 * (1.0 / (4.0 * PI)) + 0.35 * hg(dot(rd, toLightDir), 0.35);
+                float3 contrib = trans * localSigma * dl.intensityMask.xyz * (phase * integral * rangeFade);
+                float phat = luminance(contrib);
+                if (!(phat > 0.0)) {
+                    continue;
+                }
+                haloWSum += phat;
+                if (rndf(seed) * haloWSum < phat) {
+                    chosenHalo = contrib;
+                    chosenSamplePos = samplePos;
+                    chosenLightPos = center;
+                    chosenMask = clamp(uint(dl.intensityMask.w + 0.5), 1u, 255u);
+                    chosenPhat = phat;
+                }
             }
-            float tc = dot(toC, rd);
-            float perp2 = max(centerDist2 - tc * tc, 0.0) + radius * radius;
-            float perp = sqrt(perp2);
-            float thetaA = atan((-tc) / perp);
-            float thetaB = atan((haloReach - tc) / perp);
-            float deltaTheta = max(thetaB - thetaA, 0.0);
-            if (deltaTheta <= 1.0e-5) {
-                continue;
-            }
-            float integral = deltaTheta / perp;
-            float tSample = clamp(tc + perp * tan(lerp(thetaA, thetaB, rndf(seed))), 0.0, haloReach);
-            float3 samplePos = ro + rd * tSample;
-            float d2 = dot(center - samplePos, center - samplePos);
-            float rangeFade = clamp(1.0 - d2 / (maxRange * maxRange), 0.0, 1.0);
-            rangeFade *= rangeFade;
-            // The halo density follows the local sample height exactly like the sun-shaft sampler; there
-            // is no artificial floor, so haze-density == 0 (or volumetric-intensity == 0) means no glow.
-            float3 trans = float3(1.0, 1.0, 1.0);
-            float3 localSigma = float3(0.0, 0.0, 0.0);
-            if (currentMedium.water) {
-                trans = exp(-currentMedium.extinction * tSample);
-                localSigma = waterSigma;
-            } else {
-                float airSigma = airHazeScattering(samplePos.y, baseSigma, heightFalloff, seaLevelY) * 2.0;
-                localSigma = float3(airSigma, airSigma, airSigma);
-                float airTrans = exp(-airHazeOpticalDepth(ro, rd, tSample, baseSigma,
-                        heightFalloff, seaLevelY));
-                trans = float3(airTrans, airTrans, airTrans);
-            }
-            // Mild forward/isotropic phase blend keeps handheld mist soft rather than blinding near the eye.
-            float3 toLightDir = d2 > 1.0e-12 ? (center - samplePos) * rsqrt(d2) : rd;
-            float phase = 0.65 * (1.0 / (4.0 * PI)) + 0.35 * hg(dot(rd, toLightDir), 0.35);
-            float3 contrib = trans * localSigma * dl.intensityMask.xyz * (phase * integral * rangeFade);
-            float phat = luminance(contrib);
-            if (!(phat > 0.0)) {
-                continue;
-            }
-            haloWSum += phat;
-            if (rndf(seed) * haloWSum < phat) {
-                chosenHalo = contrib;
-                chosenSamplePos = samplePos;
-                chosenLightPos = center;
-                chosenMask = clamp(uint(dl.intensityMask.w + 0.5), 1u, 255u);
-                chosenPhat = phat;
-            }
-        }
 
-        if (chosenPhat > 0.0) {
-            float3 toL = chosenLightPos - chosenSamplePos;
-            float dist = length(toL);
-            // 1 mm tolerance only; the emitter's own geometry is hardware-culled by chosenMask, so the
-            // volume shadow ray still reaches walls behind the light and cannot leak a halo through them.
-            float traceDist = dist - 1.0e-3;
-            VisibilityResult vShadow = makeUnoccludedVisibility();
-            if (dist > 1.0e-4 && traceDist > RAY_TMIN) {
-                vShadow = visibilityMasked(chosenSamplePos, toL / dist, traceDist, chosenMask);
+            if (chosenPhat > 0.0) {
+                float3 toL = chosenLightPos - chosenSamplePos;
+                float dist = length(toL);
+                float traceDist = dist - 1.0e-3;
+                VisibilityResult vShadow = makeUnoccludedVisibility();
+                if (dist > 1.0e-4 && traceDist > RAY_TMIN) {
+                    vShadow = visibilityMasked(chosenSamplePos, toL / dist, traceDist, chosenMask);
+                }
+                float3 vis = vShadow.transmittance * waterShadowTransmittance(
+                        currentMedium, vShadow, dist);
+                Lvol += chosenHalo * vis * (haloWSum / chosenPhat);
             }
-            float3 vis = vShadow.transmittance * waterShadowTransmittance(
-                    currentMedium, vShadow, dist);
-            Lvol += chosenHalo * vis * (haloWSum / chosenPhat);
         }
     }
 
@@ -205,7 +206,9 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
 
 // Atmospheric transmittance LUT (RtSkyLut), also bound to sky.rmiss at the same binding: raygen reads it
 // to colour the NEE sun/moonlight, the miss shader reads it to tint the visible discs and stars.
-public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
+public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cachedPrimaryRecord,
+                        float3 prefixCamOrigin, float3 prefixCamDir, Medium prefixCameraMedium) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     float3 L = float3(0.0, 0.0, 0.0);
     float3 ro = seg.ro;
     float3 rd = seg.rd;
@@ -216,68 +219,54 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
     seed = pcg(seed);
     float rayConeWidth = seg.rayConeWidth;
     float rayConeSpread = max(seg.rayConeSpread, RAY_CONE_MIN_SPREAD);
-    int maxBounces = int(worldPush.maxBounces);
+    int maxBounces = int(wp[0].maxBounces);
     int rrStart = maxBounces <= 3 ? 1 : 2;
+    uint primaryRisCandidates = wp[0].risCandidates;
+    uint indirectRisCandidates = wp[0].risCandidatesIndirect;
     // RIS emitter NEE: direct lighting from block emitters is active when lights are published and the
     // candidate count is non-zero. Otherwise emitters contribute only when a path hits them.
-    bool risOn = worldPush.risCandidates > 0u && worldPush.lightCount > 0u && pc.lightBufAddr != 0;
-    bool dynLightsOn = worldPush.dynamicLightCount > 0u;
+    bool risOn = primaryRisCandidates > 0u && wp[0].lightCount > 0u && pc.lightBufAddr != 0;
+    bool dynLightsOn = wp[0].dynamicLightCount > 0u;
+    bool hasCelestialNee = max(celestialLight.illuminance.r,
+            max(celestialLight.illuminance.g, celestialLight.illuminance.b)) > 1.0e-5;
     // Independent light-proposal RNG.
     uint proposalSeed = pix.x * 1973u + pix.y * 9277u + 26699u
-            ^ worldPush.frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
+            ^ wp[0].frameIndex * 2654435761u ^ sampleIndex * 2246822519u;
     proposalSeed = pcg(proposalSeed);
     MediumStack medium = seg.medium;
-    bool waterWaves = (worldPush.flags & 16u) != 0u; // animated wave-normal perturbation
+    bool waterWaves = (wp[0].flags & WORLD_FLAG_WATER_WAVES) != 0u;
     bool showCelestial = seg.showCelestial;
-    // True when the vertex that produced the current continuation ran risDynamic. Paired with
-    // payloadDynamicEmitter() so a torch entity's own mesh is emitted exactly once (see the emission gate
-    // at the opaque surface below).
     bool prevSampledDynamic = false;
-    // Primary visual segments (camera prefix, plus everything before the first non-dielectric hit) own
-    // the volumetric pass. The flag survives a dielectric crossing, so light shafts are continuous
-    // through water/glass and a room seen through a window still gets its sun shafts.
+    float prevBsdfPdf = 0.0;
     bool evalVolumetrics = seg.primaryVisual;
-    float causticsIntensity = worldPush.visualParams0.z;
-    float msGgxStrength = worldPush.visualParams0.w;
-    // Air density used by the analytic optical depth. volStrength scales the coefficient, matching
-    // evaluatePrimaryVolumetrics, so absorption and in-scattering come from one physical density.
-    float airBaseSigma = max(worldPush.visualParams1.x, 0.0) * max(worldPush.visualParams0.x, 0.0);
-    float airHeightFalloff = worldPush.visualParams1.y;
-    float airSeaLevelY = worldPush.visualParams1.z;
+    float4 vp0 = wp[0].visualParams0;
+    float4 vp1 = wp[0].visualParams1;
+    float causticsIntensity = vp0.z;
+    float msGgxStrength = vp0.w;
+    float airBaseSigma = max(vp1.x, 0.0) * max(vp0.x, 0.0);
+    float airHeightFalloff = vp1.y;
+    float airSeaLevelY = vp1.z;
     int indirectDepth = 0;
 
-    // The primary pass split at a dielectric and wrote the camera→interface distance on the branch that
-    // carries queue[pixelIndex]. Reconstruct that exact camera ray (same jitter, same invViewProj, same
-    // camera medium as primary.rgen) and add its volumetric scattering with weight 1.0. The interface
-    // Fresnel split is already folded into each continuation's throughput, but the prefix belongs to the
-    // whole pixel, not to either leaf. Its air/water optical depth was also multiplied into the shared
-    // throughput in primary.rgen, so both leaves inherit it exactly once.
     if (seg.preInterfaceDist > 0.0) {
-        float2 dims = float2(DispatchRaysDimensions().xy);
-        float2 uv = (float2(pix) + 0.5) / dims;
-        float2 jndc = (uv + worldPush.jitter / dims) * 2.0 - 1.0;
-        float4 nearH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
-        float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
-        float3 nearP = nearH.xyz / nearH.w;
-        float3 farP = farH.xyz / farH.w;
-        float3 camOrigin = nearP + worldPush.camOffset;
-        float3 camDir = normalize(farP - nearP);
-        MediumStack cameraMedium = makeMediumStack((worldPush.flags & 1u) != 0u
-                ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0)
-                : airMedium());
-        L += evaluatePrimaryVolumetrics(camOrigin, camDir, seg.preInterfaceDist,
-                cameraMedium.current, waterWaves, seed);
+        L += evaluatePrimaryVolumetrics(prefixCamOrigin, prefixCamDir, seg.preInterfaceDist,
+                prefixCameraMedium, waterWaves, seed);
     }
 
     for (int bounce = seg.bounce; bounce <= maxBounces; bounce++) {
+        if (bounce == seg.bounce && cachedPrimaryRecord != PATH_NO_NEXT) {
+            ConstPtr<PackedPathSegment> queue = ConstPtr<PackedPathSegment>(pc.pathQueueAddr);
+            payload = unpackCachedPrimaryHit(queue[cachedPrimaryRecord], rd);
+        } else {
 #ifdef CAUSTICA_ENABLE_EXT_SER
-        uint pathPhaseHint = bounce >= maxBounces ? 2u : (bounce >= rrStart ? 1u : 0u);
-        traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
-                               showCelestial, rayConeWidth, rayConeSpread, pathPhaseHint);
+            uint pathPhaseHint = bounce >= maxBounces ? 2u : (bounce >= rrStart ? 1u : 0u);
+            traceRadianceReordered(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
+                                   showCelestial, rayConeWidth, rayConeSpread, pathPhaseHint);
 #else
-        traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
-                      showCelestial, rayConeWidth, rayConeSpread);
+            traceRadiance(bounce == 0 ? CULL_PRIMARY : CULL_SECONDARY, ro, 0.0, rd, 10000.0,
+                          showCelestial, rayConeWidth, rayConeSpread);
 #endif
+        }
 
         if (payload.hitT < 0.0) {
             // An underwater ray that misses is NOT air and must not reveal sky or air shafts: the water
@@ -299,6 +288,16 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 }
             }
             float3 sky = payloadSky();
+            // Non-delta BSDF bounces suppress the huge 33-degree drawn sprite in sky.rmiss and instead
+            // evaluate the physical celestial square weighted by power-heuristic MIS against prevBsdfPdf.
+            if (!showCelestial && hasCelestialNee && prevBsdfPdf > 0.0 && celestialLight.halfAngle > 0.0) {
+                float2 sunLocal;
+                if (celestialSquareLocal(rd, celestialLight.dir, celestialLight.halfAngle, sunLocal)) {
+                    float pSun = celestialSquarePdf(rd, celestialLight.dir, celestialLight.halfAngle);
+                    float wBsdf = powerHeuristic(prevBsdfPdf, pSun);
+                    sky += celestialLight.illuminance * (pSun * wBsdf);
+                }
+            }
             L += throughput * sky; // escaped to sky
             break;
         }
@@ -336,28 +335,43 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
             float3 geometricNormal = n; // unrippled; ray origins offset along this
             if (isWater && waterWaves) {
-                float2 waterDomain = hitPos.xz + worldPush.waterAnchor.xy;
+                float2 waterDomain = hitPos.xz + wp[0].waterAnchor.xy;
                 float waterFootprint = rayConeWidth / max(abs(dot(-rd, geometricNormal)), 0.2);
                 n = applyWaterWaves(geometricNormal, waterDomain,
-                                    worldPush.waterParams.w, waterFootprint);
+                                    wp[0].waterParams.w, waterFootprint);
             }
 
             Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0), tint, transmission);
             float etaI = medium.current.ior;
             float etaT = entering ? entered.ior : medium.outer.ior;
+            float dielectricRough = isWater ? 0.0 : clamp(payloadRoughness(), 0.0, 1.0);
+            bool frostedDielectric = dielectricRough >= FROSTED_DIELECTRIC_ALPHA_MIN;
+            float3 facetNormal = frostedDielectric ? sampleGGXVNDF(n, -rd, dielectricRough, seed) : n;
 
-            float cosI = clamp(dot(-rd, n), 0.0, 1.0);
+            float cosI = clamp(dot(-rd, facetNormal), 0.0, 1.0);
             float F = fresnelDielectric(cosI, etaI, etaT);
-            float3 transmittedDir = refract(rd, n, etaI / etaT);
+            float3 transmittedDir = refract(rd, facetNormal, etaI / etaT);
             float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
-            bool chooseReflection = rndf(seed) < F;
+            bool hasTransmitted = dot(transmittedDir, transmittedDir) > 0.0;
+            bool chooseReflection = !hasTransmitted || (rndf(seed) < F);
             if (chooseReflection) {
-                rd = reflect(rd, n);
+                float3 reflDir = reflect(rd, facetNormal);
+                if (frostedDielectric) {
+                    float ndl = dot(n, reflDir);
+                    if (ndl <= 0.0) break;
+                    throughput *= ggxG1(ndl, dielectricRough);
+                }
+                rd = reflDir;
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
             } else {
-                if (dot(transmittedDir, transmittedDir) <= 0.0) break; // TIR with F < 1 cannot happen
-                rd = normalize(transmittedDir);
+                float3 refrDir = normalize(transmittedDir);
+                if (frostedDielectric) {
+                    float ndt = -dot(n, refrDir);
+                    if (ndt <= 0.0) break;
+                    throughput *= ggxG1(ndt, dielectricRough);
+                }
+                rd = refrDir;
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, transmitBias);
                 if (entering) {
                     mediumPush(medium, entered);
@@ -365,8 +379,16 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                     mediumPop(medium);
                 }
             }
-            showCelestial = true; // specular interface: the continuation ray may see the sun/moon disc
+            if (frostedDielectric) {
+                rayConeSpread = max(rayConeSpread, dielectricRough * RAY_CONE_GLOSSY_SPREAD_SCALE);
+            }
+            // Preserve showCelestial & prevBsdfPdf from the incoming path: a camera/mirror chain stays
+            // delta-visible through windows and water, whereas a diffuse/glossy ray that already ran sun
+            // NEE through the window will not re-enable the 33-degree sprite and double-count sunlight.
             prevSampledDynamic = false; // a dielectric does no dynamic NEE; emission may be seen again
+            if (max(throughput.r, max(throughput.g, throughput.b)) <= 1.0e-5) {
+                break;
+            }
             if (bounce >= rrStart) {
                 float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
                 if (rndf(seed) > q) {
@@ -383,24 +405,26 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         evalVolumetrics = false;
 
         int hitDepth = indirectDepth++;
-        uint risCandidates = hitDepth == 0 ? worldPush.risCandidates : worldPush.risCandidatesIndirect;
+        uint risCandidates = hitDepth == 0 ? primaryRisCandidates : indirectRisCandidates;
 
         // Particles (material == 2): camera-facing receiver billboard.
         if (material == MATERIAL_PARTICLE) {
             float3 albedo = payloadAlbedo();
 
-            float3 lightDir = celestialLight.dir;
-            float lightHalfAngle = celestialLight.halfAngle;
-            if (lightHalfAngle > 0.0) {
-                lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
-            }
-            float signedNdl = dot(n, lightDir);
-            float ndl = abs(signedNdl);
-            if (ndl > 0.0) {
-                float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
-                float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
-                if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                    L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
+            if (hasCelestialNee) {
+                float3 lightDir = celestialLight.dir;
+                float lightHalfAngle = celestialLight.halfAngle;
+                if (lightHalfAngle > 0.0) {
+                    lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+                }
+                float signedNdl = dot(n, lightDir);
+                float ndl = abs(signedNdl);
+                if (ndl > 0.0) {
+                    float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
+                    float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                    if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
+                        L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
+                    }
                 }
             }
 
@@ -415,8 +439,6 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
             if (dynLightsOn) {
                 float3 v = -rd;
-                // Independent proposal stream (same role as risInitial's proposalSeed): sampling the
-                // spherical emitter must not consume the main BSDF path's RNG.
                 DynamicReservoir dr = risDynamic(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
                                                  float3(1.0, 1.0, 1.0), true, 0.0, proposalSeed);
                 L += throughput * shadeDynamicReservoir(dr, hitPos, n, v, rd, albedo,
@@ -428,13 +450,15 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 break;
             }
             throughput *= albedo;
+            if (max(throughput.r, max(throughput.g, throughput.b)) <= 1.0e-5) {
+                break;
+            }
             ro = hitPos + n * SURF_BIAS;
             rd = cosineDir(n, seed);
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false;
-            // The billboard ran dynamic NEE above when lights exist; the next diffuse hit is exactly the
-            // bounce whose emitter-mesh emission must be suppressed.
             prevSampledDynamic = dynLightsOn;
+            prevBsdfPdf = 0.0;
             continue;
         }
 
@@ -449,47 +473,71 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         rough = exactSpecular ? 0.0 : rough;
         float3 diffAlb = albedo * (1.0 - metal);
         float3 F0 = payload.f0;
+        float ps = surfaceSpecularProb(diffAlb, F0, exactSpecular);
         // Multiple-scattering GGX compensation is a vertex invariant: F0, the view cosine, the roughness
         // and the global strength are fixed for every NEE/RIS/BSDF estimate at this shading point, so the
         // Turquin scale is evaluated once here instead of once per candidate inside the lighting loops.
         float3 msScale = ggxMultiScatterScale(F0, max(1.0e-4, dot(n, v)), rough, msGgxStrength);
 
         float emission = payloadEmission();
-        // Static emitters in the RIS list are covered by risInitial NEE and must not emit again on diffuse
-        // continuation rays. Dynamic emitter entity meshes follow the same rule, but their NEE ran only on
-        // the previous bounce (hitDepth <= 1), so the previous vertex records that in prevSampledDynamic.
-        // showCelestial (primary/specular/refraction) always keeps the mesh visible.
+        // Direct camera/mirror/dielectric chains (showCelestial == true) see full textured emission.
+        // Non-delta BSDF bounces suppress dynamic emitters already sampled at the previous vertex and
+        // weight listed static RIS emitters by the complementary power-heuristic MIS weight against
+        // evalSampleContrib so glossy/near-field emitter hits neither double-count nor firefly.
         bool gateStaticEmitter = risOn && payloadEmitterInList();
         bool gateDynamicEmitter = prevSampledDynamic && payloadDynamicEmitter();
-        if (emission > 0.0 && ((!gateStaticEmitter && !gateDynamicEmitter) || showCelestial)) {
-            L += throughput * albedo * emission;
+        if (emission > 0.0) {
+            float emitWeight = 1.0;
+            if (!showCelestial) {
+                if (gateDynamicEmitter) {
+                    emitWeight = 0.0;
+                } else if (gateStaticEmitter) {
+                    if (prevBsdfPdf > 0.0) {
+                        float hitDist = max(payload.hitT, 1.0e-3);
+                        float hitCosL = max(dot(n, v), 1.0e-4);
+                        emitWeight = powerHeuristic(prevBsdfPdf,
+                                staticEmitterMisPdf(hitDist * hitDist, hitCosL));
+                    } else {
+                        emitWeight = 0.0;
+                    }
+                }
+            }
+            if (emitWeight > 0.0) {
+                L += throughput * albedo * (emission * emitWeight);
+            }
         }
 
         // NEE: direct light from the dominant celestial body (sun by day, moon by night).
         float3 lightDir = celestialLight.dir;
-        float lightHalfAngle = celestialLight.halfAngle;
-        if (lightHalfAngle > 0.0) {
-            lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
-        }
-        float ndl = max(0.0, dot(n, lightDir));
-        if (ndl > 0.0) {
-            VisibilityResult shadow = visibility(p, lightDir, 10000.0);
-            float3 vis = shadow.transmittance;
-            if (medium.current.water && waterWaves && shadow.waterHitT > 0.0) {
-                vis *= waterCausticSpectral(p + lightDir * shadow.waterHitT, lightDir, shadow.waterHitT,
-                        causticsIntensity);
+        if (hasCelestialNee) {
+            float lightHalfAngle = celestialLight.halfAngle;
+            float wSunNee = 1.0;
+            if (lightHalfAngle > 0.0) {
+                lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
+                float pSun = celestialSquarePdf(lightDir, celestialLight.dir, lightHalfAngle);
+                float pBsdf = surfaceBsdfPdf(n, v, lightDir, rough, ps, exactSpecular);
+                wSunNee = powerHeuristic(pSun, pBsdf);
             }
-            if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
-                float3 brdf = diffAlb * INV_PI;
-                float3 h = safeHalfVector(lightDir, v, n);
-                float ndh = max(0.0, dot(n, h));
-                float ndv = max(1.0e-4, dot(n, v));
-                float vdh = max(0.0, dot(v, h));
-                float D = ggxD(ndh, rough);
-                float G = ggxG1(ndv, rough) * ggxG1(ndl, rough);
-                float3 F = fresnelSchlick(vdh, F0);
-                brdf += (D * G) * (F * msScale) / (4.0 * ndv * ndl);
-                L += throughput * brdf * celestialLight.illuminance * ndl * vis;
+            float ndl = max(0.0, dot(n, lightDir));
+            if (ndl > 0.0 && wSunNee > 0.0) {
+                VisibilityResult shadow = visibility(p, lightDir, 10000.0);
+                float3 vis = shadow.transmittance;
+                if (medium.current.water && waterWaves && shadow.waterHitT > 0.0) {
+                    vis *= waterCausticSpectral(p + lightDir * shadow.waterHitT, lightDir, shadow.waterHitT,
+                            causticsIntensity, rayConeWidth);
+                }
+                if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
+                    float3 brdf = diffAlb * INV_PI;
+                    float3 h = safeHalfVector(lightDir, v, n);
+                    float ndh = max(0.0, dot(n, h));
+                    float ndv = max(1.0e-4, dot(n, v));
+                    float vdh = max(0.0, dot(v, h));
+                    float D = ggxD(ndh, rough);
+                    float G = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+                    float3 F = fresnelSchlick(vdh, F0);
+                    brdf += (D * G) * (F * msScale) / (4.0 * ndv * ndl);
+                    L += throughput * brdf * celestialLight.illuminance * (ndl * wSunNee) * vis;
+                }
             }
         }
 
@@ -508,8 +556,6 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         // direct shadows and PBR specular highlights.
         if (dynLightsOn && hitDepth <= 1) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
-            // Independent proposal stream, exactly like risInitial's proposalSeed; the BSDF path's seed
-            // stays untouched so emitter sampling cannot perturb the continuation direction.
             DynamicReservoir dr = risDynamic(hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
                                              activeSss, proposalSeed);
             L += throughput * shadeDynamicReservoir(dr, hitPos, n, v, rd, diffAlb, F0, rough, msScale,
@@ -517,14 +563,14 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
         }
 
         // Thin-surface SSS transmission from celestial light.
-        if (sss > 0.0 && hitDepth <= MAX_SSS_INDIRECT_DEPTH) {
+        if (hasCelestialNee && sss > 0.0 && hitDepth <= MAX_SSS_INDIRECT_DEPTH) {
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
                 VisibilityResult shadowBack = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
                 float3 visB = shadowBack.transmittance;
                 if (medium.current.water && waterWaves && shadowBack.waterHitT > 0.0) {
                     visB *= waterCausticSpectral(hitPos + lightDir * shadowBack.waterHitT,
-                                                 lightDir, shadowBack.waterHitT, causticsIntensity);
+                                                 lightDir, shadowBack.waterHitT, causticsIntensity, rayConeWidth);
                 }
                 if (max(visB.r, max(visB.g, visB.b)) > 0.0) {
                     float cosT = dot(lightDir, rd);
@@ -537,19 +583,17 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
             break;
         }
 
-        // Did this vertex run risDynamic? Only hitDepth 0 and 1 do. Recorded on a diffuse continuation so
-        // the next hit can tell whether the torch it sees was already sampled as a light by NEE.
         bool sampledDynamicHere = dynLightsOn && hitDepth <= 1;
 
         // Indirect continuation: importance-sample the diffuse OR the GGX specular lobe.
-        float ps = exactSpecular && luminance(diffAlb) <= 1.0e-6
-                       ? 1.0
-                       : clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
         if (rndf(seed) < ps) {
             float3 l;
             if (exactSpecular) {
                 l = reflect(rd, n);
                 throughput *= fresnelSchlick(clamp(dot(n, v), 0.0, 1.0), F0) / ps;
+                showCelestial = true;
+                prevSampledDynamic = false;
+                prevBsdfPdf = 0.0;
             } else {
                 float3 h = sampleGGXVNDF(n, v, rough, seed);
                 l = reflect(rd, h);
@@ -560,24 +604,29 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
                 float3 F = fresnelSchlick(max(0.0, dot(v, h)), F0);
                 throughput *= (F * msScale) * ggxG1(ndl2, rough) / ps;
                 rayConeSpread = max(rayConeSpread, rough * RAY_CONE_GLOSSY_SPREAD_SCALE);
+                showCelestial = false;
+                prevSampledDynamic = sampledDynamicHere;
+                prevBsdfPdf = surfaceBsdfPdf(n, v, l, rough, ps, false);
             }
             ro = p;
             rd = l;
-            showCelestial = true;
-            // A specular continuation is a delta path: it may legitimately see the emitter mesh, and the
-            // next vertex must not inherit this vertex's diffuse-NEE bookkeeping.
-            prevSampledDynamic = false;
         } else {
+            float3 l = cosineDir(n, seed);
             throughput *= diffAlb / (1.0 - ps);
             ro = p;
-            rd = cosineDir(n, seed);
+            rd = l;
             rayConeSpread = max(rayConeSpread, RAY_CONE_DIFFUSE_SPREAD);
             showCelestial = false;
             prevSampledDynamic = sampledDynamicHere;
+            prevBsdfPdf = surfaceBsdfPdf(n, v, l, rough, ps, exactSpecular);
         }
 
+        float maxTp = max(throughput.r, max(throughput.g, throughput.b));
+        if (maxTp <= 1.0e-5) {
+            break;
+        }
         if (bounce >= rrStart) {
-            float q = clamp(max(throughput.r, max(throughput.g, throughput.b)), 0.02, 1.0);
+            float q = clamp(maxTp, 0.02, 1.0);
             if (rndf(seed) > q) {
                 break;
             }
@@ -589,28 +638,51 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex) {
 
 [shader("raygeneration")]
 void main() {
-    worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
-    celestialLight = dominantCelestialLight(skyState(worldPush), transmittanceLut);
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    celestialLight = dominantCelestialLight(skyState(wp), transmittanceLut);
     celestialLight.illuminance = bt709ToAcesCg(celestialLight.illuminance);
     uint2 dispatchIndex = DispatchRaysIndex().xy;
     uint2 dimensions = DispatchRaysDimensions().xy;
     int2 pix = int2(dispatchIndex);
-    uint spp = max(worldPush.spp, 1u);
+    uint spp = max(wp[0].spp, 1u);
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
+    uint splitRecord = dimensions.x * dimensions.y + pixelIndex;
     ConstPtr<PackedPathSegment> queue = ConstPtr<PackedPathSegment>(pc.pathQueueAddr);
     float3 frameRadiance = float3(0.0, 0.0, 0.0);
+    float3 prefixCamOrigin = float3(0.0, 0.0, 0.0);
+    float3 prefixCamDir = float3(0.0, 0.0, 1.0);
+    Medium prefixCameraMedium = airMedium();
+    bool prefixReady = false;
     uint recordIndex = pixelIndex;
     for (uint leaf = 0u; leaf < MAX_PATH_SEGMENTS; ++leaf) {
         PackedPathSegment packed = queue[recordIndex];
         PathSegment segment = unpackPathSegment(packed);
+        uint cachedPrimaryRecord = (packed.pathFlags & PATH_FLAG_CACHED_PRIMARY) != 0u
+                ? splitRecord : PATH_NO_NEXT;
+        if (segment.preInterfaceDist > 0.0 && !prefixReady) {
+            float2 dims = float2(dimensions);
+            float2 uv = (float2(pix) + 0.5) / dims;
+            float2 jndc = (uv + wp[0].jitter / dims) * 2.0 - 1.0;
+            float4 nearH = mul(wp[0].invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
+            float4 farH = mul(wp[0].invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
+            float3 nearP = nearH.xyz / nearH.w;
+            float3 farP = farH.xyz / farH.w;
+            prefixCamOrigin = nearP + wp[0].camOffset;
+            prefixCamDir = normalize(farP - nearP);
+            prefixCameraMedium = (wp[0].flags & WORLD_FLAG_SUBMERGED) != 0u
+                    ? makeDielectricMedium(true, WATER_IOR, wp[0].waterParams.xyz, 1.0)
+                    : airMedium();
+            prefixReady = true;
+        }
         for (uint s = 0u; s < spp; ++s) {
-            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp);
+            frameRadiance += tracePath(segment, uint2(pix), s + leaf * spp, cachedPrimaryRecord,
+                    prefixCamOrigin, prefixCamDir, prefixCameraMedium);
         }
         if (packed.nextRecord == PATH_NO_NEXT) {
             break;
         }
         recordIndex = packed.nextRecord;
     }
-    float3 stored = frameRadiance * (worldPush.preExposure / float(spp));
+    float3 stored = frameRadiance * (wp[0].preExposure / float(spp));
     outImage[pix] = float4(clamp(stored, float3(0.0), float3(HALF_MAX)), 1.0);
 }

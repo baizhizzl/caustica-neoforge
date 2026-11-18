@@ -12,6 +12,7 @@ import org.lwjgl.util.vma.VmaAllocationCreateInfo;
 import org.lwjgl.util.vma.VmaAllocationInfo;
 import org.lwjgl.util.vma.VmaAllocatorCreateInfo;
 import org.lwjgl.util.vma.VmaVulkanFunctions;
+import org.lwjgl.vulkan.KHRSynchronization2;
 import org.lwjgl.vulkan.VK10;
 import org.lwjgl.vulkan.VK11;
 import org.lwjgl.vulkan.VK12;
@@ -21,6 +22,7 @@ import org.lwjgl.vulkan.VkCommandBuffer;
 import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
 import org.lwjgl.vulkan.VkCommandBufferBeginInfo;
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
+import org.lwjgl.vulkan.VkDependencyInfo;
 import org.lwjgl.vulkan.VkDevice;
 import org.lwjgl.vulkan.VkFenceCreateInfo;
 import org.lwjgl.vulkan.VkFormatProperties;
@@ -28,6 +30,7 @@ import org.lwjgl.vulkan.VkImageCreateInfo;
 import org.lwjgl.vulkan.VkImageFormatProperties;
 import org.lwjgl.vulkan.VkImageMemoryBarrier;
 import org.lwjgl.vulkan.VkImageViewCreateInfo;
+import org.lwjgl.vulkan.VkMemoryBarrier2;
 import org.lwjgl.vulkan.VkPhysicalDevice;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructurePropertiesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceDescriptorIndexingProperties;
@@ -253,6 +256,32 @@ public final class RtContext {
     public RtBuffer createAsyncBuffer(long size, int usage, boolean hostVisible, String label) {
         return createBuffer(size, usage, hostVisible, label, true,
                 hostVisible ? Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT : 0, 0L);
+    }
+
+    /** Create a persistently mapped host-to-GPU buffer optimized for sequential writes (ring/geometry uploads). */
+    public RtBuffer createSequentialBuffer(long size, int usage, String label) {
+        return createBuffer(size, usage, true, label, false,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, 0L);
+    }
+
+    /** Create an aligned persistently mapped host-to-GPU buffer optimized for sequential writes. */
+    public RtBuffer createSequentialAlignedBuffer(long size, int usage, String label, long addressAlignment) {
+        return createBuffer(size, usage, true, label, false,
+                Vma.VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT, addressAlignment);
+    }
+
+    /** Emit a fine-grained stage/access synchronization2 memory barrier instead of a full ALL_COMMANDS stall. */
+    public static void memoryBarrier2(VkCommandBuffer cmd, MemoryStack stack,
+                                      long srcStage, long srcAccess,
+                                      long dstStage, long dstAccess) {
+        VkMemoryBarrier2.Buffer barrier = VkMemoryBarrier2.calloc(1, stack);
+        barrier.get(0).sType$Default()
+                .srcStageMask(srcStage)
+                .srcAccessMask(srcAccess)
+                .dstStageMask(dstStage)
+                .dstAccessMask(dstAccess);
+        VkDependencyInfo dep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(barrier);
+        KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, dep);
     }
 
     /** Create a transient, persistently mapped upload buffer optimized for sequential host writes. */

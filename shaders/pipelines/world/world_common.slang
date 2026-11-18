@@ -65,7 +65,7 @@ public struct WorldPush {
     public float3   camDelta;
     public uint     spp;
     public float2   jitter;
-    public uint     flags;            // bit0 submerged, bit4 waves
+    public uint     flags;            // bit0 submerged, bit4 waves, bit5 specGuides, bit6 transGuides
     public uint     maxBounces;
     // ---- Sky state. Only what the CPU alone can know: Minecraft's four eased celestial angles (the
     // 26.2 timeline drives them through a cubic-bezier ease and a datapack may replace the track, so
@@ -259,13 +259,22 @@ public static const uint MATERIAL_WATER = 1u;
 public static const uint MATERIAL_PARTICLE = 2u;
 public static const uint MATERIAL_DIELECTRIC = 3u;
 
+public static const uint WORLD_FLAG_SUBMERGED = 1u;
+public static const uint WORLD_FLAG_WATER_WAVES = 16u;
+public static const uint WORLD_FLAG_SPEC_GUIDES = 32u;
+public static const uint WORLD_FLAG_TRANSMISSION_GUIDES = 64u;
+
+// EntityPrim.flags layout: bits 0..1 hold the MATERIAL_* model id; bit 2 marks stochastic alpha so
+// world.rahit can alpha-test and tint entity shadow rays without fetching the 80-byte MaterialHeader.
+public static const uint ENTITY_PRIM_STOCHASTIC_ALPHA = 4u;
+
 // Entity per-triangle record (48 B). The final lane mirrors TerrainPrim's integer material metadata.
 public struct Prim {
     public float4 normal; // xyz = geometric normal, w = per-primitive emission strength
     public float4 tint;
     public uint materialId;
-    public uint flags;
-    public uint aux0;
+    public uint flags;    // bits 0..1 MATERIAL_*, bit 2 ENTITY_PRIM_STOCHASTIC_ALPHA
+    public uint aux0;     // asuint(transmission) for shadow-ray entity dielectrics/water
     public uint aux1;
 };
 

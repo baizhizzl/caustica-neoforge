@@ -246,21 +246,28 @@ public final class RtSkyLut {
             VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
 
             if (!staticLutsBaked) {
-                dispatch(cmd, stack, transmittancePipeline, TRANSMITTANCE_WIDTH, TRANSMITTANCE_HEIGHT);
-                // The multiple-scattering bake samples the transmittance LUT the previous dispatch just
-                // wrote, and the sky-view bake samples both.
-                dispatch(cmd, stack, multiScatterPipeline, MULTISCATTER_WIDTH, MULTISCATTER_HEIGHT);
+                dispatch(cmd, transmittancePipeline, TRANSMITTANCE_WIDTH, TRANSMITTANCE_HEIGHT);
+                RtContext.memoryBarrier2(cmd, stack,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
+                dispatch(cmd, multiScatterPipeline, MULTISCATTER_WIDTH, MULTISCATTER_HEIGHT);
+                RtContext.memoryBarrier2(cmd, stack,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
                 staticLutsBaked = true;
             }
-            dispatch(cmd, stack, skyViewPipeline, SKY_VIEW_WIDTH, SKY_VIEW_HEIGHT);
+            dispatch(cmd, skyViewPipeline, SKY_VIEW_WIDTH, SKY_VIEW_HEIGHT);
         }
     }
 
-    private void dispatch(VkCommandBuffer cmd, MemoryStack stack, long pipeline, int width, int height) {
+    private void dispatch(VkCommandBuffer cmd, long pipeline, int width, int height) {
         VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
         VK10.vkCmdDispatch(cmd, (width + GROUP_SIZE - 1) / GROUP_SIZE,
                 (height + GROUP_SIZE - 1) / GROUP_SIZE, 1);
-        VulkanCommandEncoder.memoryBarrier(cmd, stack);
     }
 
     public void destroy() {

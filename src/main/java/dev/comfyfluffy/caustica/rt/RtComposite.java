@@ -777,8 +777,8 @@ public final class RtComposite {
             if (pushRing == null) {
                 pushRing = new PushSlot[PUSH_RING];
                 for (int i = 0; i < PUSH_RING; i++) {
-                    pushRing[i] = new PushSlot(ctx.createBuffer(WORLD_PUSH_SIZE,
-                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true, "rt world push " + i));
+                    pushRing[i] = new PushSlot(ctx.createSequentialBuffer(WORLD_PUSH_SIZE,
+                            VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, "rt world push " + i));
                 }
             }
             if (output != null) {
@@ -1138,6 +1138,16 @@ public final class RtComposite {
                 if (waterWaves()) {
                     flags |= 0b10000; // animated water wave normals
                 }
+                boolean specGuidesNeeded = rrPath || debugView != 0;
+                boolean transmissionGuidesNeeded = specGuidesNeeded
+                        || CausticaConfig.Rt.Fg.ENABLED.value()
+                        || exposure.isAutoMode();
+                if (specGuidesNeeded) {
+                    flags |= 0b100000; // WORLD_FLAG_SPEC_GUIDES
+                }
+                if (transmissionGuidesNeeded) {
+                    flags |= 0b1000000; // WORLD_FLAG_TRANSMISSION_GUIDES
+                }
 
                 // Water parameters: camera-biome tint plus wrapped animation time. Per-water-body tint
                 // comes from the primitive; this is the fallback for a camera already inside the medium.
@@ -1256,23 +1266,25 @@ public final class RtComposite {
                     try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("entity.blasRecord")) {
                         RtAccel.recordBlasBuilds(ctx, cmd, fe.blas());
                     }
-                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // entity BLAS writes visible to the TLAS build
+                    RtContext.memoryBarrier2(cmd, stack,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR);
                 }
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.prepareTlas")) {
                     frameTlas = RtAccel.prepareTlas(ctx, fe.baseInstances(), terrain.staticInstancesRevision(),
                             fe.dynamicInstances(), tlasRing, !fe.blas().isEmpty(), graphicsUse, graphicsUseWaiter);
                 }
-                active.setTlas(frameTlas.accel.handle, graphicsUse, graphicsUseWaiter);
+                active.setTlas(frameTlas.accel, graphicsUse, graphicsUseWaiter);
                 currentTlasHandle = frameTlas.accel.handle;
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.recordTlas")) {
                     RtAccel.recordTlasBuild(ctx, cmd, frameTlas);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // TLAS build visible to the trace
 
                 // Push the BDA ring slot's address plus the small hot subset used directly by the shaders.
-                // Every 64-bit device address the trace needs lives here rather than behind worldPushAddr:
-                // the section/entity/material tables are read from any_hit.rahit and closest_hit.rchit, which
-                // never load WorldPush, and the RIS light buffers are read from the raygen inner loops.
+                // Recorded alongside the TLAS build before the combined barrier below so GPU sky-LUT/presample
+                // compute work can overlap with TLAS construction instead of stalling behind ALL_COMMANDS.
                 ByteBuffer pushConstants = stack.malloc(WorldPushConstantsData.BYTE_SIZE);
                 new WorldPushConstantsData(pushBuf.deviceAddress, terrain.tableAddress(), fe.geomTableAddr(),
                         RtMaterialRegistry.INSTANCE.tableAddress(),
@@ -1288,75 +1300,92 @@ public final class RtComposite {
                                 (int) frameCounter, lightPlan.entryCount());
                     }
                 }
-                // Sky LUTs, from the same WorldPush slot the trace is about to read: the sky the LUT holds and
-                // the sky the frame shades are built from one set of angles, not two. Recorded here (after the
-                // push flush, before the trace) so the miss shader's very first fetch sees this frame's dome.
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.skyLut")) {
                     skyLut.record(cmd, pushBuf.deviceAddress);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // sky LUT writes visible to raygen/miss
+                RtContext.memoryBarrier2(cmd, stack,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                                | KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
 
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world primary trace");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.tracePrimary")) {
                     active.trace(cmd, renderW, renderH, pushConstants, 0);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // continuation/guide writes visible to pass B
+                RtContext.memoryBarrier2(cmd, stack,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world indirect trace");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.traceIndirect")) {
                     active.trace(cmd, renderW, renderH, pushConstants, 1);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // RT writes visible to DLSS reads
-                // DLSS-RR denoise + upscale. The RT pass wrote noisy color (render res) + guides;
-                // RR reads them and writes the display-res denoised result straight into rrOutput.
                 if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // NGX DLSS-RR external compute boundary
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate");
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.dlssRr")) {
                         rrDone = RtDlssRr.INSTANCE.evaluate(cmd.address(), output, gDepth, gMotion, gAlbedo,
                                 gSpecAlbedo, gNormal, gSpecMotion, rrOutput, renderW, renderH, displayW, displayH,
                                 -jitterX, -jitterY, frameViewRotation, frameProjection);
                     }
+                    VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure/bloom/display
                 }
 
-                // When DLSS-RR did not produce the display-res image (disabled or a runtime failure), bring
-                // the render-res trace up to display res with a linear blit so the display mapper and
-                // downstream debug pass always have a valid display-res scene image. With RR off
-                // render == display, so this is a 1:1 copy.
                 if (!rrDone) {
-                    VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                    RtContext.memoryBarrier2(cmd, stack,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_TRANSFER_READ_BIT_KHR);
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "fallback upscale");
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.upscale")) {
                         blitUpscale(cmd, stack, output, rrOutput);
                     }
+                    RtContext.memoryBarrier2(cmd, stack,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR
+                                    | KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR
+                                    | KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR
+                                    | KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // rrOutput visible to exposure histogram
 
-                // Auto-exposure meters rrOutput (the post-RR, denoised/converged image), not the raw
-                // pre-RR trace: RR has no notion of exposure (DLSS-RR Integration Guide §3.7 — ignore
-                // exposure/auto-exposure/sharpness entirely for RR), so this is purely our own metering
-                // choice, independent of RR's pipeline placement. Metering the noisy pre-RR buffer made
-                // the histogram's log-luminance average biased by Monte-Carlo noise (Jensen's inequality
-                // on the concave log()), so the computed exposure drifted with SPP; rrOutput is stable
-                // regardless of SPP, keeping exposure consistent.
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.exposure")) {
                     exposure.record(ctx, cmd, stack, rrOutput, gDepth, gAlbedo);
                     exposure.recordStateReadback(cmd, stack);
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // exposure image visible to the display mapper
+                // Manual exposure writes via vkCmdClearColorImage (CLEAR / ALL_TRANSFER), while auto
+                // exposure writes via compute storage; cover both before bloom/display read exposureImage.
+                RtContext.memoryBarrier2(cmd, stack,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR
+                                | KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
 
-                try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "bloom");
-                     RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.bloom")) {
-                    RtLookPackage.Bloom bloom = LOOK.bloom();
-                    // The tent radius is in source texels, so it needs no resolution scaling: the pyramid's
-                    // reach is set by its level count, and each level's texel already scales with the frame.
-                    bloomPipeline.dispatch(cmd, bloomLevels,
-                            bloom.thresholdSceneLinear(), bloom.softKneeFraction(), bloom.radius());
+                RtLookPackage.Bloom bloom = LOOK.bloom();
+                float effectiveBloomStrength = (bloom.strength()
+                        * CausticaConfig.Rt.Visuals.BLOOM_SCALE.value()) / bloomLevels.length;
+                if (effectiveBloomStrength > 0.0f) {
+                    try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "bloom");
+                         RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.bloom")) {
+                        bloomPipeline.dispatch(cmd, bloomLevels,
+                                bloom.thresholdSceneLinear(), bloom.softKneeFraction(), bloom.radius());
+                    }
                 }
 
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "map RT to display");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.displayMap")) {
-                    float effectiveBloomStrength = (LOOK.bloom().strength()
-                            * CausticaConfig.Rt.Visuals.BLOOM_SCALE.value()) / bloomLevels.length;
                     displayPipeline.dispatch(cmd, displayW, displayH, CausticaConfig.Rt.Hdr.enabled(),
                             sdrToneLut.size, CausticaConfig.Rt.Tonemap.GAMMA.value(), loadedHdrLutNits,
                             true, lookLut.size, effectiveBloomStrength,
@@ -1365,13 +1394,15 @@ public final class RtComposite {
                             CausticaConfig.Rt.Visuals.SHARPNESS.value());
                 }
                 hdrWrittenThisFrame = CausticaConfig.Rt.Hdr.enabled();
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // display output visible to debug composite
 
                 if (debugView != 0) {
-                    // Debug content is composited only after the real scene has completed trace, RR/fallback,
-                    // exposure, and display mapping. It therefore observes the renderer without perturbing
-                    // exposure history or feeding literal diagnostic colors through ACES. Debug presentation
-                    // remains SDR for now; a PQ swapchain uses the existing SDR->PQ conversion path.
+                    RtContext.memoryBarrier2(cmd, stack,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR
+                                    | KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                            KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                            KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR
+                                    | KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "debug present");
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.debugPresent")) {
                         debugPresentPipeline.dispatch(cmd, displayW, displayH, debugView,
@@ -1380,7 +1411,11 @@ public final class RtComposite {
                     }
                     hdrWrittenThisFrame = false;
                 }
-                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                RtContext.memoryBarrier2(cmd, stack,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_TRANSFER_READ_BIT_KHR);
 
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.copyOutput")) {
@@ -1708,12 +1743,16 @@ public final class RtComposite {
     private long atlasSampler(RtContext ctx) {
         if (atlasSampler == 0L) {
             try (MemoryStack stack = MemoryStack.stackPush()) {
+                boolean aniso = RtDeviceBringup.samplerAnisotropyEnabled()
+                        && RtDeviceBringup.maxSamplerAnisotropy() > 1.0f;
                 VkSamplerCreateInfo sci = VkSamplerCreateInfo.calloc(stack).sType$Default()
                         .magFilter(VK10.VK_FILTER_NEAREST).minFilter(VK10.VK_FILTER_NEAREST)
                         .mipmapMode(VK10.VK_SAMPLER_MIPMAP_MODE_LINEAR)
                         .addressModeU(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeV(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
                         .addressModeW(VK10.VK_SAMPLER_ADDRESS_MODE_REPEAT)
+                        .anisotropyEnable(aniso)
+                        .maxAnisotropy(aniso ? RtDeviceBringup.maxSamplerAnisotropy() : 1.0f)
                         .minLod(0f).maxLod(16f);
                 LongBuffer p = stack.mallocLong(1);
                 if (VK10.vkCreateSampler(ctx.vk(), sci, null, p) != VK10.VK_SUCCESS) {

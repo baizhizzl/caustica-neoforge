@@ -33,21 +33,38 @@ public float waterWaveLodWeight(float wavelength, float footprint) {
 // gradient — the trigonometry is shared, but the chain-rule work is not free.
 public void waterWaveSpectrum<let WITH_DT : int>(float2 p, float t, float footprint,
                                           out float2 grad, out float2 gradDt) {
-    // Per-wave steepness a·k: gentle in the long swell, concentrated in the mid/short chop.
+    // Per-wave steepness a·k, wavelength λ, wavenumber k = 2π/λ, deep-water ω = √(g·k), and wind-spread
+    // unit headings precomputed across all 10 octaves so no per-octave trig/sqrt runs on constant indices.
     const float Q[WAVE_COUNT] = { 0.030, 0.035, 0.042, 0.050, 0.060, 0.065, 0.065, 0.058, 0.048, 0.038 };
+    const float LAMBDA[WAVE_COUNT] = {
+        14.00000000, 9.33333333, 6.22222222, 4.14814815, 2.76543210,
+        1.84362140, 1.22908093, 0.81938729, 0.54625819, 0.36417213
+    };
+    const float K[WAVE_COUNT] = {
+        0.44879895, 0.67319843, 1.00979764, 1.51469646, 2.27204469,
+        3.40806703, 5.11210055, 7.66815083, 11.50222624, 17.25333936
+    };
+    const float W[WAVE_COUNT] = {
+        2.09826526, 2.56983956, 3.14739773, 3.85475916, 4.72109638,
+        5.78213808, 7.08164385, 8.67320703, 10.62246585, 13.00981140
+    };
+    const float DX[WAVE_COUNT] = {
+        0.88643689, 0.98028219, 0.96396434, 0.75184189, 0.96875772,
+        0.69285884, 0.94170789, 0.95829132, 0.20589894, 0.84580863
+    };
+    const float DY[WAVE_COUNT] = {
+        0.46284951, 0.19760319, 0.26603034, 0.65934487, -0.24800902,
+        0.72107325, 0.33643312, -0.28579285, 0.97857326, -0.53348642
+    };
     t *= WAVE_SPEED;
     grad = float2(0.0, 0.0);
     gradDt = float2(0.0, 0.0);
-    float lambda = 14.0;
     for (int i = 0; i < WAVE_COUNT; i++) {
-        float lodWeight = waterWaveLodWeight(lambda, footprint);
+        float lodWeight = waterWaveLodWeight(LAMBDA[i], footprint);
         if (lodWeight <= 0.0) break;
-        float k = 2.0 * PI / lambda;
-        float w = sqrt(WAVE_G * k);   // deep-water dispersion: phase speed √(g/k)
-        // Heading: deterministic irregular spread about the wind, widening down the spectrum.
-        float spread = (0.15 + 0.11 * float(i)) * sin(float(i) * 2.4 + 1.3);
-        float cs = cos(spread), sn = sin(spread);
-        float2 d = float2(WAVE_WIND.x * cs - WAVE_WIND.y * sn, WAVE_WIND.x * sn + WAVE_WIND.y * cs);
+        float k = K[i];
+        float w = W[i];
+        float2 d = float2(DX[i], DY[i]);
         float ph = k * dot(d, p) - w * t + 1.7 * float(i) * float(i);
         float2 dph = k * d;
         float phDt = -w;                      // ∂φ/∂t
@@ -75,7 +92,6 @@ public void waterWaveSpectrum<let WITH_DT : int>(float2 p, float t, float footpr
             gradDt += amplitude * e
                     * (phDt * (-sinPh + S * cosPh * cosPh) * dph + cosPh * dphDt);
         }
-        lambda /= 1.5;
     }
     grad *= WATER_WAVE_STRENGTH;
     gradDt *= WATER_WAVE_STRENGTH;
@@ -136,7 +152,8 @@ float causticChannelFocus(float2 base, float2 baseX, float2 baseZ,
     return min(focus, CAUSTIC_MAX);
 }
 
-public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterDist, float intensity) {
+public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterDist, float intensity,
+                                   float footprint) {
     if (intensity <= 0.0) {
         return float3(1.0, 1.0, 1.0);
     }
@@ -144,16 +161,20 @@ public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterD
     if (fade <= 0.0) {
         return float3(1.0, 1.0, 1.0);
     }
+    ConstPtr<WorldPush> wp = worldPushPtr();
     float h = max(waterDist * lightDir.y, 0.05);
-    float t = worldPush.waterParams.w;
+    float t = wp[0].waterParams.w;
     float3 inc = -lightDir;
-    float2 base = exitPos.xz + worldPush.waterAnchor.xy;
+    float2 base = exitPos.xz + wp[0].waterAnchor.xy;
     float2 baseX = base + float2(CAUSTIC_EPS, 0.0);
     float2 baseZ = base + float2(0.0, CAUSTIC_EPS);
+    // Wavelengths finer than the finite-difference step alias across [base, base + eps] anyway; combine
+    // with the caller's ray-cone footprint so distant/deep receivers prune high-frequency chop octaves.
+    float causticFootprint = max(CAUSTIC_EPS, footprint);
 
-    float2 g0 = waterWaveGrad(base, t);
-    float2 gx = waterWaveGrad(baseX, t);
-    float2 gz = waterWaveGrad(baseZ, t);
+    float2 g0 = waterWaveGrad(base, t, causticFootprint);
+    float2 gx = waterWaveGrad(baseX, t, causticFootprint);
+    float2 gz = waterWaveGrad(baseZ, t, causticFootprint);
     float3 nw0 = normalize(float3(-g0.x, 1.0, -g0.y));
     float3 nwx = normalize(float3(-gx.x, 1.0, -gx.y));
     float3 nwz = normalize(float3(-gz.x, 1.0, -gz.y));
@@ -171,4 +192,8 @@ public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterD
     float3 shaped = max(float3(1.0) + (focus - float3(1.0)) * intensity, float3(0.0));
     shaped = min(shaped, float3(CAUSTIC_MAX));
     return lerp(float3(1.0), shaped, fade);
+}
+
+public float3 waterCausticSpectral(float3 exitPos, float3 lightDir, float waterDist, float intensity) {
+    return waterCausticSpectral(exitPos, lightDir, waterDist, intensity, CAUSTIC_EPS);
 }

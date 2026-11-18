@@ -140,12 +140,31 @@ public final class RtWorldOverlay {
             long overlayView = overlayImage.view;
             beginColorRendering(cmd, stack, overlayView, width, height, true); // clear to transparent once
             endRendering(cmd);
-            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+            RtContext.memoryBarrier2(cmd, stack,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT_KHR
+                            | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR);
 
-            for (RtOverlayFeature f : ready) {
-                f.record(cmd, overlayView, width, height);
-                VulkanCommandEncoder.memoryBarrier(cmd, stack); // this feature's writes visible to the next / final composite
+            for (int i = 0; i < ready.size(); i++) {
+                ready.get(i).record(cmd, overlayView, width, height);
+                if (i + 1 < ready.size()) {
+                    RtContext.memoryBarrier2(cmd, stack,
+                            org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+                            org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR,
+                            org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR
+                                    | org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
+                            org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT_KHR
+                                    | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR
+                                    | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
+                }
             }
+            RtContext.memoryBarrier2(cmd, stack,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT_KHR,
+                    org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
 
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "world overlay UI composite")) {
                 beginColorRendering(cmd, stack, targetView, width, height, false); // LOAD the transparent UI image

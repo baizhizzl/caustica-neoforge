@@ -19,6 +19,7 @@ import java.util.List;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.core.registries.BuiltInRegistries;
@@ -95,6 +96,8 @@ public final class RtDynamicLights {
     private final float[] acesScratch = new float[3];
     private final double[] anchorScratch = new double[3];
     private final double[] handScratch = new double[3];
+    private final BlockPos.MutableBlockPos clipBlockPos = new BlockPos.MutableBlockPos();
+    private final DynamicLight[][] resultBuffers = new DynamicLight[WorldPushData.DYNAMIC_LIGHTS_CAPACITY + 1][];
     // Double accumulation keeps flicker phase continuous for days of play without a modulo discontinuity.
     private double animSeconds;
     private long lastNanoTime = 0L;
@@ -427,7 +430,11 @@ public final class RtDynamicLights {
         // Slot order is stable-key order so frame-to-frame slot indices do not permute.
         RtDynamicLightSpecs.sortCandidatesByStableKey(scratchCandidates, selectedCount);
 
-        DynamicLight[] result = new DynamicLight[selectedCount];
+        DynamicLight[] result = resultBuffers[selectedCount];
+        if (result == null) {
+            result = new DynamicLight[selectedCount];
+            resultBuffers[selectedCount] = result;
+        }
         for (int i = 0; i < selectedCount; i++) {
             Candidate candidate = scratchCandidates.get(i);
             int excludeBit = candidate.ownerEntityId() != RtDynamicLightSpecs.NO_ENTITY
@@ -538,11 +545,43 @@ public final class RtDynamicLights {
                                            float userIntensity, boolean allowFlicker, float priorityBoost) {
         long key = packKey(living.getId(), slot);
         smoothAnchor(key, eyePos.x + offsetX, eyePos.y + offsetY, eyePos.z + offsetZ, alpha, frameSerial);
-        Vec3 clipped = clipOutOfWalls(level, living, eyePos,
-                new Vec3(anchorScratch[0], anchorScratch[1], anchorScratch[2]));
-        addCandidate(clipped.x, clipped.y, clipped.z, camX, camY, camZ,
+        double tx = anchorScratch[0];
+        double ty = anchorScratch[1];
+        double tz = anchorScratch[2];
+        if (!isOpenAirSpan(level, eyePos.x, eyePos.y, eyePos.z, tx, ty, tz)) {
+            Vec3 clipped = clipOutOfWalls(level, living, eyePos, new Vec3(tx, ty, tz));
+            tx = clipped.x;
+            ty = clipped.y;
+            tz = clipped.z;
+        }
+        addCandidate(tx, ty, tz, camX, camY, camZ,
                 profile, key, shadowOwnerId, animSeconds, baselineCdM2, userIntensity,
                 allowFlicker, priorityBoost);
+    }
+
+    private boolean isOpenAirSpan(ClientLevel level, double x0, double y0, double z0,
+                                  double x1, double y1, double z1) {
+        int minX = Mth.floor(Math.min(x0, x1));
+        int maxX = Mth.floor(Math.max(x0, x1));
+        int minY = Mth.floor(Math.min(y0, y1));
+        int maxY = Mth.floor(Math.max(y0, y1));
+        int minZ = Mth.floor(Math.min(z0, z1));
+        int maxZ = Mth.floor(Math.max(z0, z1));
+        if ((maxX - minX) > 2 || (maxY - minY) > 2 || (maxZ - minZ) > 2) {
+            return false;
+        }
+        for (int bx = minX; bx <= maxX; bx++) {
+            for (int by = minY; by <= maxY; by++) {
+                for (int bz = minZ; bz <= maxZ; bz++) {
+                    clipBlockPos.set(bx, by, bz);
+                    BlockState state = level.getBlockState(clipBlockPos);
+                    if (!state.isAir() && !state.getCollisionShape(level, clipBlockPos).isEmpty()) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     private void writeDisplayOffset(Display display, float partial, float camXRot, float camYRot,

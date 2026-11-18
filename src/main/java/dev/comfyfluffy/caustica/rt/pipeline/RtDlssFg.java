@@ -34,6 +34,9 @@ public final class RtDlssFg {
 
     private NgxLibrary lib;
     private MemorySegment feature = MemorySegment.NULL;
+    private final Arena matrixScratchArena = Arena.ofAuto();
+    private final MemorySegment clipToPrevScratch = matrixScratchArena.allocate(ValueLayout.JAVA_FLOAT, 16);
+    private final MemorySegment prevToClipScratch = matrixScratchArena.allocate(ValueLayout.JAVA_FLOAT, 16);
     private boolean initialized;
     private boolean failed;
     private boolean probed;
@@ -222,9 +225,9 @@ public final class RtDlssFg {
         if (!isReady()) {
             return false;
         }
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment clipToPrev = matrixSegment(arena, clipToPrevClip);
-            MemorySegment prevToClip = matrixSegment(arena, prevClipToClip);
+        try {
+            MemorySegment clipToPrev = writeMatrixSegment(clipToPrevScratch, clipToPrevClip);
+            MemorySegment prevToClip = writeMatrixSegment(prevToClipScratch, prevClipToClip);
             int rc = lib.evaluateDlssg(cmd, feature,
                     backbufferView, backbufferImage, backbufferFormat,
                     depthView, depthImage, depthFormat,
@@ -251,11 +254,10 @@ public final class RtDlssFg {
     }
 
     /** Format a JOML matrix into NGX left-multiply (row-major) layout, or NULL for a null matrix. */
-    private static MemorySegment matrixSegment(Arena arena, Matrix4fc m) {
+    private static MemorySegment writeMatrixSegment(MemorySegment seg, Matrix4fc m) {
         if (m == null) {
             return MemorySegment.NULL;
         }
-        MemorySegment seg = arena.allocate(ValueLayout.JAVA_FLOAT, 16);
         seg.setAtIndex(ValueLayout.JAVA_FLOAT, 0, m.m00());
         seg.setAtIndex(ValueLayout.JAVA_FLOAT, 1, m.m01());
         seg.setAtIndex(ValueLayout.JAVA_FLOAT, 2, m.m02());

@@ -5,9 +5,11 @@ import world_common;
 import sky;
 import bindings;
 
-// Per-frame push data loaded once from the BDA buffer at the top of main() (same pattern as the GLSL
-// `worldPush` global). Layout constants generated from this module's SPIR-V — see world_common.WorldPush.
-public static WorldPush worldPush = {};
+// Per-frame push data accessed directly in the BDA buffer via pc.worldPushAddr so stages read only the
+// scalar/vector lanes they consume instead of copying the 1184-byte struct or spilling embedded arrays.
+public ConstPtr<WorldPush> worldPushPtr() {
+    return ConstPtr<WorldPush>(pc.worldPushAddr);
+}
 
 // The radiance payload remains module-level so tracePath and its guide helpers can share it across
 // HitObject trace/invoke calls, mirroring the GLSL rayPayloadEXT global.
@@ -78,7 +80,7 @@ public static const float RAY_TMIN = 0.001;   // tiny tmin: the normal offset al
 
 // Water is a smooth dielectric. IOR 1.333; absorption is per-block Beer-Lambert extinction.
 public static const float WATER_IOR = 1.333;
-public static const float3 SKY_SPEC_ALBEDO = float3(0.5, 0.5, 0.5); // RR guide default for sky pixels.
+public static const float3 SKY_SPEC_ALBEDO = float3(0.0, 0.0, 0.0); // Sky misses carry no specular lobe in DLSS-RR.
 public static const float3 SKY_DIFF_ALBEDO = float3(0.5, 0.5, 0.5);
 
 // Transmitted-ray origin offset when crossing a face from the TRANSLUCENT terrain layer (glass, ice).
@@ -100,6 +102,10 @@ public static const float RAY_CONE_GLOSSY_SPREAD_SCALE = 0.35;
 
 // Stored roughness IS alpha (see payloadRoughness), so these compare against it directly.
 public static const float MIRROR_ALPHA_MAX = 4.0e-4; // LabPBR perceptual smoothness >= 0.98
+// Authored LabPBR frosted glass / rough ice threshold (perceptual smoothness <= 0.80). Vanilla clear
+// glass defaults to alpha = 0.0025 (s = 0.95) and stays on Pass A's deterministic Fresnel split, while
+// genuinely rough dielectrics switch to microfacet VNDF reflection/refraction in Pass B.
+public static const float FROSTED_DIELECTRIC_ALPHA_MIN = 0.04;
 // Above this the specular lobe is too broad for a single mirrored reprojection to describe, so the
 // reflection MV is left at zero and RR falls back to the ordinary MV.
 public static const float SPEC_MOTION_ALPHA_MAX = 0.25; // perceptual smoothness <= 0.5

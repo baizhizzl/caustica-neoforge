@@ -46,6 +46,7 @@ public final class RtMaterialRegistry {
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
+    public static final int ENTITY_PRIM_STOCHASTIC_ALPHA = 4;
     // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo. Baked into every
     // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
     // any resource-pack absolute emission.strength_cd_m2 override; see header() and RtMaterialOverrides.
@@ -105,6 +106,8 @@ public final class RtMaterialRegistry {
     private int entityEmissiveFallbackId;
     private int nextDynamicId;
     private int tableCapacity;
+    private volatile int[] primFlagsTable = new int[0];
+    private volatile int[] primAux0Table = new int[0];
 
     private record EntityTemplate(RtMaterialDesc desc, RtBlockMaterials.Entry entry) {
     }
@@ -272,13 +275,18 @@ public final class RtMaterialRegistry {
         }
         RtBuffer nextTable = ctx.createBuffer(byteSize, VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 true, "material table");
+        int[] nextPrimFlags = new int[recordCapacity];
+        int[] nextPrimAux0 = new int[recordCapacity];
         try {
             ByteBuffer mapped = MemoryUtil.memByteBuffer(nextTable.mapped, (int) byteSize)
                     .order(ByteOrder.nativeOrder());
             for (int i = 0; i < headers.size(); i++) {
+                MaterialHeaderData h = headers.get(i);
                 ByteBuffer entry = mapped.slice(i * MaterialHeaderData.BYTE_SIZE,
                         MaterialHeaderData.BYTE_SIZE).order(ByteOrder.nativeOrder());
-                headers.get(i).write(entry);
+                h.write(entry);
+                nextPrimFlags[i] = packEntityPrimFlags(h.model(), h.features());
+                nextPrimAux0[i] = Float.floatToRawIntBits(h.params().w());
             }
             nextTable.flush();
         } catch (Throwable t) {
@@ -312,6 +320,8 @@ public final class RtMaterialRegistry {
         entityEmissiveFallbackId = nextEntityEmissiveFallbackId;
         nextDynamicId = headers.size();
         tableCapacity = recordCapacity;
+        primFlagsTable = nextPrimFlags;
+        primAux0Table = nextPrimAux0;
         table = nextTable;
         snapshot = next; // volatile publication: map and arrays are never mutated afterward
         if (oldTable != null) oldTable.destroy();
@@ -392,8 +402,11 @@ public final class RtMaterialRegistry {
                 MaterialHeaderData.BYTE_SIZE);
         ByteBuffer target = MemoryUtil.memByteBuffer(table.mapped + targetOffset, MaterialHeaderData.BYTE_SIZE)
                 .order(ByteOrder.nativeOrder());
-        target.putInt(4, target.getInt(4) | FEATURE_STOCHASTIC_ALPHA);
+        int features = target.getInt(4) | FEATURE_STOCHASTIC_ALPHA;
+        target.putInt(4, features);
         table.flush(targetOffset, MaterialHeaderData.BYTE_SIZE);
+        primFlagsTable[id] = packEntityPrimFlags(target.getInt(0), features);
+        primAux0Table[id] = primAux0Table[materialId];
         stochasticAlphaIds.put(materialId, id);
         return id;
     }
@@ -458,8 +471,26 @@ public final class RtMaterialRegistry {
                 .order(ByteOrder.nativeOrder());
         header.write(target);
         table.flush(offset, MaterialHeaderData.BYTE_SIZE);
+        primFlagsTable[id] = packEntityPrimFlags(header.model(), header.features());
+        primAux0Table[id] = Float.floatToRawIntBits(header.params().w());
         (emitting ? emissiveEntitySpriteIds : entitySpriteIds).put(key, id);
         return stochasticAlpha ? withStochasticAlpha(id) : id;
+    }
+
+    /** Inlined entity Prim.flags bits (low 2 bits = model, bit 2 = stochastic alpha) for any_hit.rahit. */
+    public int entityPrimFlags(int materialId) {
+        int[] flags = primFlagsTable;
+        return materialId >= 0 && materialId < flags.length ? flags[materialId] : 0;
+    }
+
+    /** Raw IEEE-754 float bits of MaterialHeader.params.w (transmission) for entity shadow rays. */
+    public int entityPrimAux0Bits(int materialId) {
+        int[] aux0 = primAux0Table;
+        return materialId >= 0 && materialId < aux0.length ? aux0[materialId] : 0;
+    }
+
+    private static int packEntityPrimFlags(int model, int features) {
+        return (model & 3) | ((features & FEATURE_STOCHASTIC_ALPHA) != 0 ? ENTITY_PRIM_STOCHASTIC_ALPHA : 0);
     }
 
     /** Caller must ensure no in-flight trace references the current table. */
@@ -474,6 +505,8 @@ public final class RtMaterialRegistry {
         entityEmissiveFallbackId = 0;
         nextDynamicId = 0;
         tableCapacity = 0;
+        primFlagsTable = new int[0];
+        primAux0Table = new int[0];
         if (table != null) {
             table.destroy();
             table = null;

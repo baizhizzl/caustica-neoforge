@@ -64,13 +64,14 @@ import static org.lwjgl.vulkan.KHRRayTracingPipeline.vkGetRayTracingShaderGroupH
 public final class RtPipeline {
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/world/";
     // A ring of descriptor sets: setTlas waits for the selected slot's exact prior graphics use before
-    // rewriting it. Ring depth is only a performance choice that avoids routine host waits.
-    private static final int RING = 6;
+    // rewriting it. Sized as a multiple of TlasRing.RING (4) so each slot pairs with a stable TLAS handle.
+    private static final int RING = 8;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
     private final long descriptorPool;
     private final long[] descriptorSets;
+    private final long[] boundTlasSerials = new long[RING];
     private final RtGpuExecutor.TrackedGraphicsUse[] descriptorSetUses;
     private int currentSet;
     private final long pipelineLayout;
@@ -375,19 +376,22 @@ public final class RtPipeline {
     }
 
     /** Bind a new TLAS after the selected descriptor slot's exact prior graphics use completes. */
-    public void setTlas(long tlas, RtGpuExecutor.GraphicsUse graphicsUse,
+    public void setTlas(RtAccel tlas, RtGpuExecutor.GraphicsUse graphicsUse,
                         RtGpuExecutor.GraphicsUseWaiter graphicsUseWaiter) {
         currentSet = (currentSet + 1) % RING;
         RtGpuExecutor.TrackedGraphicsUse slotUse = descriptorSetUses[currentSet];
         graphicsUseWaiter.await(slotUse);
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
-                    .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas));
-            VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
-            write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet])
-                    .dstBinding(WORLD_TLAS)
-                    .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
-            VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
+        if (boundTlasSerials[currentSet] != tlas.serial) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkWriteDescriptorSetAccelerationStructureKHR asWrite = VkWriteDescriptorSetAccelerationStructureKHR.calloc(stack)
+                        .sType(VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR).pAccelerationStructures(stack.longs(tlas.handle));
+                VkWriteDescriptorSet.Buffer write = VkWriteDescriptorSet.calloc(1, stack);
+                write.get(0).sType$Default().pNext(asWrite.address()).dstSet(descriptorSets[currentSet])
+                        .dstBinding(WORLD_TLAS)
+                        .descriptorCount(1).descriptorType(VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR);
+                VK10.vkUpdateDescriptorSets(ctx.vk(), write, null);
+            }
+            boundTlasSerials[currentSet] = tlas.serial;
         }
         slotUse.mark(graphicsUse);
     }

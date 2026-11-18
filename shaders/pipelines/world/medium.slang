@@ -211,6 +211,6 @@ public float3 waterShadowTransmittance(Medium currentMedium, VisibilityResult sh
     }
     float3 ext = currentMedium.water
             ? currentMedium.extinction
-            : waterExtinction(worldPush.waterParams.xyz);
+            : waterExtinction(worldPushPtr()[0].waterParams.xyz);
     return exp(-ext * waterDist);
 }

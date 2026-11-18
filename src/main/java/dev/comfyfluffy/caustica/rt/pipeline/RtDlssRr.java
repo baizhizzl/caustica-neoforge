@@ -50,6 +50,9 @@ public final class RtDlssRr {
 
     private NgxLibrary lib;
     private MemorySegment feature = MemorySegment.NULL;
+    private final Arena matrixScratchArena = Arena.ofAuto();
+    private final MemorySegment worldToViewScratch = matrixScratchArena.allocate(ValueLayout.JAVA_FLOAT, 16);
+    private final MemorySegment viewToClipScratch = matrixScratchArena.allocate(ValueLayout.JAVA_FLOAT, 16);
     private boolean initialized;
     private boolean failed;
     private boolean loggedAvailable;
@@ -106,27 +109,22 @@ public final class RtDlssRr {
                     : Math.clamp((now - lastFrameNanos) / 1_000_000.0f, 0.1f, 200.0f);
             lastFrameNanos = now;
 
-            int rc;
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment worldToViewMatrix = arena.allocate(ValueLayout.JAVA_FLOAT, 16);
-                MemorySegment viewToClipMatrix = arena.allocate(ValueLayout.JAVA_FLOAT, 16);
-                putNgxLeftMultiplyMatrix(worldToView, worldToViewMatrix);
-                putNgxLeftMultiplyMatrix(viewToClip, viewToClipMatrix);
-                rc = lib.evaluateDlssd(cmd, feature,
-                        color.view, color.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                        depth.view, depth.image, VK10.VK_FORMAT_R32_SFLOAT,
-                        motion.view, motion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
-                        diffuseAlbedo.view, diffuseAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                        specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                        normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                        specularMotion.view, specularMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
-                        0L, 0L, 0,
-                        out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
-                        renderWidth, renderHeight, displayWidth, displayHeight,
-                        // jitter in render pixels; MVs are already in render-pixel units, so MV scale = 1.
-                        jitterX, jitterY, 1.0f, 1.0f, resetHistory ? 1 : 0, frameMs,
-                        worldToViewMatrix, viewToClipMatrix);
-            }
+            putNgxLeftMultiplyMatrix(worldToView, worldToViewScratch);
+            putNgxLeftMultiplyMatrix(viewToClip, viewToClipScratch);
+            int rc = lib.evaluateDlssd(cmd, feature,
+                    color.view, color.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    depth.view, depth.image, VK10.VK_FORMAT_R32_SFLOAT,
+                    motion.view, motion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                    diffuseAlbedo.view, diffuseAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    specularAlbedo.view, specularAlbedo.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    normals.view, normals.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    specularMotion.view, specularMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
+                    0L, 0L, 0,
+                    out.view, out.image, VK10.VK_FORMAT_R16G16B16A16_SFLOAT,
+                    renderWidth, renderHeight, displayWidth, displayHeight,
+                    // jitter in render pixels; MVs are already in render-pixel units, so MV scale = 1.
+                    jitterX, jitterY, 1.0f, 1.0f, resetHistory ? 1 : 0, frameMs,
+                    worldToViewScratch, viewToClipScratch);
             resetHistory = false;
             if (NgxRuntime.ngxFailed(rc)) {
                 throw new IllegalStateException("ngxshim_evaluate_dlssd failed: 0x" + Integer.toHexString(rc)

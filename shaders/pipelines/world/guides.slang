@@ -65,7 +65,8 @@ public SpecSurface makeSpecSurface(float3 camRel, float3 normal, float3 motionPr
 }
 // angle can land behind the eye even though the reflector itself is comfortably in view.
 public float2 projectPrevNdc(float3 worldPos, out bool valid) {
-    float4 clip = mul(worldPush.prevViewProj, float4(worldPos - worldPush.camOffset + worldPush.camDelta, 1.0));
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    float4 clip = mul(wp[0].prevViewProj, float4(worldPos - wp[0].camOffset + wp[0].camDelta, 1.0));
     valid = clip.w > 0.0;
     return valid ? clip.xy / clip.w : float2(0.0, 0.0);
 }
@@ -94,14 +95,16 @@ public float2 previousReflectionNdc(float3 surfacePos, float3 surfaceNormal, flo
 public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
                              float2 currentNdc, float2 size, float primaryConeSpread,
                              out float3 specAlbedo) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     specAlbedo = surface.albedo;
-    if (length(surface.normal) < 0.5
+    if ((wp[0].flags & WORLD_FLAG_SPEC_GUIDES) == 0u
+            || length(surface.normal) < 0.5
             || max(surface.albedo.r, max(surface.albedo.g, surface.albedo.b)) <= 0.001
             || surface.roughness > SPEC_MOTION_ALPHA_MAX) {
         return float2(0.0, 0.0);
     }
 
-    float3 surfacePos = surface.camRel + worldPush.camOffset;
+    float3 surfacePos = surface.camRel + wp[0].camOffset;
     float3 n = normalize(surface.normal);
     float3 specDir = reflect(primaryDir, n);
 
@@ -161,18 +164,24 @@ public void setTransmissionGuide(float3 hitCamRel, float3 motionPrev, float3 nor
 public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                               float3 surfaceBiasNormal, MediumStack medium, float rayBias,
                               float rayConeWidth, float rayConeSpread, float3 guideFilter) {
-    if (dot(transmittedDir, transmittedDir) <= 0.0) return;
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    uint flags = wp[0].flags;
+    if ((flags & WORLD_FLAG_TRANSMISSION_GUIDES) == 0u || dot(transmittedDir, transmittedDir) <= 0.0) {
+        return;
+    }
 
     float3 direction = normalize(transmittedDir);
     float3 ro = offsetSurfaceOrigin(surfacePos, surfaceBiasNormal, direction, rayBias);
+    float3 camOffset = wp[0].camOffset;
+    // Full bounce-depth crossing walk is only required when DLSS-RR or guide debug views are active;
+    // FG and auto-exposure metering need at most the first transmitted layer.
+    uint maxCrossings = (flags & WORLD_FLAG_SPEC_GUIDES) != 0u ? wp[0].maxBounces : min(wp[0].maxBounces, 1u);
 
-    // The camera interface consumed bounce 0; the remaining configured bounce budget is the natural
-    // cap for deterministic guide crossings too.
-    for (uint crossing = 0u; crossing < worldPush.maxBounces; ++crossing) {
-        traceGuide(CULL_PRIMARY, ro, RAY_TMIN, direction, 10000.0,
+    for (uint crossing = 0u; crossing < maxCrossings; ++crossing) {
+        traceGuide(CULL_SECONDARY, ro, RAY_TMIN, direction, 10000.0,
                 rayConeWidth, rayConeSpread);
         if (payload.hitT <= 0.0) {
-            setTransmissionGuide((ro + direction * 1.0e6) - worldPush.camOffset,
+            setTransmissionGuide((ro + direction * 1.0e6) - camOffset,
                     float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 0.0), 1.0,
                     guideFilter * SKY_DIFF_ALBEDO, false);
             return;
@@ -188,7 +197,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
             float3 endpointAlbedo = material == MATERIAL_PARTICLE
                     ? hitAlbedo
                     : hitAlbedo * (1.0 - clamp(payloadMetalness(), 0.0, 1.0));
-            setTransmissionGuide(interfacePos - worldPush.camOffset, payload.motionPrev,
+            setTransmissionGuide(interfacePos - camOffset, payload.motionPrev,
                     payloadNormal(), endpointRoughness, guideFilter * endpointAlbedo,
                     payloadEmission() > 0.0);
             return;
@@ -199,12 +208,12 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         bool entering = payloadDielectricEntering();
         float3 geometricNormal = normalize(payloadNormal());
         float3 interfaceNormal = geometricNormal;
-        if (isWater && (worldPush.flags & 16u) != 0u) {
+        if (isWater && (flags & WORLD_FLAG_WATER_WAVES) != 0u) {
             float waterFootprint = rayConeWidth
                     / max(abs(dot(-direction, geometricNormal)), 0.2);
             interfaceNormal = applyWaterWaves(geometricNormal,
-                    interfacePos.xz + worldPush.waterAnchor.xy,
-                    worldPush.waterParams.w, waterFootprint);
+                    interfacePos.xz + wp[0].waterAnchor.xy,
+                    wp[0].waterParams.w, waterFootprint);
         }
 
         float transmission = clamp(payloadTransmission(), 0.0, 1.0);
@@ -214,9 +223,11 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         float3 nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
         if (dot(nextDirection, nextDirection) <= 0.0) {
             // Never let a TIR reflection become ordinary diffuse/depth.
-            setTransmissionGuide(interfacePos - worldPush.camOffset,
+            float tirRough = isWater ? 0.0 : clamp(payloadRoughness(), 0.0, 1.0);
+            tirRough = isDeltaAlpha(tirRough) ? 0.0 : tirRough;
+            setTransmissionGuide(interfacePos - camOffset,
                     isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
-                    interfaceNormal, 0.0, float3(0.0, 0.0, 0.0), false);
+                    interfaceNormal, tirRough, float3(0.0, 0.0, 0.0), false);
             return;
         }
         if (!isWater && entering) {
@@ -235,51 +246,31 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
 
 // Resolve the captured gv_* guide state into the DLSS-RR guide images after Pass A queues continuations.
 public void writeGuides(int2 pix, float3 primaryDir, float2 jndc, float2 size, float primaryConeSpread) {
-    // Reflection remains owned by the foreground interface even when a dielectric replaced the ordinary
-    // tuple with the transmitted destination.
-    float3 specAlbedo;
-    float2 specMotion = resolveSpecularGuides(
-            gv_spec, primaryDir, jndc, size, primaryConeSpread, specAlbedo);
-
-    // Hardware (non-linear, reversed-Z) depth for DLSS-RR + Frame Generation: project the camera-relative
-    // primary hit through the forward view-projection and take ndc z/w — exactly the value a rasterizer
-    // would write. Reversed-Z (near=1, far=0), so DLSS gets the DepthInverted flag; sky's far hit -> ~0.
-    // Clear transmission uses destination depth so the entire ordinary tuple describes one layer.
-    float4 curClip = mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0));
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    // Write ordinary primary/transmitted guides BEFORE launching the reflection probe so the gv_* registers
+    // do not stay live across resolveSpecularGuides's TraceRay call.
+    float4 curClip = mul(wp[0].curViewProj, float4(gv_hitCamRel, 1.0));
     float depth = curClip.w > 0.0 ? curClip.z / curClip.w : 0.0;
 
-    // Motion vector: reproject this guide point through the previous frame's view-projection.
-    // The primary ray was cast through the JITTERED ndc (jndc), so this hit's current screen position is
-    // jndc, NOT the pixel centre. Subtract jndc so the MV is jitter-free (= 0 when static), which is
-    // what DLSS expects with MVJittered unset. Scaled from NDC into render-pixel space.
-    // For a dynamic surface, previous-frame position is the current point minus its world-space
-    // displacement; subtracting gv_motionObjDisp de-cameras the MV.
-    float4 prevClip = mul(worldPush.prevViewProj,
-            float4(gv_hitCamRel + worldPush.camDelta - gv_motionObjDisp, 1.0));
-    float2 curNdc = jndc; // primary hit's current screen position is exactly the jittered ray ndc
-    // Transmitted content is its own feature: compare its previous and current projections rather than
-    // subtracting the primary interface's jittered NDC.
-    float4 curClipMotion = gv_motionUseRefracted
-            ? mul(worldPush.curViewProj, float4(gv_hitCamRel, 1.0))
-            : float4(0.0, 0.0, 0.0, 1.0); // unused; keeps the guard below uniform
-    // Guard both perspective divides the way the depth above does. A guide point can land behind either
-    // camera — most easily a transmitted destination seen at a grazing angle, or one that leaves the
-    // frustum as the camera turns — and w at or below zero turns the divide into an arbitrarily large
-    // vector that DLSS-RR reprojects with. No valid previous position exists in that case, so report no
-    // motion and let RR fall back instead of handing it garbage.
+    float4 prevClip = mul(wp[0].prevViewProj,
+            float4(gv_hitCamRel + wp[0].camDelta - gv_motionObjDisp, 1.0));
+    float2 curNdc = jndc;
     float2 motion;
-    if (prevClip.w > 0.0 && (!gv_motionUseRefracted || curClipMotion.w > 0.0)) {
-        if (gv_motionUseRefracted) curNdc = curClipMotion.xy / curClipMotion.w;
+    if (prevClip.w > 0.0 && (!gv_motionUseRefracted || curClip.w > 0.0)) {
+        if (gv_motionUseRefracted) curNdc = curClip.xy / curClip.w;
         motion = (prevClip.xy / prevClip.w - curNdc) * 0.5 * size;
     } else {
         motion = float2(0.0, 0.0);
     }
 
-    // Guide buffers: first-hit or coherently replaced attributes consumed by the denoiser/DLSS-RR.
     gNormal[pix] = float4(gv_normal, gv_rough);
     gAlbedo[pix] = float4(gv_albedo, gv_emissive ? 1.0 : 0.0);
     gDepth[pix] = depth;
     gMotion[pix] = motion;
+
+    float3 specAlbedo;
+    float2 specMotion = resolveSpecularGuides(
+            gv_spec, primaryDir, jndc, size, primaryConeSpread, specAlbedo);
     gSpecAlbedo[pix] = float4(specAlbedo, 1.0);
     gSpecMotion[pix] = specMotion;
 }

@@ -315,7 +315,13 @@ public final class RtBloomPipeline {
         new BloomPushData(mode, threshold, softKnee, radius).write(push);
         VK10.vkCmdPushConstants(cmd, pipelineLayout, VK10.VK_SHADER_STAGE_COMPUTE_BIT, 0, push);
         VK10.vkCmdDispatch(cmd, (dst.width + 7) / 8, (dst.height + 7) / 8, 1);
-        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        RtContext.memoryBarrier2(cmd, stack,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR
+                        | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR
+                        | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
     }
 
     public void destroy() {

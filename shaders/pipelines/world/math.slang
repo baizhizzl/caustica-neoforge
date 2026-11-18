@@ -8,18 +8,14 @@ import sky;
 public float luminance(float3 c) { return dot(c, ACESCG_LUMA); }
 
 // GGX normal distribution.
-// NOTE: the 1e-7 denominator guard is not merely a divide-by-zero epsilon, and it is load-bearing. At
-// the lobe peak d == a2, so the guard dominates PI*d*d until a2 >> 1.8e-4, i.e. rough >> 0.116; every
-// smoother material has its NEE highlight peak truncated. That truncation is what keeps the sun from
-// being counted twice: a specular continuation sets showCelestial, so the BSDF-sampled ray may hit the
-// sun disc in world.rmiss while NEE is also adding a sun term for the same lobe, with no MIS weighting
-// between them. Removing the guard restores the physical peak AND the double count, and makes the
-// single-sample sun estimator explode wherever the lobe is tighter than the disc (~0.0047 rad). The
-// real fix is MIS (or a disc-aware specular light sample), not an epsilon edit — left as-is.
+// Uses the cancellation-free factored form d = (1 - ndh)(1 + ndh) + a2 * ndh^2 so smooth lobes near
+// MIRROR_ALPHA_MAX (4e-4, a2 = 1.6e-7) retain full fp32 mantissa precision at ndh -> 1 without an
+// artificial 1e-7 floor truncating highlights; NEE/BSDF double-counting and tight-lobe variance are
+// handled via power-heuristic MIS (see powerHeuristic / surfaceBsdfPdf / celestialSquarePdf below).
 public float ggxD(float ndh, float alpha) {
     float a2 = alpha * alpha;
-    float d = ndh * ndh * (a2 - 1.0) + 1.0;
-    return a2 / (PI * d * d + 1.0e-7);
+    float d = (1.0 - ndh) * (1.0 + ndh) + a2 * (ndh * ndh);
+    return a2 / max(PI * d * d, 1.0e-20);
 }
 
 // Smith GGX masking term for one direction (separable form; G2 = G1(v) * G1(l)).
@@ -174,18 +170,33 @@ public float rndf(inout uint s) {
 }
 
 public float3 primaryRayDir(float2 ndc) {
-    float4 nearH = mul(worldPush.invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
-    float4 farH = mul(worldPush.invViewProj, float4(ndc.x, ndc.y, 0.0, 1.0));
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    float4 nearH = mul(wp[0].invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
+    float4 farH = mul(wp[0].invViewProj, float4(ndc.x, ndc.y, 0.0, 1.0));
     float3 nearP = nearH.xyz / nearH.w;
     float3 farP = farH.xyz / farH.w;
     return normalize(farP - nearP);
 }
 
-public float primaryRayConeSpread(float2 ndc, float2 size, float3 dir) {
+public float primaryRayConeSpreadFromClip(float4 nearH, float4 farH, float2 size, float3 dir) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     float2 onePixelNdc = 2.0 / size;
-    float3 dx = primaryRayDir(ndc + float2(onePixelNdc.x, 0.0));
-    float3 dy = primaryRayDir(ndc + float2(0.0, onePixelNdc.y));
+    float4 deltaX = mul(wp[0].invViewProj, float4(onePixelNdc.x, 0.0, 0.0, 0.0));
+    float4 nearX = nearH + deltaX;
+    float4 farX = farH + deltaX;
+    float3 dx = normalize(farX.xyz / farX.w - nearX.xyz / nearX.w);
+    float4 deltaY = mul(wp[0].invViewProj, float4(0.0, onePixelNdc.y, 0.0, 0.0));
+    float4 nearY = nearH + deltaY;
+    float4 farY = farH + deltaY;
+    float3 dy = normalize(farY.xyz / farY.w - nearY.xyz / nearY.w);
     return max(max(length(cross(dir, dx)), length(cross(dir, dy))), RAY_CONE_MIN_SPREAD);
+}
+
+public float primaryRayConeSpread(float2 ndc, float2 size, float3 dir) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
+    float4 nearH = mul(wp[0].invViewProj, float4(ndc.x, ndc.y, 1.0, 1.0));
+    float4 farH = mul(wp[0].invViewProj, float4(ndc.x, ndc.y, 0.0, 1.0));
+    return primaryRayConeSpreadFromClip(nearH, farH, size, dir);
 }
 
 public void orthonormalBasis(float3 axis, out float3 tangent, out float3 bitangent) {
@@ -268,3 +279,66 @@ public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, inout uint s) {
     float3 Ne = normalize(float3(a * Nh.x, a * Nh.y, max(0.0, Nh.z))); // microfacet normal, tangent space
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space
 }
+
+// Overflow/underflow-safe Veach power heuristic (beta = 2) for two-technique MIS.
+public float powerHeuristic(float pdfA, float pdfB) {
+    float m = max(pdfA, pdfB);
+    if (m <= 0.0) {
+        return 0.0;
+    }
+    float a = pdfA / m;
+    float b = pdfB / m;
+    float a2 = a * a;
+    return a2 / (a2 + b * b);
+}
+
+// Specular lobe selection probability shared by NEE MIS evaluation and BSDF continuation sampling.
+public float surfaceSpecularProb(float3 diffAlb, float3 F0, bool exactSpecular) {
+    return exactSpecular && luminance(diffAlb) <= 1.0e-6
+            ? 1.0
+            : clamp(luminance(F0) / (luminance(F0) + luminance(diffAlb) + 1.0e-4), 0.1, 0.9);
+}
+
+// Exact continuous solid-angle PDF of theVNDF-GGX + cosine-Lambertian BSDF mixture at an opaque/entity
+// surface. When exactSpecular is true, the mirror branch is a Dirac delta and contributes zero continuous
+// density; only the (1 - ps) diffuse lobe overlaps continuous NEE light samples.
+public float surfaceBsdfPdf(float3 n, float3 v, float3 l, float rough, float ps, bool exactSpecular) {
+    float ndl = dot(n, l);
+    if (ndl <= 0.0) {
+        return 0.0;
+    }
+    float diffPdf = (1.0 - ps) * (ndl * INV_PI);
+    if (exactSpecular) {
+        return diffPdf;
+    }
+    float3 h = safeHalfVector(l, v, n);
+    float ndh = max(0.0, dot(n, h));
+    float ndv = max(1.0e-4, dot(n, v));
+    float specPdf = ps * (ggxD(ndh, rough) * ggxG1(ndv, rough)) / (4.0 * ndv);
+    return specPdf + diffPdf;
+}
+
+// Exact solid-angle PDF of sampleSquare(bodyDir, halfAngle) for directions inside the celestial tangent
+// square: dOmega = dA_tan * cos^3(theta), with tangent-square area 4 * tan^2(halfAngle).
+public float celestialSquarePdf(float3 dir, float3 bodyDir, float halfAngle) {
+    if (halfAngle <= 0.0) {
+        return 0.0;
+    }
+    float c = dot(dir, bodyDir);
+    if (c <= 1.0e-3) {
+        return 0.0;
+    }
+    float t = tan(halfAngle);
+    float areaTan = max(4.0 * t * t, 1.0e-12);
+    return 1.0 / (areaTan * c * c * c);
+}
+
+// Shared local reference solid-angle density for static emitter RIS <-> BSDF hit MIS. Because both
+// evalSampleContrib (the RIS integrand) and the BSDF hit on PAYLOAD_EMITTER_IN_LIST evaluate complementary
+// powerHeuristic weights against this identical local geometric density, w_nee + w_bsdf == 1 holds
+// point-wise on every listed emitter without needing the intractable M-candidate marginal RIS PDF.
+public static const float STATIC_EMITTER_REF_AREA = 0.25;
+public float staticEmitterMisPdf(float dist2, float cosL) {
+    return max(dist2, 1.0e-6) / max(STATIC_EMITTER_REF_AREA * cosL, 1.0e-5);
+}
+

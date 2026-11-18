@@ -48,14 +48,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     int2 pix = int2(tid.xy);
     float4 ui = sourceImage.Load(int3(pix, 0));
     float alpha = ui.a;
+    if (alpha <= 0.0) return;
+
     float3 worldPq = outputImage[pix].rgb;
-    if (alpha > 0.0) {
-        float3 worldNits2020 = float3(pqDecode(worldPq.x), pqDecode(worldPq.y), pqDecode(worldPq.z));
-        float3 straight = clamp(ui.rgb / alpha, 0.0, 1.0);
-        float3 uiNits709 = srgbToLinear(straight) * pc.uiNits;
-        float3 uiNits2020 = mul(BT709_TO_BT2020, uiNits709);
-        float3 blended = worldNits2020 * (1.0 - alpha) + uiNits2020 * alpha;
-        worldPq = float3(pqEncode(blended.x), pqEncode(blended.y), pqEncode(blended.z));
-    }
+    float3 worldNits2020 = float3(pqDecode(worldPq.x), pqDecode(worldPq.y), pqDecode(worldPq.z));
+    float3 straight = clamp(ui.rgb / alpha, 0.0, 1.0);
+    float3 uiNits709 = srgbToLinear(straight) * pc.uiNits;
+    float3 uiNits2020 = mul(BT709_TO_BT2020, uiNits709);
+    float3 blended = worldNits2020 * (1.0 - alpha) + uiNits2020 * alpha;
+    worldPq = float3(pqEncode(blended.x), pqEncode(blended.y), pqEncode(blended.z));
     outputImage[pix] = float4(worldPq, 1.0);
 }

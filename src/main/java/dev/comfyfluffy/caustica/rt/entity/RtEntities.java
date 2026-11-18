@@ -31,7 +31,20 @@ import net.minecraft.world.entity.item.FallingBlockEntity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.ClipContext;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.level.block.entity.ChestBlockEntity;
+import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
+import net.minecraft.world.level.block.entity.HangingSignBlockEntity;
+import net.minecraft.world.level.block.entity.LidBlockEntity;
+import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignTextSlot;
+import net.minecraft.world.level.block.entity.SkullBlockEntity;
+import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.ChestType;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
@@ -281,6 +294,10 @@ public final class RtEntities {
 
     // Persistent per-entity acceleration structures, keyed by entity id, for refit.
     private final Int2ObjectOpenHashMap<EntityAccel> entityAccels = new Int2ObjectOpenHashMap<>(entityMapCapacity());
+    // Persistent timeline-guarded ring of combined particle BLAS + geometry buffers so visible particles
+    // neither churn VMA buffers per frame nor defeat in-place TLAS refit.
+    private final EntitySlot[] particleRing = new EntitySlot[4];
+    private int particleCursor;
 
     // Persistent per-block-entity geometry, keyed by BlockPos.asLong(). Built once and reused every frame.
     private final Map<Long, BeEntry> beCache = new HashMap<>();
@@ -315,6 +332,11 @@ public final class RtEntities {
         long meshHash;                           // hash of the captured mesh — rebuild only when it changes
         long lastSeen;                           // last frame this BE was in the scan window — for eviction
         float[] prevVerts;                       // block-local verts at this build, for the per-vertex MV diff
+        BlockEntity beRef;                       // exact live BE instance this entry was built from
+        BlockState blockState;                   // canonical state reference at build time
+        Object auxStateA;                        // immutable auxiliary state (e.g. SignText front / Skull profile)
+        Object auxStateB;                        // immutable auxiliary state (e.g. SignText back)
+        boolean staticEligible;                  // true when known-static while state references match
         final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
     }
 
@@ -326,7 +348,11 @@ public final class RtEntities {
         RtBuffer backing;
         RtBuffer geometry;
         RtBuffer refitScratch;
+        long accelCapacity;
+        long asOffset;
         boolean updatable;
+        boolean extentValid;
+        float halfExtentX, halfExtentY, halfExtentZ;
         int vertCount = -1;
         int triCount = -1;
         int[] bucketTris;
@@ -434,8 +460,8 @@ public final class RtEntities {
             while (true) {
                 if (pageIndex == pages.size()) {
                     long capacity = Math.max(MOTION_PAGE_BYTES, size);
-                    pages.add(ctx.createBuffer(capacity,
-                            org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, true,
+                    pages.add(ctx.createSequentialBuffer(capacity,
+                            org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             "entity motion arena"));
                     lastUsedCycles.add(cycle);
                     dirtyEnds.add(0L);
@@ -551,7 +577,24 @@ public final class RtEntities {
         final MotionArena motion = new MotionArena();
         final ArrayList<EntitySlot> usedEntitySlots = new ArrayList<>(entityListCapacity());
         final ArrayList<BeEntry> usedBlockEntities = new ArrayList<>();
+        final ArrayList<float[]> transformPool = new ArrayList<>(entityListCapacity());
+        int transformCursor;
         final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
+
+        float[] translation(float x, float y, float z) {
+            float[] m;
+            if (transformCursor < transformPool.size()) {
+                m = transformPool.get(transformCursor);
+            } else {
+                m = new float[12];
+                transformPool.add(m);
+            }
+            transformCursor++;
+            m[0] = 1f; m[1] = 0f; m[2] = 0f; m[3] = x;
+            m[4] = 0f; m[5] = 1f; m[6] = 0f; m[7] = y;
+            m[8] = 0f; m[9] = 0f; m[10] = 1f; m[11] = z;
+            return m;
+        }
 
         void reset() {
             instances.clear();
@@ -561,6 +604,7 @@ public final class RtEntities {
             buffers.clear();
             usedEntitySlots.clear();
             usedBlockEntities.clear();
+            transformCursor = 0;
             motion.reset();
         }
 
@@ -1074,9 +1118,35 @@ public final class RtEntities {
         if (capture.isEmpty()) {
             return;
         }
+        // Center particle positions around the cloud's AABB midpoint and carry that midpoint in the TLAS
+        // instance matrix so RtTlasCache tracks real particle displacement just like dynamic entities.
+        float[] v = capture.verts.elements();
+        int vertFloats = capture.verts.size();
+        float minX = v[0], maxX = v[0];
+        float minY = v[1], maxY = v[1];
+        float minZ = v[2], maxZ = v[2];
+        for (int i = 3; i < vertFloats; i += 3) {
+            float vx = v[i], vy = v[i + 1], vz = v[i + 2];
+            if (vx < minX) minX = vx;
+            else if (vx > maxX) maxX = vx;
+            if (vy < minY) minY = vy;
+            else if (vy > maxY) maxY = vy;
+            if (vz < minZ) minZ = vz;
+            else if (vz > maxZ) maxZ = vz;
+        }
+        float cx = (minX + maxX) * 0.5f;
+        float cy = (minY + maxY) * 0.5f;
+        float cz = (minZ + maxZ) * 0.5f;
+        float hx = (maxX - minX) * 0.5f;
+        float hy = (maxY - minY) * 0.5f;
+        float hz = (maxZ - minZ) * 0.5f;
+        for (int i = 0; i < vertFloats; i += 3) {
+            v[i] -= cx;
+            v[i + 1] -= cy;
+            v[i + 2] -= cz;
+        }
         long dispAddr = uploadDisp(ctx, build, particleDisp);
-        appendCapture(ctx, build, new Motion(dispAddr, 0f, 0f, 0f),
-                -1, PARTICLE_BIT, PARTICLE_MASK, IDENTITY); // one combined mesh, per-particle MV
+        appendParticleCapture(ctx, build, new Motion(dispAddr, 0f, 0f, 0f), cx, cy, cz, hx, hy, hz);
     }
 
     /** Average (rebase-space) position of a captured particle's verts — approximates the particle center. */
@@ -1199,6 +1269,15 @@ public final class RtEntities {
     private boolean prepareBlockEntity(RtContext ctx, FrameBuild build, BlockEntityRenderDispatcher beDispatcher,
                                        BeCandidate candidate, float partial, long now) {
         BlockEntity be = candidate.be;
+        long key = be.getBlockPos().asLong();
+        BeEntry entry = beCache.get(key);
+        if (canSkipBlockEntityExtract(entry, be)) {
+            entry.lastSeen = now;
+            candidate.preparedEntry = entry;
+            candidate.preparedDisp = null;
+            RtFrameStats.FRAME.count("blockEntitiesFastReused", 1);
+            return true;
+        }
         capture.reset();
         try {
             BlockEntityRenderState state = beDispatcher.tryExtractRenderState(be, partial, null, false);
@@ -1218,8 +1297,6 @@ public final class RtEntities {
         if (capture.isEmpty()) {
             return false;
         }
-        long key = be.getBlockPos().asLong();
-        BeEntry entry = beCache.get(key);
         if (entry != null) {
             entry.lastSeen = now;
         }
@@ -1248,10 +1325,72 @@ public final class RtEntities {
             }
             beCache.put(key, rebuilt);
             entry = rebuilt;
+        } else {
+            recordStaticBlockEntityState(entry, be);
         }
         candidate.preparedEntry = entry;
         candidate.preparedDisp = disp;
         return true;
+    }
+
+    private static boolean canSkipBlockEntityExtract(BeEntry entry, BlockEntity be) {
+        if (entry == null || !entry.staticEligible || entry.beRef != be || entry.blockState != be.getBlockState()) {
+            return false;
+        }
+        Class<?> cls = be.getClass();
+        if (cls == ChestBlockEntity.class || cls == TrappedChestBlockEntity.class || cls == EnderChestBlockEntity.class) {
+            LidBlockEntity lid = (LidBlockEntity) be;
+            return lid.getOpenNess(0.0f) == 0.0f && lid.getOpenNess(1.0f) == 0.0f;
+        }
+        if (cls == ShulkerBoxBlockEntity.class) {
+            ShulkerBoxBlockEntity shulker = (ShulkerBoxBlockEntity) be;
+            return shulker.getProgress(0.0f) == 0.0f && shulker.getProgress(1.0f) == 0.0f;
+        }
+        if (cls == SignBlockEntity.class || cls == HangingSignBlockEntity.class) {
+            SignBlockEntity sign = (SignBlockEntity) be;
+            return entry.auxStateA == sign.getText(SignTextSlot.FRONT)
+                    && entry.auxStateB == sign.getText(SignTextSlot.BACK);
+        }
+        if (cls == SkullBlockEntity.class) {
+            return true;
+        }
+        return false;
+    }
+
+    private static void recordStaticBlockEntityState(BeEntry entry, BlockEntity be) {
+        entry.beRef = be;
+        BlockState state = be.getBlockState();
+        entry.blockState = state;
+        entry.auxStateA = null;
+        entry.auxStateB = null;
+        entry.staticEligible = false;
+        Class<?> cls = be.getClass();
+        if (cls == EnderChestBlockEntity.class) {
+            LidBlockEntity lid = (LidBlockEntity) be;
+            entry.staticEligible = lid.getOpenNess(0.0f) == 0.0f && lid.getOpenNess(1.0f) == 0.0f;
+        } else if (cls == ChestBlockEntity.class || cls == TrappedChestBlockEntity.class) {
+            // Double chests combine lid openness across both halves in ChestRenderer; only fast-skip
+            // standalone SINGLE chests so opening the neighbour half never leaves one half frozen shut.
+            if (state.getOptionalValue(ChestBlock.TYPE).orElse(ChestType.SINGLE) == ChestType.SINGLE) {
+                LidBlockEntity lid = (LidBlockEntity) be;
+                entry.staticEligible = lid.getOpenNess(0.0f) == 0.0f && lid.getOpenNess(1.0f) == 0.0f;
+            }
+        } else if (cls == ShulkerBoxBlockEntity.class) {
+            ShulkerBoxBlockEntity shulker = (ShulkerBoxBlockEntity) be;
+            entry.staticEligible = shulker.getProgress(0.0f) == 0.0f && shulker.getProgress(1.0f) == 0.0f;
+        } else if (cls == SignBlockEntity.class || cls == HangingSignBlockEntity.class) {
+            SignBlockEntity sign = (SignBlockEntity) be;
+            entry.auxStateA = sign.getText(SignTextSlot.FRONT);
+            entry.auxStateB = sign.getText(SignTextSlot.BACK);
+            entry.staticEligible = true;
+        } else if (cls == SkullBlockEntity.class) {
+            // Exclude animated heads (dragon/piglin) and player heads whose skin textures resolve asynchronously.
+            if (!state.is(Blocks.DRAGON_HEAD) && !state.is(Blocks.DRAGON_WALL_HEAD)
+                    && !state.is(Blocks.PIGLIN_HEAD) && !state.is(Blocks.PIGLIN_WALL_HEAD)
+                    && !state.is(Blocks.PLAYER_HEAD) && !state.is(Blocks.PLAYER_WALL_HEAD)) {
+                entry.staticEligible = true;
+            }
+        }
     }
 
     /** Upload the already-captured BE mesh to fresh buffers and build its BLAS (block-local). */
@@ -1267,7 +1406,7 @@ public final class RtEntities {
         BlockPos p = be.getBlockPos();
         String label = "block entity " + p.getX() + "," + p.getY() + "," + p.getZ();
         long required = Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L);
-        RtBuffer geometry = allocBuffer(ctx, required, asInput | storage, true, label + " geometry");
+        RtBuffer geometry = allocSequentialBuffer(ctx, required, asInput | storage, label + " geometry");
         layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
         MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
                 .put(capture.verts.elements(), 0, capture.verts.size());
@@ -1304,6 +1443,7 @@ public final class RtEntities {
         e.meshHash = hash;
         // Retain this build's block-local verts so the next rebuild can diff against them for the MV.
         e.prevVerts = java.util.Arrays.copyOf(capture.verts.elements(), capture.verts.size());
+        recordStaticBlockEntityState(e, be);
         return e;
     }
 
@@ -1344,7 +1484,7 @@ public final class RtEntities {
         long dispAddr = uploadDisp(ctx, build, disp);
         writeTableEntry(build, e.primAddr, e.indexAddr, e.uvAddr, dispAddr, 0f, 0f, 0f, e.bucketTris, false);
         // Block-local mesh placed by a translate-only instance transform (blockPos − rebase), like terrain.
-        float[] xform = {1, 0, 0, e.bx - rbx, 0, 1, 0, e.by - rby, 0, 0, 1, e.bz - rbz};
+        float[] xform = build.lists.translation(e.bx - rbx, e.by - rby, e.bz - rbz);
         build.instances.add(new RtAccel.Instance(xform, e.accel.deviceAddress,
                 ENTITY_BIT | (build.count & 0x3FFFFF), 0xFF, RtAccel.SBT_ENTITY_OFFSET));
         build.count++;
@@ -1390,6 +1530,11 @@ public final class RtEntities {
     private RtBuffer allocBuffer(RtContext ctx, long minSize, int usage, boolean hostVisible, String label) {
         RtFrameStats.FRAME.count("vmaBufferCreates", 1);
         return ctx.createBuffer(Math.max(minSize, MIN_BUFFER_SIZE), usage, hostVisible, label);
+    }
+
+    private RtBuffer allocSequentialBuffer(RtContext ctx, long minSize, int usage, String label) {
+        RtFrameStats.FRAME.count("vmaBufferCreates", 1);
+        return ctx.createSequentialBuffer(Math.max(minSize, MIN_BUFFER_SIZE), usage, label);
     }
 
     private RtBuffer allocAlignedBuffer(RtContext ctx, long minSize, int usage, boolean hostVisible,
@@ -1679,7 +1824,7 @@ public final class RtEntities {
             if (geometry == null || geometry.size < required) {
                 RtBuffer old = geometry;
                 long capacity = old == null ? required : growCapacity(old.size, required);
-                geometry = allocBuffer(ctx, capacity, asInput | storage, true, "entity geometry");
+                geometry = allocSequentialBuffer(ctx, capacity, asInput | storage, "entity geometry");
                 slot.geometry = geometry;
                 retainedGeometryBytes = Math.addExact(retainedGeometryBytes, geometry.size);
                 RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
@@ -1834,11 +1979,165 @@ public final class RtEntities {
         return slot;
     }
 
+    private EntitySlot selectParticleBuildSlot(FrameBuild build) {
+        int s = particleCursor;
+        particleCursor = (particleCursor + 1) % REFIT_RING;
+        EntitySlot slot = particleRing[s];
+        if (slot == null) {
+            slot = new EntitySlot();
+            particleRing[s] = slot;
+        } else {
+            awaitGraphicsUse(build, slot.graphicsUse, "particleSlotWaits");
+        }
+        return slot;
+    }
+
+    /** Upload the centered particle mesh into its retired ring slot, reusing geometry, AS backing, and scratch. */
+    private void appendParticleCapture(RtContext ctx, FrameBuild build, Motion motion,
+                                       float cx, float cy, float cz, float hx, float hy, float hz) {
+        beginBuildIfNeeded(ctx, build);
+        int asInput = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        int vertCount = capture.verts.size() / 3;
+        RtEntityCapture.PackedGeometry packed = capture.packGeometry();
+        int idxCount = packed.indices().size();
+        EntityGeometryLayout layout = EntityGeometryLayout.create(capture.verts.size(), idxCount,
+                capture.uvList.size(), packed.primitives().size());
+
+        EntitySlot slot = selectParticleBuildSlot(build);
+        build.lists.usedEntitySlots.add(slot);
+        long required = Math.max(16_384L, Math.addExact(layout.totalBytes, EntityGeometryLayout.REGION_ALIGNMENT - 1L));
+        RtBuffer geometry = slot.geometry;
+        if (geometry == null || geometry.size < required) {
+            RtBuffer old = geometry;
+            long capacity = old == null ? required : growCapacity(old.size, required);
+            geometry = allocSequentialBuffer(ctx, capacity, asInput | storage, "particle geometry");
+            slot.geometry = geometry;
+            retainedGeometryBytes = Math.addExact(retainedGeometryBytes, geometry.size);
+            if (old != null) {
+                retainedGeometryBytes = Math.subtractExact(retainedGeometryBytes, old.size);
+                old.destroy();
+            }
+        }
+        layout = layout.shifted((-geometry.deviceAddress) & (EntityGeometryLayout.REGION_ALIGNMENT - 1L));
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.positionOffset, capture.verts.size())
+                .put(capture.verts.elements(), 0, capture.verts.size());
+        MemoryUtil.memIntBuffer(geometry.mapped + layout.indexOffset, idxCount)
+                .put(packed.indices().elements(), 0, idxCount);
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.uvOffset, capture.uvList.size())
+                .put(capture.uvList.elements(), 0, capture.uvList.size());
+        MemoryUtil.memFloatBuffer(geometry.mapped + layout.primOffset, packed.primitives().size())
+                .put(packed.primitives().elements(), 0, packed.primitives().size());
+        geometry.flush(layout.positionOffset, layout.totalBytes - layout.positionOffset);
+
+        long positionAddr = Math.addExact(geometry.deviceAddress, layout.positionOffset);
+        long indexAddr = Math.addExact(geometry.deviceAddress, layout.indexOffset);
+        long uvAddr = Math.addExact(geometry.deviceAddress, layout.uvOffset);
+        long primAddr = Math.addExact(geometry.deviceAddress, layout.primOffset);
+
+        RtAccel accel = refitOrBuildParticle(ctx, build, slot, positionAddr, indexAddr,
+                vertCount, packed.indices(), packed.bucketTris(), hx, hy, hz);
+        writeTableEntry(build, primAddr, indexAddr, uvAddr, motion.dispAddr,
+                motion.rigidX, motion.rigidY, motion.rigidZ, packed.bucketTris(), false);
+        build.instances.add(new RtAccel.Instance(build.lists.translation(cx, cy, cz), accel.deviceAddress,
+                PARTICLE_BIT | (build.count & 0x3FFFFF), PARTICLE_MASK, RtAccel.SBT_ENTITY_OFFSET));
+        build.count++;
+    }
+
+    private RtAccel refitOrBuildParticle(RtContext ctx, FrameBuild build, EntitySlot slot,
+                                         long positionAddr, long indexAddr,
+                                         int vertCount, IntArrayList indices, int[] bucketTris,
+                                         float hx, float hy, float hz) {
+        int triCount = 0;
+        for (int bucketTriCount : bucketTris) {
+            triCount += bucketTriCount;
+        }
+        int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        boolean refitEnabled = CausticaConfig.Rt.Entities.REFIT_ENABLED.value();
+        float ehx = hx - slot.halfExtentX;
+        float ehy = hy - slot.halfExtentY;
+        float ehz = hz - slot.halfExtentZ;
+        boolean extentJump = !slot.extentValid || (ehx * ehx + ehy * ehy + ehz * ehz) > 16.0f;
+
+        boolean canUpdate = refitEnabled && !extentJump && slot.accel != null && slot.updatable
+                && slot.vertCount == vertCount && slot.triCount == triCount
+                && java.util.Arrays.equals(slot.bucketTris, bucketTris)
+                && sameIndexTopology(slot, indices)
+                && slot.updatesSinceBuild < REFIT_REBUILD_INTERVAL;
+        if (canUpdate) {
+            ensureSlotScratch(ctx, slot, slot.updateScratchSize, storage, "particle scratch");
+            build.blas.add(RtAccel.refitEntityUpdate(slot.accel, slot.refitScratch,
+                    positionAddr, indexAddr, vertCount, bucketTris, "particle BLAS refit"));
+            slot.updatesSinceBuild++;
+            return slot.accel;
+        }
+
+        RtAccel.EntityBlasSizes sizes = RtAccel.queryEntityBlasBuildSizes(ctx, positionAddr, vertCount,
+                indexAddr, bucketTris, refitEnabled);
+        long requiredScratch = Math.max(sizes.buildScratchSize(), refitEnabled ? sizes.updateScratchSize() : 0L);
+        ensureSlotScratch(ctx, slot, Math.max(8_192L, requiredScratch), storage, "particle scratch");
+
+        boolean needNewHandle = extentJump || slot.accel == null || slot.updatable != refitEnabled
+                || sizes.accelerationStructureSize() > slot.accelCapacity;
+        if (needNewHandle) {
+            // Toggling the 256B sub-offset when particle AABB half-extents jump > 4 blocks changes the
+            // BLAS device address without reallocating VMA backing, signaling RtTlasCache to rebuild TLAS.
+            long nextOffset = (slot.accel != null && extentJump)
+                    ? (slot.asOffset ^ RtAccel.AS_OFFSET_ALIGNMENT) : slot.asOffset;
+            if (slot.accel != null) {
+                slot.accel.destroy();
+                slot.accel = null;
+            }
+            long nextCapacity = slot.accelCapacity >= sizes.accelerationStructureSize()
+                    ? slot.accelCapacity
+                    : Math.max(32_768L, growCapacity(slot.accelCapacity, sizes.accelerationStructureSize()));
+            long requiredBacking = Math.addExact(nextCapacity, RtAccel.AS_OFFSET_ALIGNMENT);
+            if (slot.backing == null || slot.backing.size < requiredBacking) {
+                if (slot.backing != null) {
+                    slot.backing.destroy();
+                }
+                int asStorage = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+                slot.backing = allocBuffer(ctx, requiredBacking, asStorage, false, "particle BLAS backing");
+                nextOffset = 0L;
+            }
+            slot.accel = RtAccel.createEntityBlasAt(ctx, slot.backing, nextOffset, nextCapacity, "particle BLAS");
+            slot.accelCapacity = nextCapacity;
+            slot.asOffset = nextOffset;
+            slot.halfExtentX = hx;
+            slot.halfExtentY = hy;
+            slot.halfExtentZ = hz;
+            slot.extentValid = true;
+        }
+
+        build.blas.add(RtAccel.entityBuildOp(slot.accel, slot.refitScratch, positionAddr, indexAddr,
+                vertCount, bucketTris, refitEnabled, "particle BLAS"));
+        slot.updatable = refitEnabled;
+        slot.vertCount = vertCount;
+        slot.triCount = triCount;
+        slot.bucketTris = bucketTris.clone();
+        rememberIndexTopology(slot, indices);
+        slot.updateScratchSize = sizes.updateScratchSize();
+        slot.updatesSinceBuild = 0;
+        return slot.accel;
+    }
+
+    private void ensureSlotScratch(RtContext ctx, EntitySlot slot, long required, int usage, String label) {
+        if (slot.refitScratch == null || slot.refitScratch.size < required) {
+            long capacity = slot.refitScratch == null ? required : growCapacity(slot.refitScratch.size, required);
+            if (slot.refitScratch != null) {
+                slot.refitScratch.destroy();
+            }
+            slot.refitScratch = allocAlignedBuffer(ctx, capacity, usage, false, label,
+                    ctx.accelerationStructureScratchAlignment());
+            RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
+        } else {
+            RtFrameStats.FRAME.count("entityScratchBufferReuses", 1);
+        }
+    }
+
     /**
      * Refit-or-build this entity's persistent acceleration structure in an already-selected retired slot.
-     * Records an in-place UPDATE (cheap refit) when the slot already holds an
-     * AS of the same topology when refit is enabled. Otherwise it records a full BUILD; BLAS built while
-     * refit is disabled omit ALLOW_UPDATE. Refit scratch and packed geometry persist per ring slot.
+     * Reuses both the backing AS and the scratch buffer across topology rebuilds whenever capacity suffices.
      */
     private RtAccel refitOrBuild(RtContext ctx, FrameBuild build, EntitySlot slot,
                                  long positionAddr, long indexAddr,
@@ -1857,56 +2156,44 @@ public final class RtEntities {
                 && slot.updatesSinceBuild < REFIT_REBUILD_INTERVAL;
         if (canUpdate) {
             RtFrameStats.FRAME.count("refits", 1);
-            long required = slot.updateScratchSize;
-            if (slot.refitScratch == null || slot.refitScratch.size < required) {
-                if (slot.refitScratch != null) {
-                    slot.refitScratch.destroy();
-                }
-                slot.refitScratch = allocAlignedBuffer(ctx, required, storage, false, "entity refit scratch",
-                        ctx.accelerationStructureScratchAlignment());
-                RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
-            } else {
-                RtFrameStats.FRAME.count("entityScratchBufferReuses", 1);
-            }
+            ensureSlotScratch(ctx, slot, slot.updateScratchSize, storage, "entity refit scratch");
             build.blas.add(RtAccel.refitEntityUpdate(slot.accel, slot.refitScratch,
                     positionAddr, indexAddr, vertCount, bucketTris,
                     "entity BLAS refit"));
             slot.updatesSinceBuild++;
             return slot.accel;
         }
-        // (Re)build: the selected ring slot's exact prior graphics use has completed, so replace its old AS.
-        if (slot.accel != null) {
-            RtAccel.destroyEntityAccel(slot.accel, slot.backing);
-            slot.accel = null;
-            slot.backing = null;
+        RtAccel.EntityBlasSizes sizes = RtAccel.queryEntityBlasBuildSizes(ctx, positionAddr, vertCount,
+                indexAddr, bucketTris, refitEnabled);
+        long requiredScratch = Math.max(sizes.buildScratchSize(), refitEnabled ? sizes.updateScratchSize() : 0L);
+        ensureSlotScratch(ctx, slot, requiredScratch, storage, "entity scratch");
+
+        if (slot.accel == null || slot.backing == null || slot.updatable != refitEnabled
+                || sizes.accelerationStructureSize() > slot.accelCapacity) {
+            if (slot.accel != null) {
+                slot.accel.destroy();
+                slot.accel = null;
+            }
+            long nextCapacity = Math.max(8_192L, growCapacity(slot.accelCapacity, sizes.accelerationStructureSize()));
+            if (slot.backing == null || slot.backing.size < nextCapacity) {
+                if (slot.backing != null) {
+                    slot.backing.destroy();
+                }
+                int asStorage = org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+                slot.backing = allocBuffer(ctx, nextCapacity, asStorage, false, "entity BLAS backing");
+                RtFrameStats.FRAME.count("entityVmaBufferCreates", 1);
+            }
+            slot.accel = RtAccel.createEntityBlasAt(ctx, slot.backing, 0L, nextCapacity, "entity BLAS");
+            slot.accelCapacity = nextCapacity;
         }
-        if (!refitEnabled && slot.refitScratch != null) {
-            slot.refitScratch.destroy();
-            slot.refitScratch = null;
-        }
-        RtFrameStats.FRAME.count("entityVmaBufferCreates", 2); // persistent AS backing + transient build scratch
-        if (refitEnabled) {
-            RtAccel.UpdatableBuild ub = RtAccel.prepareUpdatableEntityBlasBuild(ctx, positionAddr, vertCount,
-                    indexAddr, bucketTris, "entity BLAS");
-            slot.accel = ub.accel();
-            slot.backing = ub.backing();
-            slot.updateScratchSize = ub.updateScratchSize();
-            build.blas.add(ub.op());
-            build.refitScratch.add(ub.scratch());
-        } else {
-            RtAccel.PersistentBuild pb = RtAccel.preparePersistentEntityBlasBuild(ctx, positionAddr, vertCount,
-                    indexAddr, bucketTris, "entity BLAS");
-            slot.accel = pb.accel();
-            slot.backing = pb.backing();
-            slot.updateScratchSize = 0L;
-            build.blas.add(pb.op());
-            build.refitScratch.add(pb.scratch());
-        }
+        build.blas.add(RtAccel.entityBuildOp(slot.accel, slot.refitScratch, positionAddr, indexAddr,
+                vertCount, bucketTris, refitEnabled, "entity BLAS"));
         slot.updatable = refitEnabled;
         slot.vertCount = vertCount;
         slot.triCount = triCount;
         slot.bucketTris = bucketTris.clone();
         rememberIndexTopology(slot, indices);
+        slot.updateScratchSize = sizes.updateScratchSize();
         slot.updatesSinceBuild = 0;
         return slot.accel;
     }
@@ -1961,7 +2248,13 @@ public final class RtEntities {
             RtAccel.destroyEntityAccel(slot.accel, slot.backing);
             slot.accel = null;
             slot.backing = null;
+        } else if (slot.backing != null) {
+            slot.backing.destroy();
+            slot.backing = null;
         }
+        slot.accelCapacity = 0L;
+        slot.asOffset = 0L;
+        slot.extentValid = false;
         if (slot.geometry != null) {
             retainedGeometryBytes = Math.subtractExact(retainedGeometryBytes, slot.geometry.size);
             slot.geometry.destroy();
@@ -1985,12 +2278,16 @@ public final class RtEntities {
         retainedGeometryBytes = Math.subtractExact(retainedGeometryBytes, geometryBytes);
         slot.accel = null;
         slot.backing = null;
+        slot.accelCapacity = 0L;
+        slot.asOffset = 0L;
+        slot.extentValid = false;
         slot.geometry = null;
         slot.refitScratch = null;
         slot.indices = null;
         slot.indexCount = 0;
         ctx.gpuExecutor().retireAfterGraphics(slot.graphicsUse, () -> {
             if (accel != null) RtAccel.destroyEntityAccel(accel, backing);
+            else if (backing != null) backing.destroy();
             if (geometry != null) geometry.destroy();
             if (scratch != null) scratch.destroy();
         });
@@ -2030,8 +2327,8 @@ public final class RtEntities {
         int storage = org.lwjgl.vulkan.VK10.VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
         tableRing = new TableSlot[TABLE_RING];
         for (int i = 0; i < TABLE_RING; i++) {
-            tableRing[i] = new TableSlot(ctx.createBuffer((long) requiredCapacity * TABLE_ENTRY_BYTES,
-                    storage, true, "entity geometry table ring " + i));
+            tableRing[i] = new TableSlot(ctx.createSequentialBuffer((long) requiredCapacity * TABLE_ENTRY_BYTES,
+                    storage, "entity geometry table ring " + i));
         }
         tableCapacity = requiredCapacity;
     }
@@ -2039,6 +2336,18 @@ public final class RtEntities {
     /** Retire all cached world-bound entity and block-entity GPU geometry on world/dimension switches or reloads. */
     public void clearWorldCaches() {
         RtContext ctx = RtContext.currentOrNull();
+        for (int i = 0; i < particleRing.length; i++) {
+            EntitySlot slot = particleRing[i];
+            if (slot != null) {
+                if (ctx != null) {
+                    retireEntitySlot(ctx, slot);
+                } else {
+                    destroyEntitySlot(slot);
+                }
+                particleRing[i] = null;
+            }
+        }
+        particleCursor = 0;
         for (EntityAccel ea : entityAccels.values()) {
             for (EntitySlot slot : ea.ring) {
                 if (slot != null) {
@@ -2084,6 +2393,14 @@ public final class RtEntities {
             lists.releaseDeferred();
             lists.destroyPersistent();
         }
+        for (int i = 0; i < particleRing.length; i++) {
+            EntitySlot slot = particleRing[i];
+            if (slot != null) {
+                destroyEntitySlot(slot);
+                particleRing[i] = null;
+            }
+        }
+        particleCursor = 0;
         for (EntityAccel ea : entityAccels.values()) {
             for (EntitySlot slot : ea.ring) {
                 if (slot != null) {

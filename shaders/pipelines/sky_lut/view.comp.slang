@@ -20,8 +20,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= uint(SKY_VIEW_LUT_W) || tid.y >= uint(SKY_VIEW_LUT_TOTAL_H)) {
         return;
     }
-    WorldPush push = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0];
-    SkyState sky = skyState(push);
+    SkyState sky = skyState(ConstPtr<WorldPush>(pcAddr.worldPushAddr));
 
     int body = int(tid.y) / SKY_VIEW_LUT_H;
     int row = int(tid.y) - body * SKY_VIEW_LUT_H;
@@ -66,7 +65,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // limit the rows above the horizon converge to, making both sides meet at the same value.
     float horizonCos = horizonZenithCos(sky.viewerRadiusKm);
     float dip = acos(clamp(viewZenithCos, -1.0, 1.0)) - acos(clamp(horizonCos, -1.0, 1.0));
-    if (dip > 0.0 && sky.horizonSoften > 0.0) {
+    if (dip > 0.0 && dip < sky.horizonSoften) {
         float3 tangentDir;
         float3 tangentLight;
         skyViewLocalDirections(worldLightDir.y, horizonCos, lightViewCos, tangentDir, tangentLight);

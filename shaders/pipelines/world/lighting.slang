@@ -78,13 +78,18 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
     if (dist2 < 1.0e-6) {
         return float3(0.0, 0.0, 0.0);
     }
-    float dist = sqrt(dist2);
-    float3 wi = toL / dist;
-    float cosL = max(0.0, dot(lnrm, -wi));
-    if (cosL <= 0.0) {
+    float rawCosL = dot(lnrm, -toL);
+    if (rawCosL <= 0.0) {
         return float3(0.0, 0.0, 0.0); // receiver behind the emitter face
     }
-    float ndl = dot(n, wi);
+    float rawNdl = dot(n, toL);
+    if (!twoSided && sss <= 0.0 && rawNdl <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float invDist = rsqrt(dist2);
+    float3 wi = toL * invDist;
+    float cosL = rawCosL * invDist;
+    float ndl = rawNdl * invDist;
     if (twoSided) {
         ndl = abs(ndl);
     }
@@ -107,8 +112,14 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
             // msScale is a loop invariant at this shading point (F0, ndv, rough and the global strength
             // do not change across RIS candidates), so it is computed once by the caller and passed in.
             brdf += (D * Gs) * (Fs * msScale) / (4.0 * ndv * ndl);
+            bool exactSpec = rough <= 0.0;
+            float ps = surfaceSpecularProb(diffAlb, F0, exactSpec);
+            float wNee = powerHeuristic(staticEmitterMisPdf(dist2, cosL),
+                    surfaceBsdfPdf(n, v, wi, rough, ps, exactSpec));
+            contrib = brdf * le * (G * area * wNee);
+        } else {
+            contrib = brdf * le * (G * area);
         }
-        contrib = brdf * le * (G * area);
     } else if (sss > 0.0) {
         float backNdl = -ndl;
         float G = backNdl * cosL / dist2;
@@ -136,9 +147,13 @@ public float3 evalDynamicContrib(float3 sp, float3 intensity, float radius, floa
     float window = maxRange2 > 0.0 ? clamp(1.0 - dist2 / maxRange2, 0.0, 1.0) : 1.0;
     window *= window;
     float atten = window / (dist2 + radius * radius);
-    float dist = sqrt(dist2);
-    float3 wi = toL / dist;
-    float ndl = dot(n, wi);
+    float rawNdl = dot(n, toL);
+    if (!twoSided && sss <= 0.0 && rawNdl <= 0.0) {
+        return float3(0.0, 0.0, 0.0);
+    }
+    float invDist = rsqrt(dist2);
+    float3 wi = toL * invDist;
+    float ndl = rawNdl * invDist;
     if (twoSided) {
         ndl = abs(ndl);
     }
@@ -150,8 +165,12 @@ public float3 evalDynamicContrib(float3 sp, float3 intensity, float radius, floa
             float ndh = max(0.0, dot(n, h));
             float ndv = max(1.0e-4, dot(n, v));
             float vdh = max(0.0, dot(v, h));
-            float D = ggxD(ndh, rough);
-            float Gs = ggxG1(ndv, rough) * ggxG1(ndl, rough);
+            // Analytical spherical lights have no BVH sphere mesh for BSDF rays to MIS against (e.g. a
+            // first-person handheld torch). Bound single-sample lobe tightness to the emitter's subtended
+            // half-angle when !exactSpecular so smooth metals do not spike when one disk sample lands on h.
+            float dynSpecRough = rough > 0.0 ? max(rough, min(0.35 * radius * invDist, 0.1)) : 0.0;
+            float D = ggxD(ndh, dynSpecRough);
+            float Gs = ggxG1(ndv, dynSpecRough) * ggxG1(ndl, dynSpecRough);
             float3 Fs = fresnelSchlick(vdh, F0);
             // Same loop-invariant msScale as evalSampleContrib, computed once per shading point.
             brdf += (D * Gs) * (Fs * msScale) / (4.0 * ndv * ndl);
@@ -173,17 +192,18 @@ public float3 evalDynamicContrib(float3 sp, float3 intensity, float radius, floa
 public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
                                    float3 F0, float rough, float3 msScale, bool twoSided, float sss,
                                    inout uint seed) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     DynamicReservoir r = dynamicResEmpty();
-    uint count = min(worldPush.dynamicLightCount, 16u);
+    uint count = min(wp[0].dynamicLightCount, 16u);
     if (count == 0u) {
         return r;
     }
-    float maxRange = max(worldPush.visualParams0.y, 0.0);
+    float maxRange = max(wp[0].visualParams0.y, 0.0);
     float maxRange2 = maxRange * maxRange;
     // msScale is a loop invariant at this shading point (F0, ndv, rough and the global strength are
     // constant across candidates), so the caller computes it once and this loop only reuses it.
     for (uint i = 0u; i < count; i++) {
-        DynamicLight dl = worldPush.dynamicLights[i];
+        DynamicLight dl = wp[0].dynamicLights[i];
         float3 center = dl.posRadius.xyz;
         float radius = max(dl.posRadius.w, DYNAMIC_LIGHT_MIN_RADIUS);
         float3 toCenter = center - hitPos;
@@ -191,13 +211,18 @@ public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd,
         if (maxRange2 > 0.0 && centerDist2 >= maxRange2) {
             continue;
         }
+        float signedPlaneDist = dot(toCenter, n);
+        if (!twoSided && sss <= 0.0 && signedPlaneDist <= 0.0) {
+            continue;
+        }
         // Decode the shadow cull mask once per candidate. It is the hardware instance mask that removes
         // the emitter's own mesh from its shadow rays; no distance trim is applied anywhere.
         uint shadowMask = clamp(uint(dl.intensityMask.w + 0.5), 1u, 255u);
         float3 sp = center;
         if (centerDist2 > 1.0e-4 && radius > 0.0) {
-            float centerDist = sqrt(centerDist2);
-            float3 axis = toCenter / centerDist;
+            float invCenterDist = rsqrt(centerDist2);
+            float centerDist = centerDist2 * invCenterDist;
+            float3 axis = toCenter * invCenterDist;
             float3 tangent;
             float3 bitangent;
             orthonormalBasis(axis, tangent, bitangent);
@@ -206,7 +231,7 @@ public DynamicReservoir risDynamic(float3 hitPos, float3 n, float3 v, float3 rd,
             // clamp a sphere centre in front of the surface lets the disk edge cross behind the
             // surface, flipping ndl in mid-sample and popping the near-field energy. SSS receivers use
             // the absolute plane distance because their back hemisphere is legitimately lit.
-            float planeDist = (!twoSided && sss <= 0.0) ? dot(toCenter, n) : abs(dot(toCenter, n));
+            float planeDist = (!twoSided && sss <= 0.0) ? signedPlaneDist : abs(signedPlaneDist);
             effRadius = min(effRadius, max(planeDist * 0.85, 0.0));
             float2 disk = sampleConcentricDisk(rndf(seed), rndf(seed)) * effRadius;
             sp = center + disk.x * tangent + disk.y * bitangent;
@@ -236,7 +261,7 @@ public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n,
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
-    float maxRange = max(worldPush.visualParams0.y, 0.0);
+    float maxRange = max(worldPushPtr()[0].visualParams0.y, 0.0);
     float phat;
     float3 contrib = evalDynamicContrib(s.pos, s.intensity, s.radius, maxRange * maxRange,
             hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, phat);
@@ -269,28 +294,31 @@ public float3 shadeDynamicReservoir(DynamicReservoir s, float3 hitPos, float3 n,
 
 // Resolve the current light-grid cell, including empty and out-of-bounds fallback.
 public bool findLightGridCell(float3 p, out LightGridCell cell, out int3 cellCoord) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     cell.spanOffset = 0u;
     cell.spanCount = 0u;
     cell.invWeightSum = 0.0;
     cellCoord = int3(0, 0, 0);
+    float4 gridOrigin = wp[0].lightGridOrigin;
+    int4 gridDims = wp[0].lightGridDims;
     if (pc.lightGridCellAddr == 0 || pc.lightGridSpanAddr == 0 || pc.lightLocalAliasAddr == 0
-            || worldPush.lightGridOrigin.w <= 0.0) return false;
-    int3 coord = int3(floor((p - worldPush.lightGridOrigin.xyz) / worldPush.lightGridOrigin.w));
+            || gridOrigin.w <= 0.0) return false;
+    int3 coord = int3(floor((p - gridOrigin.xyz) / gridOrigin.w));
     if (coord.x < 0 || coord.y < 0 || coord.z < 0
-            || coord.x >= worldPush.lightGridDims.x
-            || coord.y >= worldPush.lightGridDims.y
-            || coord.z >= worldPush.lightGridDims.z) return false;
-    uint linear = (uint(coord.z) * uint(worldPush.lightGridDims.y) + uint(coord.y))
-            * uint(worldPush.lightGridDims.x) + uint(coord.x);
+            || coord.x >= gridDims.x
+            || coord.y >= gridDims.y
+            || coord.z >= gridDims.z) return false;
+    uint linear = (uint(coord.z) * uint(gridDims.y) + uint(coord.y))
+            * uint(gridDims.x) + uint(coord.x);
     cell = ConstPtr<LightGridCell>(pc.lightGridCellAddr)[linear];
     cellCoord = coord;
     return cell.spanCount > 0u;
 }
 
 public float proposalPdf(LightCandidate light, LightGridCell cell, int3 cellCoord,
-                  float localProbability) {
+                  float localProbability, uint lightCount) {
     float globalPdf = pc.lightAliasAddr != 0
-            ? light.globalPdf : 1.0 / float(worldPush.lightCount);
+            ? light.globalPdf : 1.0 / float(lightCount);
     float localPdf = 0.0;
     if (localProbability > 0.0 && light.power > 0.0) {
         int3 delta = int3(int(light.section & 0x3ffu), int((light.section >> 10u) & 0x3ffu),
@@ -303,35 +331,29 @@ public float proposalPdf(LightCandidate light, LightGridCell cell, int3 cellCoor
     return localProbability * localPdf + (1.0 - localProbability) * globalPdf;
 }
 
-// Sample the exact mixture q = alpha*qCell + (1-alpha)*qGlobal. qCell first selects a nearby section
-// by emitted power and section distance, then its section-local power alias. Every light in
-// the neighborhood is represented without a fixed cap; qGlobal gives distant lights full support.
-// Alias spans make weighted local selection O(1). The mixture PDF is reconstructed after the single
-// decoded candidate: section power cancels with the section-local light PDF.
-public void selectLightGridLight(LightGridCell cell, bool useLocal, inout uint proposalSeed,
+public void selectLightGridLight(LightGridCell cell, bool useLocal, uint lightCount, inout uint proposalSeed,
                           out uint lightIndex) {
     if (useLocal) {
         selectLightGridSpanLight(pc.lightGridSpanAddr, pc.lightLocalAliasAddr, cell, proposalSeed, lightIndex);
     } else {
-        selectGlobalLight(pc.lightAliasAddr, worldPush.lightCount, proposalSeed, lightIndex);
+        selectGlobalLight(pc.lightAliasAddr, lightCount, proposalSeed, lightIndex);
     }
 }
 
-// A shared pool amortizes alias traversal, radiance decoding and emitter-frame reconstruction.
-// Each query uses its own proposal stream; sharing candidates does not synchronize path directions.
-// Marginal proposal PDFs remain those of the published hierarchy, not frequencies in this finite pool.
 public LightCandidate selectCandidate(LightGridCell cell, int3 cellCoord, bool useLocal,
+                                     uint lightCount, float inversePowerSum,
+                                     int4 poolOrigin, int4 poolDims,
                                      inout uint proposalSeed) {
-    uint first = useLocal ? lightPoolCellOffset(cellCoord, worldPush) : 0u;
-    uint count = useLocal ? uint(worldPush.lightPoolDims.w) : uint(worldPush.lightPoolOrigin.w);
+    uint first = useLocal ? lightPoolCellOffset(cellCoord, poolOrigin, poolDims) : 0u;
+    uint count = useLocal ? uint(poolDims.w) : uint(poolOrigin.w);
     if (pc.lightPoolAddr != 0 && first != 0xffffffffu && count > 0u) {
         uint entry = min(uint(lightProposalRandom(proposalSeed) * float(count)), count - 1u);
         return ConstPtr<LightCandidate>(pc.lightPoolAddr)[first + entry];
     }
     uint index;
-    selectLightGridLight(cell, useLocal, proposalSeed, index);
+    selectLightGridLight(cell, useLocal, lightCount, proposalSeed, index);
     return decodeLightCandidate(ConstPtr<Light>(pc.lightBufAddr)[index],
-            worldPush.lightRebase.w, pc.lightAliasAddr != 0);
+            inversePowerSum, pc.lightAliasAddr != 0);
 }
 
 // Direct alias proposals resolved together. Candidates are independent until the reservoir update, so
@@ -346,7 +368,7 @@ struct LightBatch {
 // Proposal draws are taken in candidate order before any load, so the selected lights, and therefore the
 // estimator, match resolving each candidate with selectLightGridLight one at a time.
 LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateCount, bool hasGridCell,
-                          LightGridCell cell, inout uint proposalSeed) {
+                          LightGridCell cell, uint lightCount, inout uint proposalSeed) {
     bool active[RIS_LOAD_BATCH];
     bool local[RIS_LOAD_BATCH];
     float outerSample[RIS_LOAD_BATCH];
@@ -365,7 +387,7 @@ LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateC
             outerSample[k] = lightProposalRandom(proposalSeed);
             if (local[k]) innerSample[k] = lightProposalRandom(proposalSeed);
         }
-        float columns = float(local[k] ? cell.spanCount : worldPush.lightCount);
+        float columns = float(local[k] ? cell.spanCount : lightCount);
         outerSample[k] *= columns;
         column[k] = min(uint(outerSample[k]), uint(columns) - 1u);
     }
@@ -430,12 +452,13 @@ LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateC
 // Fold one decoded proposal into the streaming reservoir. The emitter point and the replacement test use
 // the per-vertex seed; the proposal PDF is the published mixture, whichever path produced the record.
 void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell, int3 gridCellCoord,
-                   float localProbability, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
+                   float localProbability, float3 lightRebase, uint lightCount,
+                   float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
                    float3 F0, float rough, float3 msScale, bool twoSided, float sss, inout uint seed) {
     // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
     float s = rndf(seed) * 2.0 - 1.0;
     float t = rndf(seed) * 2.0 - 1.0;
-    float3 sp = lg.pos + worldPush.lightRebase.xyz
+    float3 sp = lg.pos + lightRebase
             + s * lg.halfU + t * lg.halfV;
     float phat;
     evalSampleContrib(sp, lg.normal, lg.radiance, lg.area, hitPos, n, v, rd,
@@ -443,7 +466,7 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
     if (!(phat > 0.0)) {
         return;
     }
-    float sourcePdf = proposalPdf(lg, gridCell, gridCellCoord, localProbability);
+    float sourcePdf = proposalPdf(lg, gridCell, gridCellCoord, localProbability, lightCount);
     float w = phat / max(sourcePdf, 1.0e-20);
     r.wSum += w;
     if (rndf(seed) * r.wSum < w) { // weighted reservoir update
@@ -461,10 +484,13 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
 public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
                      float rough, float3 msScale, bool twoSided, float sss, uint candidateCount,
                      inout uint seed, inout uint proposalSeed) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     Reservoir r = resEmpty();
-    if (candidateCount == 0u || worldPush.lightCount == 0u || pc.lightBufAddr == 0) {
+    uint lightCount = wp[0].lightCount;
+    if (candidateCount == 0u || lightCount == 0u || pc.lightBufAddr == 0) {
         return r;
     }
+    float4 lightRebase = wp[0].lightRebase;
     // msScale is computed once per shading vertex by the caller: F0, ndv, rough and the global
     // compensation strength are constant for every candidate in this loop.
     LightGridCell gridCell;
@@ -474,7 +500,7 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
         // Stochastically blend across hard section boundaries. Every cell proposal retains full global
         // support, so conditioning on this independently jittered lookup remains unbiased.
         gridLookup += (float3(rndf(proposalSeed), rndf(proposalSeed), rndf(proposalSeed)) - 0.5)
-                * worldPush.lightGridOrigin.w;
+                * wp[0].lightGridOrigin.w;
     }
     bool hasGridCell = findLightGridCell(gridLookup, gridCell, gridCellCoord);
     r.M = float(candidateCount);
@@ -487,25 +513,28 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
     uint localCandidateCount = candidateCount - globalCandidateCount;
     float localProbability = float(localCandidateCount) / float(candidateCount);
     if (pc.lightPoolAddr != 0) {
+        int4 poolOrigin = wp[0].lightPoolOrigin;
+        int4 poolDims = wp[0].lightPoolDims;
         for (uint c = 0u; c < candidateCount; c++) {
             uint globalsBefore = (c * globalCandidateCount) / candidateCount;
             uint globalsAfter = ((c + 1u) * globalCandidateCount) / candidateCount;
             bool useLocal = hasGridCell && globalsAfter == globalsBefore;
-            LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal, proposalSeed);
-            risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
-                    diffAlb, F0, rough, msScale, twoSided, sss, seed);
+            LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal,
+                    lightCount, lightRebase.w, poolOrigin, poolDims, proposalSeed);
+            risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, lightRebase.xyz, lightCount,
+                    hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, seed);
         }
     } else {
         for (uint first = 0u; first < candidateCount; first += RIS_LOAD_BATCH) {
             LightBatch batch = loadLightBatch(first, candidateCount, globalCandidateCount, hasGridCell,
-                    gridCell, proposalSeed);
+                    gridCell, lightCount, proposalSeed);
             [unroll]
             for (uint k = 0u; k < RIS_LOAD_BATCH; k++) {
                 if (first + k >= candidateCount) break;
-                LightCandidate lg = decodeLightCandidate(batch.lights[k], worldPush.lightRebase.w,
+                LightCandidate lg = decodeLightCandidate(batch.lights[k], lightRebase.w,
                         pc.lightAliasAddr != 0);
-                risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, hitPos, n, v, rd,
-                        diffAlb, F0, rough, msScale, twoSided, sss, seed);
+                risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, lightRebase.xyz, lightCount,
+                        hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, seed);
             }
         }
     }
@@ -539,8 +568,13 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
     if (dist <= 1.0e-5) {
         return float3(0.0, 0.0, 0.0);
     }
-    // Stop just short of the sample point so the ray doesn't self-occlude on the emitter's own face.
-    VisibilityResult shadow = visibility(origin, toL / dist, dist * 0.999);
+    // Stop 1 mm (or ~160 fp32 ULPs at long range) short of the sample point so the ray never
+    // self-occludes on the emitter's own face, without the old relative 0.999*dist margin that stopped
+    // 6-12 cm short at distance and leaked light past thin occluders (carpets, snow layers, trapdoors).
+    float traceDist = dist - max(1.0e-3, dist * 1.0e-5);
+    VisibilityResult shadow = traceDist > RAY_TMIN
+            ? visibility(origin, toL / dist, traceDist)
+            : makeUnoccludedVisibility();
     float3 vis = shadow.transmittance;
     return contrib * vis * s.W;
 }

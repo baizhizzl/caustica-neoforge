@@ -2,6 +2,7 @@ package dev.comfyfluffy.caustica.rt.entity;
 
 import com.mojang.blaze3d.vertex.VertexConsumer;
 import dev.comfyfluffy.caustica.rt.accel.RtAccel;
+import dev.comfyfluffy.caustica.rt.material.RtMaterialRegistry;
 import it.unimi.dsi.fastutil.floats.FloatArrayList;
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import net.minecraft.client.resources.model.geometry.BakedQuad;
@@ -394,6 +395,9 @@ public final class RtEntityCapture implements VertexConsumer {
         float tr = ((c >> 16) & 0xFF) * (1f / 255f);
         float tg = ((c >> 8) & 0xFF) * (1f / 255f);
         float tb = (c & 0xFF) * (1f / 255f);
+        float materialBits = Float.intBitsToFloat(currentMaterialId);
+        float primFlagsBits = Float.intBitsToFloat(RtMaterialRegistry.INSTANCE.entityPrimFlags(currentMaterialId));
+        float primAux0Bits = Float.intBitsToFloat(RtMaterialRegistry.INSTANCE.entityPrimAux0Bits(currentMaterialId));
         for (int t = 0; t < 2; t++) { // one {normal+emission, tint, mat} record per triangle
             prim.add(nx);
             prim.add(ny);
@@ -403,9 +407,9 @@ public final class RtEntityCapture implements VertexConsumer {
             prim.add(tg);
             prim.add(tb);
             prim.add((float) currentTexSlot); // tint.w = bindless texture slot
-            prim.add(Float.intBitsToFloat(currentMaterialId));
-            prim.add(0f); // flags
-            prim.add(0f); // aux0
+            prim.add(materialBits);
+            prim.add(primFlagsBits); // flags: model + stochasticAlpha
+            prim.add(primAux0Bits);  // aux0: transmission
             prim.add(0f); // aux1
             alphaBuckets.add(currentAlphaBucket);
         }

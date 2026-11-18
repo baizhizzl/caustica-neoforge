@@ -227,10 +227,25 @@ final class RtTlasCacheTest {
     void freshlyBuiltParticleBlasAddressChangeRejectsInPlaceTlasRefit() {
         Object source = new Object();
         RtTlasCache cache = new RtTlasCache();
-        // 0x400000 = RtEntities.PARTICLE_BIT: particle BLASes are freshly rebuilt per frame with varying
-        // primitive counts, so swapping the BLAS address must force a full TLAS build instead of an UPDATE.
+        // 0x400000 = RtEntities.PARTICLE_BIT: swapping the BLAS address (e.g. sub-offset toggle on an AABB
+        // extent jump) must force a full TLAS build instead of an UPDATE.
         cache.built(source, 3, 10, List.of(instance(100, 0x400001, 2, 4)), 0, false);
         assertFalse(cache.canUpdate(source, 3, 10, List.of(instance(200, 0x400001, 2, 4))));
         assertTrue(cache.canUpdate(source, 3, 10, List.of(instance(100, 0x400001, 2, 4))));
+    }
+
+    @Test
+    void persistentParticleRingSlotPermitsTlasRefitWithinDisplacementBound() {
+        Object source = new Object();
+        RtTlasCache cache = new RtTlasCache();
+        var initial = new RtAccel.Instance(new float[] {1, 0, 0, 12, 0, 1, 0, 65, 0, 0, 1, -8},
+                100, 0x400001, 2, 8);
+        var drifted = new RtAccel.Instance(new float[] {1, 0, 0, 13.5f, 0, 1, 0, 65.5f, 0, 0, 1, -7.25f},
+                100, 0x400001, 2, 8);
+        var jumped = new RtAccel.Instance(new float[] {1, 0, 0, 20, 0, 1, 0, 65, 0, 0, 1, -8},
+                100, 0x400001, 2, 8);
+        cache.built(source, 3, 10, List.of(initial), 0, false);
+        assertTrue(cache.canUpdate(source, 3, 10, List.of(drifted)));
+        assertFalse(cache.canUpdate(source, 3, 10, List.of(jumped)));
     }
 }

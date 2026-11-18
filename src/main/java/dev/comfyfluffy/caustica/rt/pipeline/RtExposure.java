@@ -66,6 +66,10 @@ public final class RtExposure {
         return image != null;
     }
 
+    public boolean isAutoMode() {
+        return mode() == Mode.AUTO;
+    }
+
     public RtBuffer stateBuffer() {
         return state;
     }
@@ -219,10 +223,20 @@ public final class RtExposure {
         try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "exposure histogram clear")) {
             VK10.vkCmdFillBuffer(cmd, histogram.handle, 0, histogram.size, 0);
         }
-        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        RtContext.memoryBarrier2(cmd, stack,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR
+                        | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
         AutoConfig config = autoConfig();
         pipeline.dispatchHistogram(cmd, traceColor.width, traceColor.height, config);
-        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        RtContext.memoryBarrier2(cmd, stack,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
+                org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_READ_BIT_KHR
+                        | org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR);
         pipeline.dispatchResolve(cmd, config, frameTimeSeconds());
         logDiagnosticsIfDue();
     }

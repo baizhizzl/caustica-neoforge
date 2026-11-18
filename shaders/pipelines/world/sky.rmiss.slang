@@ -92,31 +92,44 @@ float3 stars(float3 dir, SkyState state, float3 extinction) {
 
 /** Atmosphere in-scatter for a world direction: both bodies' slices of this frame's sky-view LUT. */
 float3 skyDome(float3 dir, SkyState state) {
-    float2 sunUv = skyViewLutUv(state.viewerRadiusKm, dir.y,
-            lightViewCosine(dir, state.sunDir), SKY_VIEW_BODY_SUN);
-    float2 moonUv = skyViewLutUv(state.viewerRadiusKm, dir.y,
-            lightViewCosine(dir, state.moonDir), SKY_VIEW_BODY_MOON);
+    // Share the elevation coordinate v across both slices so acos/sqrt only run once per miss.
+    float horizonSin = sqrt(max(state.viewerRadiusKm * state.viewerRadiusKm
+            - ATMOS_BOTTOM_KM * ATMOS_BOTTOM_KM, 0.0)) / max(state.viewerRadiusKm, 1.0e-6);
+    float horizonAngle = acos(clamp(horizonSin, -1.0, 1.0));
+    float zenithHorizonAngle = SKY_PI - horizonAngle;
+    float viewZenithAngle = acos(clamp(dir.y, -1.0, 1.0));
+    float v;
+    if (viewZenithAngle < zenithHorizonAngle) {
+        float coord = viewZenithAngle / max(zenithHorizonAngle, 1.0e-6);
+        v = (1.0 - sqrt(max(1.0 - coord, 0.0))) * 0.5;
+    } else {
+        float coord = (viewZenithAngle - zenithHorizonAngle) / max(horizonAngle, 1.0e-6);
+        v = sqrt(max(coord, 0.0)) * 0.5 + 0.5;
+    }
+    float vClamped = saturate(v);
+    float2 lutSize = float2(float(SKY_VIEW_LUT_W), float(SKY_VIEW_LUT_H));
+    float sunU = sqrt(max(0.5 - 0.5 * lightViewCosine(dir, state.sunDir), 0.0));
+    float moonU = sqrt(max(0.5 - 0.5 * lightViewCosine(dir, state.moonDir), 0.0));
+    float2 sunSub = unitToSubUv(float2(sunU, vClamped), lutSize);
+    float2 moonSub = unitToSubUv(float2(moonU, vClamped), lutSize);
+    float2 sunUv = float2(sunSub.x, (sunSub.y + float(SKY_VIEW_BODY_SUN)) / float(SKY_VIEW_BODY_COUNT));
+    float2 moonUv = float2(moonSub.x, (moonSub.y + float(SKY_VIEW_BODY_MOON)) / float(SKY_VIEW_BODY_COUNT));
     return skyViewLut.SampleLevel(sunUv, 0.0).rgb + skyViewLut.SampleLevel(moonUv, 0.0).rgb;
 }
 
 [shader("miss")]
 void main(inout Payload payload) {
-    WorldPush worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
-    SkyState state = skyState(worldPush);
+    SkyState state = skyState(ConstPtr<WorldPush>(pc.worldPushAddr));
     float3 dir = normalize(WorldRayDirection());
     bool showCelestial = (payload.flags & PAYLOAD_SHOW_CELESTIAL) != 0u;
 
     float3 color = skyDome(dir, state);
-    // Airglow plus integrated unresolved starlight: the real floor of a moonless night sky (~1e-3 cd/m²),
-    // isotropic because it is emitted by the upper atmosphere itself rather than scattered from a body.
-    // Multiple scattering is in the LUT, so this remains a flat, physically small constant.
     color += state.airglowLuminance;
 
-    // Extinction along the view ray: stars redden and dim into the horizon on exactly the curve the sky
-    // itself follows, because it is the same LUT that produced the sky. Zero angular radius — a star is a
-    // point, so it sets at the horizon line.
-    float3 extinction = transmittanceToSpace(transmittanceLut, state.viewerRadiusKm, dir, 0.0);
-    color += stars(dir, state, extinction);
+    if (state.starLuminance > 0.0 && dir.y > 0.0) {
+        float3 extinction = transmittanceToSpace(transmittanceLut, state.viewerRadiusKm, dir, 0.0);
+        color += stars(dir, state, extinction);
+    }
 
     if (showCelestial) {
         float2 local;

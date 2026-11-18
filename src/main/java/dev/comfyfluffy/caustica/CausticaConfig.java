@@ -1044,6 +1044,6 @@ public final class CausticaConfig {
     }
 
     private static int defaultWorkerThreads() {
-        return Math.clamp(Runtime.getRuntime().availableProcessors() / 2, 1, 4);
+        return Math.clamp(Runtime.getRuntime().availableProcessors() / 2, 1, 8);
     }
 }

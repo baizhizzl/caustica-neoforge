@@ -119,6 +119,8 @@ public final class RtDeviceBringup {
     private static volatile boolean presentIdEnabled; // VK_KHR_present_id actually enabled on the device
     private static volatile boolean wideLinesEnabled; // VkPhysicalDeviceFeatures.wideLines actually enabled
     private static volatile float maxLineWidth = 1.0f; // device's lineWidthRange[1]; 1.0 unless wideLinesEnabled
+    private static volatile boolean samplerAnisotropyEnabled; // VkPhysicalDeviceFeatures.samplerAnisotropy actually enabled
+    private static volatile float maxSamplerAnisotropy = 1.0f; // min(16, device maxSamplerAnisotropy); 1.0 unless enabled
     private static volatile int overlayMsaaSamples = VK10.VK_SAMPLE_COUNT_1_BIT; // capped to the device's framebufferColorSampleCounts
     private static volatile int maxOpacity4StateSubdivisionLevel;
     private static volatile int computeQueueFamilyIndex = -1;
@@ -149,6 +151,7 @@ public final class RtDeviceBringup {
     private static final VulkanFeature OMM_FEATURE = new VulkanFeature(OMM_FEATURES_STRUCT, "micromap");
     private static final VulkanFeature PRESENT_ID_FEATURE = new VulkanFeature(PRESENT_ID_FEATURES_STRUCT, "presentId");
     private static final VulkanFeature WIDE_LINES_FEATURE = new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "wideLines");
+    private static final VulkanFeature SAMPLER_ANISOTROPY_FEATURE = new VulkanFeature(VulkanFeatureSets.VK10_FEATURES_STRUCT, "samplerAnisotropy");
 
     private static final List<VulkanFeature> REQUIRED_RT_FEATURES = List.of(
             BUFFER_DEVICE_ADDRESS_FEATURE,
@@ -182,7 +185,8 @@ public final class RtDeviceBringup {
     }
 
     private record FeatureSupport(List<String> missingRequired, SerBackend serBackend,
-                                  boolean omm, boolean presentId, boolean wideLines) {
+                                  boolean omm, boolean presentId, boolean wideLines,
+                                  boolean samplerAnisotropy) {
         boolean supportsRt() {
             return missingRequired.isEmpty();
         }
@@ -243,6 +247,16 @@ public final class RtDeviceBringup {
      *  enabled (Vulkan mandates exactly 1.0 in that case). Callers must clamp their desired width to this. */
     public static float maxLineWidth() {
         return maxLineWidth;
+    }
+
+    /** True if {@code VkPhysicalDeviceFeatures.samplerAnisotropy} was enabled on the device. */
+    public static boolean samplerAnisotropyEnabled() {
+        return samplerAnisotropyEnabled;
+    }
+
+    /** Clamped hardware anisotropy limit (up to 16x); 1.0 when {@link #samplerAnisotropyEnabled()} is false. */
+    public static float maxSamplerAnisotropy() {
+        return maxSamplerAnisotropy;
     }
 
     /** {@code VK_SAMPLE_COUNT_4_BIT} capped down to whatever the device's {@code framebufferColorSampleCounts}
@@ -427,6 +441,7 @@ public final class RtDeviceBringup {
                 PRESENT_ID_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
             }
             WIDE_LINES_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
+            SAMPLER_ANISOTROPY_FEATURE.struct().findOrCreateStructInPNextChain(available, stack);
 
             VK12.vkGetPhysicalDeviceFeatures2(physicalDevice.vkPhysicalDevice(), available);
 
@@ -441,7 +456,8 @@ public final class RtDeviceBringup {
             return new FeatureSupport(missing, supportedSer,
                     queryOmm && OMM_FEATURE.get(available),
                     queryPresentId && PRESENT_ID_FEATURE.get(available),
-                    WIDE_LINES_FEATURE.get(available));
+                    WIDE_LINES_FEATURE.get(available),
+                    SAMPLER_ANISOTROPY_FEATURE.get(available));
         }
     }
 
@@ -492,6 +508,8 @@ public final class RtDeviceBringup {
         presentIdEnabled = false;
         wideLinesEnabled = false;
         maxLineWidth = 1.0f;
+        samplerAnisotropyEnabled = false;
+        maxSamplerAnisotropy = 1.0f;
         String missingExtension = firstUnsupportedExtension(physicalDevice);
         if (missingExtension != null) {
             if (!loggedUnavailable) {
@@ -532,6 +550,13 @@ public final class RtDeviceBringup {
             maxLineWidth = physicalDevice.vkPhysicalDeviceProperties().limits().lineWidthRange(1);
         }
 
+        samplerAnisotropyEnabled = support.samplerAnisotropy;
+        if (samplerAnisotropyEnabled) {
+            features.add(SAMPLER_ANISOTROPY_FEATURE);
+            maxSamplerAnisotropy = Math.min(16.0f,
+                    Math.max(1.0f, physicalDevice.vkPhysicalDeviceProperties().limits().maxSamplerAnisotropy()));
+        }
+
         // World-overlay MSAA (block outline edge AA): a framebuffer property, not a feature — no
         // VulkanFeature entry needed, just cap the desired 4x down to what the device actually supports.
         int colorSampleCounts = physicalDevice.vkPhysicalDeviceProperties().limits().framebufferColorSampleCounts();
@@ -567,6 +592,7 @@ public final class RtDeviceBringup {
         CausticaMod.LOGGER.info(
                 "Ray tracing: enabling {}{}{} + features [bufferDeviceAddress, accelerationStructure, rayTracingPipeline, rayQuery, SER={}"
                         + (wideLinesEnabled ? ", wideLines(max=" + maxLineWidth + ")" : "")
+                        + (samplerAnisotropyEnabled ? ", samplerAnisotropy(max=" + maxSamplerAnisotropy + "x)" : "")
                         + (ommEnabled ? ", opacityMicromap" : "") + "] + overlayMsaa=" + overlayMsaaSamples + "x on [{}]",
                 RT_EXTENSIONS, serBackend.extensionName == null ? "" : " + " + serBackend.extensionName,
                 optionalExtensions.isEmpty() ? "" : " + " + optionalExtensions,

@@ -26,8 +26,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= uint(MULTISCATTER_LUT_W) || tid.y >= uint(MULTISCATTER_LUT_H)) {
         return;
     }
-    WorldPush push = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0];
-    float groundAlbedo = push.skyLook3.x;
+    float groundAlbedo = ConstPtr<WorldPush>(pcAddr.worldPushAddr)[0].skyLook3.x;
 
     float2 uv = float2(float(tid.x), float(tid.y))
               / float2(float(MULTISCATTER_LUT_W - 1), float(MULTISCATTER_LUT_H - 1));

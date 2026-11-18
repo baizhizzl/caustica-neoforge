@@ -51,20 +51,24 @@ float rayConeHitWidth(uint rayCone) {
     return max(cone.x + cone.y * max(RayTCurrent(), 0.0), RAY_CONE_MIN_WIDTH);
 }
 
-float edgeTexelsPerWorld(float3 p0, float3 p1, float2 uv0, float2 uv1, float2 textureSizePx) {
-    float worldLen = length(p1 - p0);
-    if (worldLen <= 1.0e-7) {
+float edgeTexelsPerWorldSq(float3 p0, float3 p1, float2 uv0, float2 uv1, float2 textureSizePx) {
+    float3 dp = p1 - p0;
+    float worldLenSq = dot(dp, dp);
+    if (worldLenSq <= 1.0e-14) {
         return 0.0;
     }
-    return length((uv1 - uv0) * textureSizePx) / worldLen;
+    float2 duv = (uv1 - uv0) * textureSizePx;
+    return dot(duv, duv) / worldLenSq;
 }
 
 float rayConeTextureLod(uint rayCone, float2 textureSizePx, float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2) {
-    float texelsPerWorld = max(edgeTexelsPerWorld(p0, p1, uv0, uv1, textureSizePx),
-            max(edgeTexelsPerWorld(p1, p2, uv1, uv2, textureSizePx),
-                edgeTexelsPerWorld(p2, p0, uv2, uv0, textureSizePx)));
-    float footprint = max(rayConeHitWidth(rayCone) * texelsPerWorld, RAY_CONE_MIN_TEXEL_FOOTPRINT);
-    return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
+    float texelsPerWorldSq = max(edgeTexelsPerWorldSq(p0, p1, uv0, uv1, textureSizePx),
+            max(edgeTexelsPerWorldSq(p1, p2, uv1, uv2, textureSizePx),
+                edgeTexelsPerWorldSq(p2, p0, uv2, uv0, textureSizePx)));
+    float coneWidth = rayConeHitWidth(rayCone);
+    float footprintSq = max(coneWidth * coneWidth * texelsPerWorldSq,
+            RAY_CONE_MIN_TEXEL_FOOTPRINT * RAY_CONE_MIN_TEXEL_FOOTPRINT);
+    return clamp(0.5 * log2(footprintSq), 0.0, RAY_CONE_MAX_LOD);
 }
 
 float rayConeUnitUvLod(uint rayCone, float2 textureSizePx) {
@@ -72,14 +76,99 @@ float rayConeUnitUvLod(uint rayCone, float2 textureSizePx) {
     return clamp(log2(footprint), 0.0, RAY_CONE_MAX_LOD);
 }
 
+struct RayConeGradients {
+    float2 ddx;
+    float2 ddy;
+};
+
+// Project the ray cone's elliptical surface intersection onto the hit triangle's UV gradients so
+// SampleGrad engages hardware anisotropic filtering along grazing floors/walls on coherent camera and
+// specular rays, while keeping wide indirect GI cones at 1:1 isotropic mip selection.
+RayConeGradients rayConeSurfaceGradients(uint rayCone, float3 geomNormal, float3 vdir,
+        float3 p0, float3 p1, float3 p2, float2 uv0, float2 uv1, float2 uv2) {
+    RayConeGradients gr;
+    gr.ddx = float2(0.0, 0.0);
+    gr.ddy = float2(0.0, 0.0);
+    float2 cone = unpackHalf2(rayCone);
+    float coneWidth = max(cone.x + cone.y * max(RayTCurrent(), 0.0), RAY_CONE_MIN_WIDTH);
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 nCross = cross(e1, e2);
+    float area2 = dot(nCross, nCross);
+    if (area2 <= 1.0e-20) {
+        return gr;
+    }
+    float invArea2 = 1.0 / area2;
+    float3 dual1 = cross(e2, nCross) * invArea2;
+    float3 dual2 = cross(nCross, e1) * invArea2;
+    float2 g1 = uv1 - uv0;
+    float2 g2 = uv2 - uv0;
+
+    float minNoV = cone.y <= 0.05 ? 0.0625 : 1.0; // up to 16x anisotropy on coherent rays, 1x on diffuse GI
+    float NoV = max(abs(dot(geomNormal, vdir)), minNoV);
+    float3 projRay = -vdir + geomNormal * dot(vdir, geomNormal);
+    float projLen2 = dot(projRay, projRay);
+    float3 aMajor;
+    float3 aMinor;
+    if (projLen2 > 1.0e-12) {
+        aMajor = projRay * rsqrt(projLen2);
+        aMinor = cross(geomNormal, aMajor);
+    } else {
+        orthonormalBasis(geomNormal, aMajor, aMinor);
+    }
+    float3 dpMajor = aMajor * (coneWidth / NoV);
+    float3 dpMinor = aMinor * coneWidth;
+    gr.ddx = g1 * dot(dpMajor, dual1) + g2 * dot(dpMajor, dual2);
+    gr.ddy = g1 * dot(dpMinor, dual1) + g2 * dot(dpMinor, dual2);
+    return gr;
+}
+
+// Keep anisotropic taps strictly inside a packed atlas sprite's [uMin, uMax] bounds and within vanilla's
+// 4-mip sprite domain so grazing SampleGrad fetches never bleed across neighbouring atlas tiles.
+float2 clampAtlasUvForGrad(float2 uv, float4 albedoUv, inout float2 ddx, inout float2 ddy) {
+    if (albedoUv.z <= 1.0001 && albedoUv.w <= 1.0001) {
+        return uv;
+    }
+    float maxLocalGrad = max(
+            max(abs(ddx.x), abs(ddy.x)) * albedoUv.z,
+            max(abs(ddx.y), abs(ddy.y)) * albedoUv.w);
+    if (maxLocalGrad > 0.25) {
+        float scale = 0.25 / maxLocalGrad;
+        ddx *= scale;
+        ddy *= scale;
+    }
+    float2 extent = 1.0 / max(albedoUv.zw, float2(1.0e-6, 1.0e-6));
+    float2 rUv = min(0.5 * (abs(ddx) + abs(ddy)), 0.49 * extent);
+    return clamp(uv, albedoUv.xy + rUv, albedoUv.xy + extent - rUv);
+}
+
+// Standalone [0,1] entity sheets (zombie.png, chests, font glyph atlases) pack adjacent body-part UV
+// islands and text characters with zero gutter and albedoUv.zw == (1, 1). Inset anisotropic taps inside
+// the quad/triangle UV bounding box unless the mesh explicitly tiles (> 1.0 UV span).
+float2 clampEntityUvForGrad(float2 uv, float4 albedoUv, float2 uv0, float2 uv1, float2 uv2,
+        inout float2 ddx, inout float2 ddy) {
+    if (albedoUv.z > 1.0001 || albedoUv.w > 1.0001) {
+        return clampAtlasUvForGrad(uv, albedoUv, ddx, ddy);
+    }
+    float2 triMin = min(uv0, min(uv1, uv2));
+    float2 triMax = max(uv0, max(uv1, uv2));
+    float2 triExtent = triMax - triMin;
+    if (any(triExtent <= float2(1.0e-5, 1.0e-5)) || any(triExtent > float2(1.0, 1.0))) {
+        return uv;
+    }
+    float2 rUv = min(0.5 * (abs(ddx) + abs(ddy)), 0.49 * triExtent);
+    return clamp(uv, triMin + rUv, triMax - rUv);
+}
+
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the
 // hit triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be
 // oriented toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations
-// don't invert it through the surface (the black-spot fix). Returns AO (blue) via `ao`; falls back to
-// `n` on a degenerate UV triangle. Instance transforms are translation-only, so object edges equal
-// world edges.
-float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2, float3 vdir, float4 ntex, out float ao) {
+// don't invert it through the surface (the black-spot fix). `normalAtten` tapers unresolved normal
+// slopes past the compiled mip ceiling while folding their variance into GGX roughness (Specular AA).
+float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
+        float3 vdir, float4 ntex, float normalAtten, out float ao, out float normalSlopeSq) {
     ao = 1.0;
+    normalSlopeSq = 0.0;
     float2 g1 = t1 - t0;
     float2 g2 = t2 - t0;
     float det = g1.x * g2.y - g1.y * g2.x;
@@ -90,7 +179,9 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
     float3 traw = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;
     float3 T = normalize(traw - n * dot(n, traw));       // Gram-Schmidt against the viewer-oriented normal
     float3 B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);   // handedness from the UV winding
-    float2 nxy = ntex.xy * 2.0 - 1.0;                    // R,G = tangent-space X,Y
+    float2 rawNxy = ntex.xy * 2.0 - 1.0;                 // R,G = tangent-space X,Y
+    normalSlopeSq = dot(rawNxy, rawNxy);
+    float2 nxy = rawNxy * normalAtten;
     float nz = sqrt(max(0.0, 1.0 - dot(nxy, nxy)));      // reconstruct Z
     float3 nm = normalize(nxy.x * T + nxy.y * B + nz * n);
     float NoV = dot(nm, vdir);
@@ -112,19 +203,19 @@ struct Surface {
 };
 
 // Canonical material pages use a compact page index shared by their three dedicated arrays.
-float4 samplePageSurface0(uint page, float2 uv, float lod) {
-    return materialSurface0Tex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+float4 samplePageSurface0(uint page, float2 uv, float2 ddx, float2 ddy) {
+    return materialSurface0Tex[NonUniformResourceIndex(page)].SampleGrad(uv, ddx, ddy);
 }
-float4 samplePageSurface1(uint page, float2 uv, float lod) {
-    return materialSurface1Tex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+float4 samplePageSurface1(uint page, float2 uv, float2 ddx, float2 ddy) {
+    return materialSurface1Tex[NonUniformResourceIndex(page)].SampleGrad(uv, ddx, ddy);
 }
-float4 samplePageNormalAo(uint page, float2 uv, float lod) {
-    return materialNormalAoTex[NonUniformResourceIndex(page)].SampleLevel(uv, lod);
+float4 samplePageNormalAo(uint page, float2 uv, float2 ddx, float2 ddy) {
+    return materialNormalAoTex[NonUniformResourceIndex(page)].SampleGrad(uv, ddx, ddy);
 }
 
 // The sole terrain/entity material evaluation path. LabPBR categorical bytes have already been
 // decoded on the CPU; every sample below is a continuously filterable physical channel with semantic mips.
-Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float3 albedo,
+Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, RayConeGradients coneGrad, float3 albedo,
         float3 geometricNormal, float3 p0, float3 p1, float3 p2,
         float2 uv0, float2 uv1, float2 uv2, float3 vdir,
         float fallbackRoughness, float fallbackMetalness, float fallbackEmission, bool allowSss) {
@@ -137,16 +228,40 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
     surface.sss = 0.0;
     surface.ao = 1.0;
 
+    uint activeFeatures = header.features
+            & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION | MATERIAL_FEATURE_NORMAL);
+    float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
+            & MATERIAL_EMISSION_STRENGTH_MASK)
+            * (MATERIAL_MAX_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
+    if (activeFeatures == 0u) {
+        surface.emission *= strength;
+        return surface;
+    }
+
     float2 localUv = clamp((atlasUv - header.albedoUv.xy) * header.albedoUv.zw,
             float2(0.0, 0.0), float2(1.0, 1.0));
     float2 pageUv = header.materialUv.xy + localUv * header.materialUv.zw;
     float maxMaterialLod = float((header.features >> MATERIAL_MAX_LOD_SHIFT) & MATERIAL_MAX_LOD_MASK);
-    float materialLod = min(lod, maxMaterialLod);
     uint page = header.texturePage;
+    float2 uvToPage = header.albedoUv.zw * header.materialUv.zw;
+    float2 matDdx = coneGrad.ddx * uvToPage;
+    float2 matDdy = coneGrad.ddy * uvToPage;
+    float2 pageSize = texSizePx(materialSurface0Tex[NonUniformResourceIndex(page)]);
+    float2 matPxX = matDdx * pageSize;
+    float2 matPxY = matDdy * pageSize;
+    float matFootprintSq = max(dot(matPxX, matPxX), dot(matPxY, matPxY));
+    float effectiveMatLod = 0.5 * log2(max(matFootprintSq, 1.0e-8));
+    float maxFootprint = exp2(maxMaterialLod);
+    if (matFootprintSq > maxFootprint * maxFootprint) {
+        float gradScale = maxFootprint * rsqrt(matFootprintSq);
+        matDdx *= gradScale;
+        matDdy *= gradScale;
+    }
+
     if ((header.features & (MATERIAL_FEATURE_SPEC | MATERIAL_FEATURE_HEURISTIC_EMISSION)) != 0u) {
-        float4 surface0 = samplePageSurface0(page, pageUv, materialLod);
+        float4 surface0 = samplePageSurface0(page, pageUv, matDdx, matDdy);
         if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
-            float4 surface1 = samplePageSurface1(page, pageUv, materialLod); // LabPBR F0
+            float4 surface1 = samplePageSurface1(page, pageUv, matDdx, matDdy); // LabPBR F0
             surface.roughness = surface0.r;
             surface.metalness = surface0.g;
             surface.emission = surface0.b;
@@ -160,17 +275,22 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, float lod, float
             surface.emission = surface0.b * fallbackEmission;
         }
     }
-    // Final HDR emitting-surface luminance (look-package baseline or absolute JSON cd/m² override), baked in Java at
-    // material-compile time and packed unconditionally — see MATERIAL_EMISSION_STRENGTH_SHIFT. 0 for
-    // non-emissive materials, so this multiply is always safe (and a no-op) when nothing above ran.
-    float strength = float((header.features >> MATERIAL_EMISSION_STRENGTH_SHIFT)
-            & MATERIAL_EMISSION_STRENGTH_MASK)
-            * (MATERIAL_MAX_EMISSION_STRENGTH / float(MATERIAL_EMISSION_STRENGTH_MASK));
     surface.emission *= strength;
     if ((header.features & MATERIAL_FEATURE_NORMAL) != 0u) {
-        float4 normalAo = samplePageNormalAo(page, pageUv, materialLod);
+        float4 normalAo = samplePageNormalAo(page, pageUv, matDdx, matDdy);
+        // Past maxMaterialLod (2x2 texels per block), taper unresolved normal slopes smoothly toward the
+        // geometric normal and fold the lost slope variance into GGX roughness (LEADR/Toksvig Specular AA)
+        // so distant roofs/roads keep physical sheen without sub-pixel normal-map shimmering.
+        float excessLod = max(0.0, effectiveMatLod - maxMaterialLod);
+        float normalAtten = exp2(-0.5 * excessLod);
+        float normalSlopeSq;
         surface.normal = perturbNormal(geometricNormal, p0, p1, p2, uv0, uv1, uv2,
-                vdir, normalAo, surface.ao);
+                vdir, normalAo, normalAtten, surface.ao, normalSlopeSq);
+        float unresolvedVar = 0.5 * (1.0 - normalAtten * normalAtten) * normalSlopeSq;
+        if ((header.features & MATERIAL_FEATURE_SPEC) == 0u && effectiveMatLod > 0.0) {
+            unresolvedVar += 0.15 * saturate(effectiveMatLod / max(maxMaterialLod, 1.0)) * normalSlopeSq;
+        }
+        surface.roughness = clamp(surface.roughness + unresolvedVar, 0.0, 1.0);
     }
     return surface;
 }
@@ -290,16 +410,21 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ep0 = mul(entityO2w, HitTriangleVertexPosition(0));
         float3 ep1 = mul(entityO2w, HitTriangleVertexPosition(1));
         float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
-        float entityLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(texSlot)]),
-                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
-        float4 entityTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(euvCoord, entityLod);
         MaterialHeader header = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
+        RayConeGradients entityGrad = rayConeSurfaceGradients(rayCone, n, vdir,
+                ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
+        float2 entityDdx = entityGrad.ddx;
+        float2 entityDdy = entityGrad.ddy;
+        float2 sampledEntityUv = clampEntityUvForGrad(euvCoord, header.albedoUv,
+                euv[e0], euv[e1], euv[e2], entityDdx, entityDdy);
+        float4 entityTexel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleGrad(
+                sampledEntityUv, entityDdx, entityDdy);
         uint material = header.model;
         float3 baseAlbedo709 = srgbToLinear(entityTexel.rgb) * srgbToLinear(pr.tint.rgb);
         float3 opticalColor709 = material == MATERIAL_DIELECTRIC
                 ? lerp(float3(1.0), baseAlbedo709, entityTexel.a) : baseAlbedo709;
         float3 albedo = bt709ToAcesCg(opticalColor709);
-        Surface surface = evaluateMaterial(header, euvCoord, entityLod, albedo, n,
+        Surface surface = evaluateMaterial(header, euvCoord, entityGrad, albedo, n,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2], vdir,
                 header.params.x, header.params.y, pr.normal.w, material == MATERIAL_OPAQUE);
         n = surface.normal;
@@ -363,7 +488,6 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     float3 tp0 = HitTriangleVertexPosition(0);
     float3 tp1 = HitTriangleVertexPosition(1);
     float3 tp2 = HitTriangleVertexPosition(2);
-    float blockLod = rayConeTextureLod(rayCone, texSizePx(blockAlbedoAtlas), tp0, tp1, tp2, uv0, uv1, uv2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN
     // is built in the correct hemisphere. Doing this before the map — rather than flipping the perturbed
@@ -374,16 +498,21 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         n = -n;
     }
 
+    RayConeGradients blockGrad = rayConeSurfaceGradients(rayCone, n, vdir, tp0, tp1, tp2, uv0, uv1, uv2);
+
     // Stained glass / ice: a thin colored filter resolved in raygen
     // (material 3). albedo carries the transmission tint = texel rgb mixed toward white by (1 − opacity),
     // so a more opaque texel tints transmitted light more strongly.
     if (materialHeader.model == MATERIAL_DIELECTRIC) {
-        float4 gtex = blockAlbedoAtlas.SampleLevel(uv, blockLod);
+        float2 glassDdx = blockGrad.ddx;
+        float2 glassDdy = blockGrad.ddy;
+        float2 sampledGlassUv = clampAtlasUvForGrad(uv, materialHeader.albedoUv, glassDdx, glassDdy);
+        float4 gtex = blockAlbedoAtlas.SampleGrad(sampledGlassUv, glassDdx, glassDdy);
         float3 gtex709 = srgbToLinear(gtex.rgb);
         float3 tint709 = srgbToLinear(tint);
         float3 opticalColor709 = lerp(float3(1.0), gtex709 * tint709, gtex.a);
         float3 glassAlbedo = bt709ToAcesCg(opticalColor709);
-        Surface glassSurface = evaluateMaterial(materialHeader, uv, blockLod, glassAlbedo, n,
+        Surface glassSurface = evaluateMaterial(materialHeader, uv, blockGrad, glassAlbedo, n,
                 tp0, tp1, tp2, uv0, uv1, uv2, vdir,
                 materialHeader.params.x, materialHeader.params.y, 0.0, false);
         n = glassSurface.normal;
@@ -405,21 +534,26 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
 
     // Water (tint.w == 1) carries the pure biome water tint (no grey water-texture multiply): raygen
     // shades the surface as a clear dielectric and only needs the tint to derive the per-channel
-    // Beer–Lambert absorption. Opaque terrain uses textured albedo.
+    // Beer–Lambert absorption. Opaque terrain uses anisotropic SampleGrad textured albedo.
+    uint material = materialHeader.model == MATERIAL_WATER ? MATERIAL_WATER : MATERIAL_OPAQUE;
     float3 tint709 = srgbToLinear(tint);
-    float3 albedo709 = srgbToLinear(blockAlbedoAtlas.SampleLevel(uv, blockLod).rgb) * tint709;
-    packAlbedo(payload, bt709ToAcesCg(
-            materialHeader.model == MATERIAL_WATER ? tint709 : albedo709));
+    float3 albedo709 = tint709;
+    if (material != MATERIAL_WATER) {
+        float2 blockDdx = blockGrad.ddx;
+        float2 blockDdy = blockGrad.ddy;
+        float2 sampledBlockUv = clampAtlasUvForGrad(uv, materialHeader.albedoUv, blockDdx, blockDdy);
+        albedo709 = srgbToLinear(blockAlbedoAtlas.SampleGrad(sampledBlockUv, blockDdx, blockDdy).rgb) * tint709;
+    }
+    packAlbedo(payload, bt709ToAcesCg(albedo709));
     payload.hitT = RayTCurrent();
     payload.motionPrev = half3(0.0h, 0.0h, 0.0h); // static terrain: camera-only motion vector
-    uint material = materialHeader.model == MATERIAL_WATER ? MATERIAL_WATER : MATERIAL_OPAQUE;
 
     // normal.w packs the 0..1 block-light level plus a +2 offset flag for non-SOLID (cutout /
     // translucent) render layers, set at extraction so the hit can opt SOLID terrain out of SSS below.
     float ew = pr.normal.w;
     bool nonSolid = ew >= 1.5;
     float emission = nonSolid ? ew - 2.0 : ew; // heuristic emission source (block light level)
-    Surface surface = evaluateMaterial(materialHeader, uv, blockLod, unpackAlbedo(payload), n,
+    Surface surface = evaluateMaterial(materialHeader, uv, blockGrad, unpackAlbedo(payload), n,
             tp0, tp1, tp2, uv0, uv1, uv2, vdir,
             materialHeader.params.x, materialHeader.params.y, emission, nonSolid);
     n = surface.normal;

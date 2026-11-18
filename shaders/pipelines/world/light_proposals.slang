@@ -101,10 +101,10 @@ public LightCandidate decodeLightCandidate(Light light, float inversePowerSum, b
 
 // The origin/dimensions describe a bounded camera-centered region of the immutable light grid.
 // Out-of-region secondary vertices retain the exact uncached local proposal.
-public uint lightPoolCellOffset(int3 coord, WorldPush world) {
-    int3 relative = coord - world.lightPoolOrigin.xyz;
-    if (any(relative < int3(0)) || any(relative >= world.lightPoolDims.xyz)) return 0xffffffffu;
-    uint linear = (uint(relative.z) * uint(world.lightPoolDims.y) + uint(relative.y))
-            * uint(world.lightPoolDims.x) + uint(relative.x);
-    return uint(world.lightPoolOrigin.w) + linear * uint(world.lightPoolDims.w);
+public uint lightPoolCellOffset(int3 coord, int4 poolOrigin, int4 poolDims) {
+    int3 relative = coord - poolOrigin.xyz;
+    if (any(relative < int3(0)) || any(relative >= poolDims.xyz)) return 0xffffffffu;
+    uint linear = (uint(relative.z) * uint(poolDims.y) + uint(relative.y))
+            * uint(poolDims.x) + uint(relative.x);
+    return uint(poolOrigin.w) + linear * uint(poolDims.w);
 }

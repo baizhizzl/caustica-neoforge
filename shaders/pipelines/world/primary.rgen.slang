@@ -26,7 +26,9 @@ import guides;
 public PathSegment tracePrimary(PathSegment seg,
                                 DevicePtr<PackedPathSegment> queue,
                                 uint splitRecord,
-                                out uint nextRecord) {
+                                out uint nextRecord,
+                                out bool cachedPrimary) {
+    ConstPtr<WorldPush> wp = worldPushPtr();
     float3 ro = seg.ro;
     float3 rd = seg.rd;
     float3 throughput = seg.throughput;
@@ -35,8 +37,9 @@ public PathSegment tracePrimary(PathSegment seg,
     float rayConeSpread = max(seg.rayConeSpread, RAY_CONE_MIN_SPREAD);
     uint seed = seg.seed;
     bool showCelestial = seg.showCelestial;
-    bool waterWaves = (worldPush.flags & 16u) != 0u;
+    bool waterWaves = (wp[0].flags & WORLD_FLAG_WATER_WAVES) != 0u;
     nextRecord = PATH_NO_NEXT;
+    cachedPrimary = false;
 
     {
         int bounce = seg.bounce;
@@ -56,6 +59,8 @@ public PathSegment tracePrimary(PathSegment seg,
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = float3(0.0, 0.0, 0.0);
                 gv_spec = makeSpecSurface(gv_hitCamRel, gv_normal, 1.0, SKY_SPEC_ALBEDO);
+                queue[splitRecord] = packCachedPrimaryHit(rd, payload);
+                cachedPrimary = true;
             }
             return terminal;
         }
@@ -63,6 +68,7 @@ public PathSegment tracePrimary(PathSegment seg,
         float3 n = payloadNormal();
         float3 hitPos = ro + rd * payload.hitT;
         uint material = payloadMaterial();
+        float3 camOffset = wp[0].camOffset;
         if (material != MATERIAL_WATER && material != MATERIAL_DIELECTRIC) {
             float rough = material == MATERIAL_PARTICLE
                     ? 1.0 : clamp(payloadRoughness(), 0.0, 1.0);
@@ -75,7 +81,7 @@ public PathSegment tracePrimary(PathSegment seg,
                     ? hitAlbedo : hitAlbedo * (1.0 - metal);
             if (bounce == 0) {
                 gv_normal = n;
-                gv_hitCamRel = hitPos - worldPush.camOffset;
+                gv_hitCamRel = hitPos - camOffset;
                 gv_motionUseRefracted = false;
                 gv_motionObjDisp = payload.motionPrev;
                 gv_emissive = payloadEmission() > 0.0;
@@ -94,10 +100,12 @@ public PathSegment tracePrimary(PathSegment seg,
                     float specNoV = max(1.0e-4, dot(n, v));
                     float3 specGuide = rrSpecularAlbedo(payload.f0, rough, specNoV)
                             * ggxMultiScatterScale(payload.f0, specNoV, rough,
-                                    worldPush.visualParams0.w);
+                                    wp[0].visualParams0.w);
                     gv_spec = makeSpecSurface(gv_hitCamRel, n, float3(payload.motionPrev), rough,
                                               clamp(specGuide, float3(0.0), float3(1.0)));
                 }
+                queue[splitRecord] = packCachedPrimaryHit(rd, payload);
+                cachedPrimary = true;
             }
 
             return terminal;
@@ -118,34 +126,40 @@ public PathSegment tracePrimary(PathSegment seg,
         // adding air haze inside it would scatter light in a vacuum and attenuate it twice.
         bool isAir = isAirMedium(medium.current);
         if (isAir) {
-            float airBaseSigma = max(worldPush.visualParams1.x, 0.0)
-                    * max(worldPush.visualParams0.x, 0.0);
+            float4 vp1 = wp[0].visualParams1;
+            float airBaseSigma = max(vp1.x, 0.0)
+                    * max(wp[0].visualParams0.x, 0.0);
             throughput *= exp(-airHazeOpticalDepth(ro, rd,
                     min(preDist, MAX_AIR_VOLUMETRIC_DIST), airBaseSigma,
-                    worldPush.visualParams1.y, worldPush.visualParams1.z));
+                    vp1.y, vp1.z));
         }
         rayConeWidth = max(rayConeWidth + rayConeSpread * max(payload.hitT, 0.0),
                            RAY_CONE_MIN_WIDTH);
 
         bool isWater = material == MATERIAL_WATER;
+        float dielectricRough = isWater ? 0.0 : clamp(payloadRoughness(), 0.0, 1.0);
+        dielectricRough = isDeltaAlpha(dielectricRough) ? 0.0 : dielectricRough;
+        bool frostedDielectric = dielectricRough >= FROSTED_DIELECTRIC_ALPHA_MIN;
         bool entering = payloadDielectricEntering();
         float3 geometricNormal = n;
         float3 previousNormal = n;
         if (isWater && waterWaves) {
-            float2 waterDomain = hitPos.xz + worldPush.waterAnchor.xy;
+            float4 wAnchor = wp[0].waterAnchor;
+            float waveTime = wp[0].waterParams.w;
+            float2 waterDomain = hitPos.xz + wAnchor.xy;
             float waterFootprint = rayConeWidth / max(abs(dot(-rd, geometricNormal)), 0.2);
             if (bounce == 0 && abs(geometricNormal.y) >= 0.5) {
                 float2 currentGrad;
                 float2 previousGrad;
-                waterWaveGradTemporal(waterDomain, worldPush.waterParams.w,
-                                      worldPush.waterAnchor.z, waterFootprint, currentGrad, previousGrad);
+                waterWaveGradTemporal(waterDomain, waveTime,
+                                      wAnchor.z, waterFootprint, currentGrad, previousGrad);
                 float orientation = geometricNormal.y >= 0.0 ? 1.0 : -1.0;
                 n = orientation * normalize(float3(-currentGrad.x, 1.0, -currentGrad.y));
                 previousNormal = orientation
                         * normalize(float3(-previousGrad.x, 1.0, -previousGrad.y));
             } else {
                 n = applyWaterWaves(geometricNormal, waterDomain,
-                                    worldPush.waterParams.w, waterFootprint);
+                                    waveTime, waterFootprint);
             }
         }
 
@@ -160,16 +174,26 @@ public PathSegment tracePrimary(PathSegment seg,
 
         if (bounce == 0) {
             gv_normal = n;
-            gv_rough = 0.0;
+            gv_rough = dielectricRough;
             gv_albedo = float3(0.0, 0.0, 0.0);
             gv_emissive = false;
-            gv_hitCamRel = hitPos - worldPush.camOffset;
+            gv_hitCamRel = hitPos - camOffset;
             gv_motionUseRefracted = false;
             gv_motionObjDisp = isWater ? float3(0.0, 0.0, 0.0) : payload.motionPrev;
             gv_spec = makeSpecSurface(gv_hitCamRel, n, previousNormal, geometricNormal,
                                       isWater ? float3(0.0, 0.0, 0.0) : float3(payload.motionPrev),
-                                      gv_rough, float3(F, F, F));
-            if (dot(transmittedDir, transmittedDir) > 0.0) {
+                                      dielectricRough, float3(F, F, F));
+            float3 glassFilter = !isWater && entering
+                    ? payloadAlbedo() : float3(1.0, 1.0, 1.0);
+            // Snapshot the primary hit BEFORE resolveTransmissionGuide's traceGuide() overwrites the
+            // module-level payload with the transmitted background surface.
+            if (frostedDielectric) {
+                queue[splitRecord] = packCachedPrimaryHit(rd, payload);
+                cachedPrimary = true;
+            }
+            // Heavily frosted dielectrics (> SPEC_MOTION_ALPHA_MAX) keep their own surface depth/normal so
+            // DLSS-RR does not reproject crisp background silhouettes across blurred refraction.
+            if (dielectricRough <= SPEC_MOTION_ALPHA_MAX && dot(transmittedDir, transmittedDir) > 0.0) {
                 MediumStack guideMedium = medium;
                 if (entering) {
                     mediumPush(guideMedium, entered);
@@ -178,8 +202,11 @@ public PathSegment tracePrimary(PathSegment seg,
                 }
                 resolveTransmissionGuide(hitPos, transmittedDir, geometricNormal,
                         guideMedium, transmitBias, rayConeWidth, rayConeSpread,
-                        !isWater && entering
-                                ? payloadAlbedo() : float3(1.0, 1.0, 1.0));
+                        glassFilter);
+                gv_rough = max(gv_rough, dielectricRough);
+            }
+            if (frostedDielectric) {
+                return terminal;
             }
         }
 
@@ -241,24 +268,24 @@ public PathSegment tracePrimary(PathSegment seg,
 
 [shader("raygeneration")]
 void main() {
-    worldPush = ConstPtr<WorldPush>(pc.worldPushAddr)[0];
+    ConstPtr<WorldPush> wp = worldPushPtr();
     uint2 dispatchIndex = DispatchRaysIndex().xy;
     uint2 dimensions = DispatchRaysDimensions().xy;
     int2 pix = int2(dispatchIndex);
     float2 size = float2(dimensions);
     float2 uv = (float2(pix) + 0.5) / size;
-    float2 jndc = (uv + worldPush.jitter / size) * 2.0 - 1.0;
-    float4 nearH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
-    float4 farH = mul(worldPush.invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
+    float2 jndc = (uv + wp[0].jitter / size) * 2.0 - 1.0;
+    float4 nearH = mul(wp[0].invViewProj, float4(jndc.x, jndc.y, 1.0, 1.0));
+    float4 farH = mul(wp[0].invViewProj, float4(jndc.x, jndc.y, 0.0, 1.0));
     float3 nearP = nearH.xyz / nearH.w;
     float3 farP = farH.xyz / farH.w;
-    float3 origin = nearP + worldPush.camOffset;
+    float3 origin = nearP + wp[0].camOffset;
     float3 dir = normalize(farP - nearP);
-    float rayConeSpread = primaryRayConeSpread(jndc, size, dir);
+    float rayConeSpread = primaryRayConeSpreadFromClip(nearH, farH, size, dir);
     uint seed = (dispatchIndex.x * 1973u + dispatchIndex.y * 9277u + 26699u)
-            ^ (worldPush.frameIndex * 2654435761u);
-    MediumStack cameraMedium = makeMediumStack((worldPush.flags & 1u) != 0u
-            ? makeDielectricMedium(true, WATER_IOR, worldPush.waterParams.xyz, 1.0)
+            ^ (wp[0].frameIndex * 2654435761u);
+    MediumStack cameraMedium = makeMediumStack((wp[0].flags & WORLD_FLAG_SUBMERGED) != 0u
+            ? makeDielectricMedium(true, WATER_IOR, wp[0].waterParams.xyz, 1.0)
             : airMedium());
     uint pixelIndex = dispatchIndex.y * dimensions.x + dispatchIndex.x;
     uint baseRecordCount = dimensions.x * dimensions.y;
@@ -269,9 +296,14 @@ void main() {
     PathSegment current = makePathSegment(origin, dir, float3(1.0, 1.0, 1.0),
             cameraMedium, 0.0, rayConeSpread, seed, 0, true, true, 0.0);
     uint nextRecord;
+    bool cachedPrimary;
     PathSegment terminal = tracePrimary(
-            current, queue, splitRecord, nextRecord);
-    queue[pixelIndex] = packPathSegment(terminal, nextRecord);
+            current, queue, splitRecord, nextRecord, cachedPrimary);
+    PackedPathSegment mainPacked = packPathSegment(terminal, nextRecord);
+    if (cachedPrimary) {
+        mainPacked.pathFlags |= PATH_FLAG_CACHED_PRIMARY;
+    }
+    queue[pixelIndex] = mainPacked;
 
     writeGuides(pix, dir, jndc, size, rayConeSpread);
 }

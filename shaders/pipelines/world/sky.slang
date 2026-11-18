@@ -495,30 +495,35 @@ public float moonLitFraction(float moonPhaseIndex) {
     return abs(moonPhaseIndex - 4.0) / 4.0;
 }
 
-public SkyState skyState(WorldPush push) {
+public SkyState skyState(ConstPtr<WorldPush> push) {
     SkyState s;
-    s.noonTilt = push.skyLook1.x;
-    s.sunDir = celestialDirection(push.celestial.x, s.noonTilt);
-    s.moonDir = celestialDirection(push.celestial.y, s.noonTilt);
-    s.sunIlluminance = push.skyLook0.x;
+    float4 celestial = push[0].celestial;
+    float4 skyLook0 = push[0].skyLook0;
+    float4 skyLook1 = push[0].skyLook1;
+    float4 skyLook2 = push[0].skyLook2;
+    float4 skyLook3 = push[0].skyLook3;
+    s.noonTilt = skyLook1.x;
+    s.sunDir = celestialDirection(celestial.x, s.noonTilt);
+    s.moonDir = celestialDirection(celestial.y, s.noonTilt);
+    s.sunIlluminance = skyLook0.x;
     // A fixed floor plus the visible phase: a new moon still casts a little directional light, which is
     // a gameplay decision the look package owns rather than an astronomical one.
-    float phaseFixed = push.skyLook1.w;
-    s.moonIlluminance = push.skyLook0.y
-            * (phaseFixed + (1.0 - phaseFixed) * moonLitFraction(push.skyLook2.w));
-    s.viewerRadiusKm = ATMOS_BOTTOM_KM + max(push.skyLook2.z, MIN_VIEWER_ALTITUDE_KM);
-    s.sunAngularRadius = push.skyLook1.y;
-    s.moonAngularRadius = push.skyLook1.z;
-    s.sunDiscHalfAngle = push.skyLook2.x;
-    s.moonDiscHalfAngle = push.skyLook2.y;
-    s.starAngle = push.celestial.z;
-    s.starLuminance = push.celestial.w * push.skyLook0.w;
-    s.airglowLuminance = push.skyLook0.z;
-    s.groundAlbedo = push.skyLook3.x;
-    s.horizonSoften = push.skyLook3.y;
-    s.moonPhaseIndex = push.skyLook2.w;
-    s.sunUv = push.sunUv;
-    s.moonUv = push.moonUv;
+    float phaseFixed = skyLook1.w;
+    s.moonIlluminance = skyLook0.y
+            * (phaseFixed + (1.0 - phaseFixed) * moonLitFraction(skyLook2.w));
+    s.viewerRadiusKm = ATMOS_BOTTOM_KM + max(skyLook2.z, MIN_VIEWER_ALTITUDE_KM);
+    s.sunAngularRadius = skyLook1.y;
+    s.moonAngularRadius = skyLook1.z;
+    s.sunDiscHalfAngle = skyLook2.x;
+    s.moonDiscHalfAngle = skyLook2.y;
+    s.starAngle = celestial.z;
+    s.starLuminance = celestial.w * skyLook0.w;
+    s.airglowLuminance = skyLook0.z;
+    s.groundAlbedo = skyLook3.x;
+    s.horizonSoften = skyLook3.y;
+    s.moonPhaseIndex = skyLook2.w;
+    s.sunUv = push[0].sunUv;
+    s.moonUv = push[0].moonUv;
     return s;
 }
 

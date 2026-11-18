@@ -33,6 +33,7 @@ import dev.comfyfluffy.caustica.rt.RtGpuExecutor.GraphicsUseWaiter;
 import dev.comfyfluffy.caustica.rt.RtGpuExecutor.TrackedGraphicsUse;
 
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_ACCESS_2_MICROMAP_READ_BIT_EXT;
 import static org.lwjgl.vulkan.EXTOpacityMicromap.VK_ACCESS_2_MICROMAP_WRITE_BIT_EXT;
@@ -102,8 +103,12 @@ public final class RtAccel {
         return scratch.deviceAddress;
     }
 
+    private static final AtomicLong NEXT_SERIAL = new AtomicLong(1L);
+
     public final long handle;
     public final long deviceAddress;
+    /** Monotonic creation serial so descriptor caches never alias recycled Vulkan AS handle values. */
+    public final long serial = NEXT_SERIAL.getAndIncrement();
 
     private final RtBuffer backing;
     private final boolean ownsBacking;
@@ -645,6 +650,45 @@ public final class RtAccel {
         }
     }
 
+    /** Required byte alignment for acceleration-structure backing sub-offsets (VUID-03734). */
+    public static final long AS_OFFSET_ALIGNMENT = 256L;
+
+    /** Device build/update byte sizes for an entity/particle multi-geometry BLAS. */
+    public record EntityBlasSizes(long accelerationStructureSize, long buildScratchSize, long updateScratchSize) {
+    }
+
+    /** Query exact Vulkan build/update sizes so persistent ring slots can reuse backing, AS handles, and scratch. */
+    public static EntityBlasSizes queryEntityBlasBuildSizes(RtContext ctx, long vertexAddr, int vertexCount,
+                                                            long indexAddr, int[] bucketTris, boolean allowUpdate) {
+        requireEntityBuckets(bucketTris);
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VkAccelerationStructureBuildSizesInfoKHR sizes = queryEntityBlasSizes(ctx.vk(), stack, vertexAddr,
+                    indexAddr, vertexCount, bucketTris, allowUpdate);
+            return new EntityBlasSizes(sizes.accelerationStructureSize(),
+                    sizes.buildScratchSize(), sizes.updateScratchSize());
+        }
+    }
+
+    /** Create a caller-owned-backing entity/particle BLAS view at an aligned sub-offset of {@code backing}. */
+    public static RtAccel createEntityBlasAt(RtContext ctx, RtBuffer backing, long offset, long accelSize, String label) {
+        if ((offset & (AS_OFFSET_ALIGNMENT - 1L)) != 0L || offset < 0L || offset + accelSize > backing.size) {
+            throw new IllegalArgumentException("Invalid AS backing subrange: offset=" + offset
+                    + ", size=" + accelSize + ", backing=" + backing.size);
+        }
+        String debugLabel = labelOr(label, "entity BLAS");
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            return createBlasOn(ctx, stack, backing, offset, accelSize, false, debugLabel, null);
+        }
+    }
+
+    /** Record a full BUILD op into an already-created caller-owned BLAS and caller-owned persistent scratch. */
+    public static PreparedBlas entityBuildOp(RtAccel accel, RtBuffer scratch, long vertexAddr, long indexAddr,
+                                             int vertexCount, int[] bucketTris, boolean updatable, String label) {
+        requireEntityBuckets(bucketTris);
+        return PreparedBlas.entity(accel, scratch, null, vertexAddr, indexAddr, vertexCount - 1,
+                bucketTris.clone(), labelOr(label, "entity BLAS"), updatable, false);
+    }
+
     public static UpdatableBuild prepareUpdatableEntityBlasBuild(RtContext ctx, long vertexAddr, int vertexCount,
                                                                  long indexAddr, int[] bucketTris, String label) {
         requireEntityBuckets(bucketTris);
@@ -745,9 +789,14 @@ public final class RtAccel {
 
     private static RtAccel createBlasOn(RtContext ctx, MemoryStack stack, RtBuffer backing, long accelSize,
                                         boolean ownsBacking, String label, OpacityMicromap opacityMicromap) {
+        return createBlasOn(ctx, stack, backing, 0L, accelSize, ownsBacking, label, opacityMicromap);
+    }
+
+    private static RtAccel createBlasOn(RtContext ctx, MemoryStack stack, RtBuffer backing, long offset, long accelSize,
+                                        boolean ownsBacking, String label, OpacityMicromap opacityMicromap) {
         VkDevice vk = ctx.vk();
         VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
-                .buffer(backing.handle).offset(0).size(accelSize).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
+                .buffer(backing.handle).offset(offset).size(accelSize).type(VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR);
         java.nio.LongBuffer pAs = stack.mallocLong(1);
         RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
         long handle = pAs.get(0);
@@ -1080,8 +1129,8 @@ public final class RtAccel {
         TlasRing.Slot slot = new TlasRing.Slot();
         slot.capacity = capacity;
         slot.allowUpdate = allowUpdate;
-        slot.instanceBuffer = ctx.createAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
-                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR, true,
+        slot.instanceBuffer = ctx.createSequentialAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
+                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
                 label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
         try (MemoryStack stack = MemoryStack.stackPush()) {
             // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
