@@ -64,8 +64,10 @@ abstract class GenerateRtBindings extends DefaultTask {
                     TRANSMITTANCE_IMAGE: "transmittanceImage", MULTISCATTER_IMAGE: "multiScatterImage",
                     SKY_VIEW_IMAGE: "skyViewImage", TRANSMITTANCE_SAMPLER: "transmittanceLut",
                     MULTISCATTER_SAMPLER: "multiScatterLut"]],
-            [prefix: "PRESENT", source: "pipelines/hdr_composite/main.comp.slang",
-             siblings: ["pipelines/sdr_present/main.comp.slang"],
+            [prefix: "HDR_COMPOSITE", source: "pipelines/hdr_composite/main.comp.slang",
+             resources: [OUTPUT: "outputImage", SOURCE: "sourceImage",
+                         UI_OUTPUT: "resolvedUiImage", COVERAGE: "coverageImage"]],
+            [prefix: "PRESENT", source: "pipelines/sdr_present/main.comp.slang",
              resources: [
                     OUTPUT: "outputImage", SOURCE: "sourceImage"]],
             [prefix: "OVERLAY_IMAGE", source: "pipelines/overlay_composite/glow.frag.slang",

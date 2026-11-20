@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 
 final class RtEntityCaptureTest {
     private static final float[] X = {0f, 1f, 1f, 0f};
@@ -39,6 +40,40 @@ final class RtEntityCaptureTest {
         capture.reset();
 
         assertArrayEquals(new int[] {0, 0}, capture.packGeometry().bucketTris());
+    }
+
+    @Test
+    void blockEntityMeshHashDetectsGlyphUvChangesWithIdenticalGeometry() {
+        RtEntityCapture original = new RtEntityCapture();
+        RtEntityCapture updated = new RtEntityCapture();
+        addQuad(original, RtAccel.ENTITY_BUCKET_ANY_HIT, 11);
+        addQuad(updated, RtAccel.ENTITY_BUCKET_ANY_HIT, 11);
+        long originalHash = original.meshHash();
+        assertEquals(originalHash, updated.meshHash());
+
+        // Equal-size glyphs on one font atlas keep their positions and shading but sample another tile.
+        for (int vertex = 0; vertex < 4; vertex++) {
+            updated.uvList.set(vertex * 2, updated.uvList.getFloat(vertex * 2) + 0.125f);
+        }
+
+        assertArrayEquals(original.verts.toFloatArray(), updated.verts.toFloatArray());
+        assertArrayEquals(original.idx.toIntArray(), updated.idx.toIntArray());
+        assertArrayEquals(original.prim.toFloatArray(), updated.prim.toFloatArray());
+        assertArrayEquals(original.alphaBuckets.toIntArray(), updated.alphaBuckets.toIntArray());
+        assertNotEquals(originalHash, updated.meshHash());
+    }
+
+    @Test
+    void blockEntityMeshHashIgnoresDiscardedBufferContents() {
+        RtEntityCapture capture = new RtEntityCapture();
+        addQuad(capture, RtAccel.ENTITY_BUCKET_ANY_HIT, 11);
+        long expectedHash = capture.meshHash();
+        addQuad(capture, RtAccel.ENTITY_BUCKET_OPAQUE, 22);
+
+        capture.reset();
+        addQuad(capture, RtAccel.ENTITY_BUCKET_ANY_HIT, 11);
+
+        assertEquals(expectedHash, capture.meshHash());
     }
 
     private static void addQuad(RtEntityCapture capture, int bucket, int materialId) {

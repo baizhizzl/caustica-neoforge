@@ -29,6 +29,7 @@ public final class VerifyMixinContracts {
     private static final String MODIFY_ARG = "Lorg/spongepowered/asm/mixin/injection/ModifyArg;";
     private static final String MODIFY_ARGS = "Lorg/spongepowered/asm/mixin/injection/ModifyArgs;";
     private static final String WRAP_OPERATION = "Lcom/llamalad7/mixinextras/injector/wrapoperation/WrapOperation;";
+    private static final String WRAP_METHOD = "Lcom/llamalad7/mixinextras/injector/wrapmethod/WrapMethod;";
     private static final String MODIFY_EXPR = "Lcom/llamalad7/mixinextras/injector/ModifyExpressionValue;";
     private static final Map<String, ClassNode> CLASSES = new HashMap<>();
     private static final List<String> ERRORS = new ArrayList<>();
@@ -67,7 +68,11 @@ public final class VerifyMixinContracts {
     private static void audit(String name) throws IOException {
         ClassNode mixin = read(name);
         AnnotationNode mixinAnnotation = annotation(mixin.visibleAnnotations, mixin.invisibleAnnotations, MIXIN);
-        List<Type> targets = value(mixinAnnotation, "value", List.of());
+        List<Type> targets = new ArrayList<>(value(mixinAnnotation, "value", List.of()));
+        List<String> namedTargets = value(mixinAnnotation, "targets", List.of());
+        for (String namedTarget : namedTargets) {
+            targets.add(Type.getObjectType(namedTarget.replace('.', '/')));
+        }
         require(!targets.isEmpty(), name + ": no class targets");
         for (Type targetType : targets) {
             ClassNode target = read(targetType.getInternalName());
@@ -115,6 +120,8 @@ public final class VerifyMixinContracts {
                         for (MethodNode method : methods) {
                             if (injection.desc.equals(INJECT)) {
                                 auditCallback(context, handler, method);
+                            } else if (injection.desc.equals(WRAP_METHOD)) {
+                                auditWrapMethod(context, handler, method);
                             } else if (injection.desc.equals(REDIRECT) || injection.desc.equals(MODIFY_ARG)
                                     || injection.desc.equals(MODIFY_ARGS) || injection.desc.equals(WRAP_OPERATION)
                                     || injection.desc.equals(MODIFY_EXPR)) {
@@ -153,6 +160,24 @@ public final class VerifyMixinContracts {
             }
         }
         require((handler.access & Opcodes.ACC_STATIC) == (target.access & Opcodes.ACC_STATIC), context + ": static callback mismatch");
+    }
+
+    private static void auditWrapMethod(String context, MethodNode handler, MethodNode target) {
+        Type[] arguments = Type.getArgumentTypes(handler.desc);
+        Type[] targetArguments = Type.getArgumentTypes(target.desc);
+        require(arguments.length == targetArguments.length + 1,
+                context + ": @WrapMethod must accept target arguments followed by Operation");
+        for (int i = 0; i < Math.min(arguments.length, targetArguments.length); i++) {
+            require(arguments[i].equals(targetArguments[i]),
+                    context + ": @WrapMethod argument " + i + " must be " + targetArguments[i]);
+        }
+        require(arguments.length > 0 && arguments[arguments.length - 1].getDescriptor()
+                        .equals("Lcom/llamalad7/mixinextras/injector/wrapoperation/Operation;"),
+                context + ": @WrapMethod final argument must be Operation");
+        require(Type.getReturnType(handler.desc).equals(Type.getReturnType(target.desc)),
+                context + ": @WrapMethod return type must match target");
+        require((handler.access & Opcodes.ACC_STATIC) == (target.access & Opcodes.ACC_STATIC),
+                context + ": @WrapMethod static mismatch");
     }
 
     private static void auditInjectorModifier(

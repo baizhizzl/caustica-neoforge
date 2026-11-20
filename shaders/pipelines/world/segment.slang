@@ -69,8 +69,8 @@ public struct PackedPathSegment {
 
 public static const uint PATH_NO_NEXT = 0xffffffffu;
 // Set on queue[pixelIndex].pathFlags when Pass A terminated at bounce 0 (sky miss, opaque, cutout,
-// entity, or particle) and wrote the exact primary hit/miss payload into the otherwise unused
-// queue[baseRecordCount + pixelIndex] slot so Pass B skips re-tracing bounce 0 across all SPP samples.
+// entity, particle, or frosted dielectric) and wrote the exact primary hit/miss payload into the otherwise
+// unused queue[baseRecordCount + pixelIndex] slot so Pass B skips re-tracing bounce 0 across all SPP samples.
 public static const uint PATH_FLAG_CACHED_PRIMARY = 1u << 5u;
 
 public float2 octEncode(float3 direction) {
@@ -169,7 +169,9 @@ public PathSegment unpackPathSegment(PackedPathSegment p) {
 }
 
 // Reuses the 48-byte split-record slot on non-splitting primary pixels (sky miss, opaque, cutout,
-// entity, particle) to carry the exact unquantized primary ray direction and Payload into Pass B.
+// entity, particle, frosted dielectric) to carry the exact unquantized primary ray direction and
+// shading payload into Pass B. Payload flags occupy the low 16 bits of seed; f0.z uses its high half,
+// leaving rayCone available for both half-float IOR/transmission lanes. Motion is already in the guides.
 public PackedPathSegment packCachedPrimaryHit(float3 exactRd, Payload hit) {
     PackedPathSegment p;
     p.ro = exactRd;
@@ -178,8 +180,8 @@ public PackedPathSegment packCachedPrimaryHit(float3 exactRd, Payload hit) {
     p.currentExtinction = hit.surface2;
     p.outerExtinction = asuint(hit.hitT);
     p.mediumIors = packHalf2(float2(hit.f0.x, hit.f0.y));
-    p.rayCone = (f32tof16(float(hit.f0.z)) & 0xffffu) | ((hit.iorTransmission & 0xffffu) << 16u);
-    p.seed = hit.flags;
+    p.rayCone = hit.iorTransmission;
+    p.seed = (hit.flags & 0xffffu) | ((f32tof16(float(hit.f0.z)) & 0xffffu) << 16u);
     p.pathFlags = hit.roughMetal;
     p.nextRecord = hit.emissionSss;
     return p;
@@ -194,11 +196,11 @@ public Payload unpackCachedPrimaryHit(PackedPathSegment cached, out float3 exact
     hit.hitT = asfloat(cached.outerExtinction);
     hit.motionPrev = half3(0.0h, 0.0h, 0.0h);
     float2 f0xy = unpackHalf2(cached.mediumIors);
-    hit.f0 = half3(half(f0xy.x), half(f0xy.y), half(f16tof32(cached.rayCone & 0xffffu)));
-    hit.flags = cached.seed;
+    hit.f0 = half3(half(f0xy.x), half(f0xy.y), half(f16tof32(cached.seed >> 16u)));
+    hit.flags = cached.seed & 0xffffu;
     hit.roughMetal = cached.pathFlags;
     hit.emissionSss = cached.nextRecord;
-    hit.iorTransmission = cached.rayCone >> 16u;
+    hit.iorTransmission = cached.rayCone;
     hit.rayCone = 0u;
     return hit;
 }

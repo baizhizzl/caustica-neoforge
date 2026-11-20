@@ -71,7 +71,7 @@ public DynamicReservoir dynamicResEmpty() {
 //     when the ray points from the light through the slab toward the camera (same as the sun SSS term).
 public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, float3 hitPos, float3 n,
                          float3 v, float3 rd, float3 diffAlb, float3 F0, float rough, float3 msScale,
-                         bool twoSided, float sss, out float phat) {
+                         bool twoSided, bool hasBsdfContinuation, float sss, out float phat) {
     phat = 0.0;
     float3 toL = sp - hitPos;
     float dist2 = dot(toL, toL);
@@ -114,8 +114,8 @@ public float3 evalSampleContrib(float3 sp, float3 lnrm, float3 le, float area, f
             brdf += (D * Gs) * (Fs * msScale) / (4.0 * ndv * ndl);
             bool exactSpec = rough <= 0.0;
             float ps = surfaceSpecularProb(diffAlb, F0, exactSpec);
-            float wNee = powerHeuristic(staticEmitterMisPdf(dist2, cosL),
-                    surfaceBsdfPdf(n, v, wi, rough, ps, exactSpec));
+            float wNee = surfaceNeeMisWeight(staticEmitterMisPdf(dist2, cosL), n, v, wi,
+                    rough, ps, exactSpec, hasBsdfContinuation);
             contrib = brdf * le * (G * area * wNee);
         } else {
             contrib = brdf * le * (G * area);
@@ -454,7 +454,8 @@ LightBatch loadLightBatch(uint first, uint candidateCount, uint globalCandidateC
 void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell, int3 gridCellCoord,
                    float localProbability, float3 lightRebase, uint lightCount,
                    float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                   float3 F0, float rough, float3 msScale, bool twoSided, float sss, inout uint seed) {
+                   float3 F0, float rough, float3 msScale, bool twoSided, bool hasBsdfContinuation,
+                   float sss, inout uint seed) {
     // Soft shadows: uniform point on the emitter rectangle ((s,t) in [-1,1]^2, pdf 1/area).
     float s = rndf(seed) * 2.0 - 1.0;
     float t = rndf(seed) * 2.0 - 1.0;
@@ -462,7 +463,7 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
             + s * lg.halfU + t * lg.halfV;
     float phat;
     evalSampleContrib(sp, lg.normal, lg.radiance, lg.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, msScale, twoSided, sss, phat);
+            diffAlb, F0, rough, msScale, twoSided, hasBsdfContinuation, sss, phat);
     if (!(phat > 0.0)) {
         return;
     }
@@ -481,8 +482,10 @@ void risAccumulate(inout Reservoir r, LightCandidate lg, LightGridCell gridCell,
 // Initial RIS over M power-weighted candidates -> one resampled sample, no shadow ray yet. The chosen
 // sample's W = wSum / (M * p-hat); M counts every candidate, including zero-weight ones. The caller picks
 // M per vertex: the primary-terminal hit and later indirect hits use separately configured counts.
+// hasBsdfContinuation must match shadeReservoir so its target and reconstructed contribution agree.
 public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb, float3 F0,
-                     float rough, float3 msScale, bool twoSided, float sss, uint candidateCount,
+                     float rough, float3 msScale, bool twoSided, bool hasBsdfContinuation,
+                     float sss, uint candidateCount,
                      inout uint seed, inout uint proposalSeed) {
     ConstPtr<WorldPush> wp = worldPushPtr();
     Reservoir r = resEmpty();
@@ -522,7 +525,7 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
             LightCandidate lg = selectCandidate(gridCell, gridCellCoord, useLocal,
                     lightCount, lightRebase.w, poolOrigin, poolDims, proposalSeed);
             risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, lightRebase.xyz, lightCount,
-                    hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, seed);
+                    hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, hasBsdfContinuation, sss, seed);
         }
     } else {
         for (uint first = 0u; first < candidateCount; first += RIS_LOAD_BATCH) {
@@ -534,7 +537,8 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
                 LightCandidate lg = decodeLightCandidate(batch.lights[k], lightRebase.w,
                         pc.lightAliasAddr != 0);
                 risAccumulate(r, lg, gridCell, gridCellCoord, localProbability, lightRebase.xyz, lightCount,
-                        hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, sss, seed);
+                        hitPos, n, v, rd, diffAlb, F0, rough, msScale, twoSided, hasBsdfContinuation,
+                        sss, seed);
             }
         }
     }
@@ -547,13 +551,14 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
 // the survivor (front BRDF, twoSided billboard, or SSS backscatter) — the origin is biased toward the
 // sample's side of the surface.
 public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
-                      float3 F0, float rough, float3 msScale, bool twoSided, float sss) {
+                      float3 F0, float rough, float3 msScale, bool twoSided,
+                      bool hasBsdfContinuation, float sss) {
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
     float phat;
     float3 contrib = evalSampleContrib(s.pos, s.lnrm, s.le, s.area, hitPos, n, v, rd,
-            diffAlb, F0, rough, msScale, twoSided, sss, phat);
+            diffAlb, F0, rough, msScale, twoSided, hasBsdfContinuation, sss, phat);
     if (phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }

@@ -201,16 +201,11 @@ public final class RtComposite {
     // Set true once this frame recorded the world trace that produced the guide buffers. Gates DLSS-FG so an
     // interpolated frame never reprojects against guides left over from a frame that skipped RT.
     private boolean rtRenderedThisFrame;
-    // DLSS-FG "hudless" resource: a copy of the main render target before the combined UI overlay
-    // composites back on top. Lazily allocated (only meaningful once FG + the UI overlay redirect are both
-    // active), resized on demand.
-    private RtImage fgHudlessImage;
-    // Same idea as fgHudlessImage but for the HDR present path: a copy of hdrDisplayImage taken in
-    // presentHdr right before its own combined-UI composite dispatch overwrites it in place (see
-    // captureFgHdrHudless). Already PQ-encoded (same as hdrDisplayImage), so this is a plain image copy, not
-    // a format conversion — DLSS-FG requires a display-ready EOTF-encoded [0,1] signal (its programming
-    // guide explicitly disallows scRGB), and PQ is exactly that.
+    // Captured before the first UI layer touches HDR, then retained through every generated frame.
     private RtImage fgHdrHudlessImage;
+    private boolean fgHdrHudlessCaptured;
+    private RtImage fgHdrUiImage;
+    private boolean fgHdrUiReady;
     // Composites the combined UI overlay over hdrDisplayImage at paper white, just before present.
     private RtHdrCompositePipeline hdrCompositePipeline;
     private long hdrUiSampler;
@@ -585,6 +580,8 @@ public final class RtComposite {
         frameCaptured = false;
         rtRenderedThisFrame = false;
         hdrWrittenThisFrame = false;
+        fgHdrHudlessCaptured = false;
+        fgHdrUiReady = false;
         currentTlasHandle = 0L;
     }
 
@@ -1632,13 +1629,13 @@ public final class RtComposite {
             hdrDisplayImage = null;
         }
         destroyBloomLevels();
-        if (fgHudlessImage != null) {
-            fgHudlessImage.destroy();
-            fgHudlessImage = null;
-        }
         if (fgHdrHudlessImage != null) {
             fgHdrHudlessImage.destroy();
             fgHdrHudlessImage = null;
+        }
+        if (fgHdrUiImage != null) {
+            fgHdrUiImage.destroy();
+            fgHdrUiImage = null;
         }
         RtWorldOverlay.INSTANCE.destroy(); // overlay features/pipelines/scratch live on the same device lifetime
         if (output != null) {
@@ -1830,31 +1827,22 @@ public final class RtComposite {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
 
-            // DLSS-FG "hudless" capture: hdrDisplayImage right now holds the RT world before the combined
-            // UI overlay is blended in. Snapshot it before that composite overwrites it in place, mirroring
-            // captureFgHudless's SDR pattern (pre-UI copy) but reusing this frame's already-open command
-            // buffer.
             if (RtDlssFg.enabled()) {
                 captureFgHdrHudless(cmd, stack, src);
             }
-
-            // Composite the combined UI overlay over the HDR world image (in place) at paper white,
-            // before the swapchain blit. The overlay is an MC render target kept in GENERAL layout, sampled by
-            // the compute pass. A memory barrier first makes the overlay writes + the world HDR writes visible
-            // to the compute; the dep1 barrier below (ALL writes -> transfer read) then covers the compute's
-            // HDR write for the blit.
-            long overlayView = RtUiOverlay.populatedThisFrame() ? RtUiOverlay.overlayColorView() : 0L;
-            if (overlayView != 0L) {
-                ensureHdrUiResources();
-                if (hdrCompositePipeline != null) {
-                    VkMemoryBarrier2.Buffer pre = VkMemoryBarrier2.calloc(1, stack).sType$Default();
-                    pre.get(0).srcStageMask(65536L).srcAccessMask(65536L).dstStageMask(2048L).dstAccessMask(98304L);
-                    VkDependencyInfo preDep = VkDependencyInfo.calloc(stack).sType$Default().pMemoryBarriers(pre);
-                    KHRSynchronization2.vkCmdPipelineBarrier2KHR(cmd, preDep);
-                    hdrCompositePipeline.setImages(hdrDisplayImage.view, overlayView, hdrUiSampler);
-                    hdrCompositePipeline.dispatch(cmd, src.width, src.height, CausticaConfig.Rt.Hdr.uiNits());
-                }
+            if (RtUiOverlay.pendingHdrComposite()) {
+                recordHdrGuiLayer(cmd, stack, RtGuiBlend.Mode.OVER);
                 RtUiOverlay.markConsumed();
+            }
+            if (RtGuiBlend.segmented() && fgHdrHudlessCaptured
+                    && hdrCompositePipeline != null && fgHdrUiImage != null) {
+                // Resolve against the original world, rather than the background of only the last layer.
+                hdrCompositePipeline.setImages(1, src.view, fgHdrHudlessImage.view, fgHdrUiImage.view,
+                        RtGuiBlend.coverageView(), hdrUiSampler);
+                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                hdrCompositePipeline.dispatch(cmd, 1, src.width, src.height, CausticaConfig.Rt.Hdr.uiNits(), 5);
+                VulkanCommandEncoder.memoryBarrier(cmd, stack);
+                fgHdrUiReady = true;
             }
             // Swapchain UNDEFINED -> TRANSFER_DST, plus make the HDR compute writes visible to the blit read.
             VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
@@ -1895,6 +1883,41 @@ public final class RtComposite {
             enc.execute(cmd);
             enc.signalSemaphore(presentSem, 0L, 4096L);
         }
+    }
+
+    /** Composite one ordered GUI layer before subsequent GUI draws read the destination. */
+    public void compositeHdrGuiLayer(RtGuiBlend.Mode mode) {
+        if (!isHdrPresentActive()) return;
+        var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice()
+                .createCommandEncoder()).caustica$getBackend();
+        VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            if (RtDlssFg.enabled()) captureFgHdrHudless(cmd, stack, hdrDisplayImage);
+            recordHdrGuiLayer(cmd, stack, mode);
+        }
+        RtContext.check(VK10.vkEndCommandBuffer(cmd), "vkEndCommandBuffer(HDR GUI layer)");
+        encoder.execute(cmd);
+    }
+
+    private void recordHdrGuiLayer(VkCommandBuffer cmd, MemoryStack stack, RtGuiBlend.Mode mode) {
+        ensureHdrUiResources();
+        RtContext ctx = RtContext.currentOrNull();
+        if (hdrCompositePipeline == null || ctx == null) return;
+        if (fgHdrUiImage == null || fgHdrUiImage.width != hdrDisplayImage.width || fgHdrUiImage.height != hdrDisplayImage.height) {
+            if (fgHdrUiImage != null) {
+                ctx.waitIdle();
+                fgHdrUiImage.destroy();
+            }
+            fgHdrUiImage = ctx.createStorageImage(hdrDisplayImage.width, hdrDisplayImage.height,
+                    VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "FG HDR resolved UI");
+        }
+        hdrCompositePipeline.setImages(0, hdrDisplayImage.view, RtUiOverlay.overlayColorView(), fgHdrUiImage.view,
+                RtGuiBlend.coverageViewOr(RtUiOverlay.overlayColorView()), hdrUiSampler);
+        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        hdrCompositePipeline.dispatch(cmd, 0, hdrDisplayImage.width, hdrDisplayImage.height,
+                CausticaConfig.Rt.Hdr.uiNits(), mode.id());
+        VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        fgHdrUiReady = true;
     }
 
     /** Lazily create the HDR UI-composite compute pipeline + its nearest/clamp sampler (first HDR present). */
@@ -2042,67 +2065,17 @@ public final class RtComposite {
                 dst.image, VK10.VK_IMAGE_LAYOUT_GENERAL, region, VK10.VK_FILTER_LINEAR);
     }
 
-    /**
-     * DLSS Frame Generation quality: capture a copy of {@code main} (the main render target) into
-     * {@link #fgHudlessImage} for {@link #fgInterpolate} to feed DLSSG as the "hudless" resource. Call from
-     * {@code GameRendererMixin} right after {@code GuiRenderer.render()} but BEFORE
-     * {@link RtUiOverlay#compositeIfUsed()} — at that point, when the UI overlay redirect is active, {@code
-     * main} still has no combined UI baked in (world overlays, hand/screen effects and GUI went to the
-     * overlay target instead). No-op (and {@link #fgInterpolate} passes 0/0/0 for hudless, same as always)
-     * unless both FG and the UI overlay redirect are active — capturing this without the redirect would just
-     * copy the ALREADY-composited backbuffer, which is useless as a distinct hudless input.
-     */
+    /** Preserve the SDR world before any ordinary or destination-dependent UI layer is composited. */
     public void captureFgHudless(RenderTarget main) {
-        if (!rtRenderedThisFrame || !RtDlssFg.enabled() || !RtUiOverlay.enabled()
-                || main == null || main.getColorTexture() == null) {
-            return;
+        if (rtRenderedThisFrame && RtDlssFg.enabled() && RtUiOverlay.enabled()
+                && main != null && main.getColorTexture() != null) {
+            RtGuiBlend.captureSdrHudless(main);
         }
-        RtContext ctx = RtContext.currentOrNull();
-        if (ctx == null) {
-            return;
-        }
-        long srcImage;
-        try {
-            srcImage = vkImage(main.getColorTexture());
-        } catch (IllegalStateException e) {
-            return; // not a Vulkan-backed texture (shouldn't happen on this backend)
-        }
-        if (fgHudlessImage == null || fgHudlessImage.width != main.width || fgHudlessImage.height != main.height) {
-            if (fgHudlessImage != null) {
-                ctx.waitIdle();
-                fgHudlessImage.destroy();
-            }
-            fgHudlessImage = ctx.createStorageImage(main.width, main.height, VK10.VK_FORMAT_R8G8B8A8_UNORM,
-                    "FG hudless capture " + main.width + "x" + main.height);
-        }
-        var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
-        VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Make writes into `main` visible to the copy (the combined UI has not touched `main` yet this
-            // frame — it went to the UI overlay target instead).
-            VulkanCommandEncoder.memoryBarrier(cmd, stack);
-            VK10.vkCmdCopyImage(cmd, srcImage, VK10.VK_IMAGE_LAYOUT_GENERAL,
-                    fgHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, main.width, main.height));
-            VulkanCommandEncoder.memoryBarrier(cmd, stack);
-        }
-        if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
-            throw new IllegalStateException("vkEndCommandBuffer(fg hudless capture) failed");
-        }
-        encoder.execute(cmd);
     }
 
-    /**
-     * HDR counterpart of {@link #captureFgHudless} — copies {@code src} (this frame's {@code hdrDisplayImage},
-     * before the combined UI overlay is blended in) into {@link #fgHdrHudlessImage} for {@link
-     * #fgInterpolate}'s HDR path to feed DLSSG as the "hudless" resource. A plain copy, not a format
-     * conversion: both images are
-     * already PQ-encoded (the display-ready EOTF-encoded [0,1] signal DLSS-FG's programming guide requires),
-     * so no encode step is needed. Called from {@link #presentHdr} using its already-open {@code cmd}/
-     * {@code stack}, right before that method's own combined-UI composite dispatch overwrites
-     * {@code hdrDisplayImage} in place — same "capture before the UI gets baked back in" timing as the SDR
-     * version, just within a single method instead of split across a mixin hook.
-     */
+    /** The first HDR UI operation captures the world; subsequent layers retain that original snapshot. */
     private void captureFgHdrHudless(VkCommandBuffer cmd, MemoryStack stack, RtImage src) {
+        if (fgHdrHudlessCaptured) return;
         RtContext ctx = RtContext.currentOrNull();
         if (ctx == null) {
             return;
@@ -2122,6 +2095,7 @@ public final class RtComposite {
         VK10.vkCmdCopyImage(cmd, src.image, VK10.VK_IMAGE_LAYOUT_GENERAL,
                 fgHdrHudlessImage.image, VK10.VK_IMAGE_LAYOUT_GENERAL, copyRegion(stack, src.width, src.height));
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        fgHdrHudlessCaptured = true;
     }
 
     /**
@@ -2144,14 +2118,8 @@ public final class RtComposite {
      * explicitly unsupported as a DLSS-FG input ("not suitable as inputs to DLSS-FG" — it wants a
      * display-ready, EOTF-encoded [0,1] signal, recommending HDR10/ST.2084) — since the renderer's whole HDR
      * pipeline is natively PQ-encoded, every image fed to {@code RtDlssFg.evaluate} in HDR mode is already in
-     * that format with no extra conversion needed: the backbuffer is the raw {@code backbufferView}/
-     * {@code backbufferImage} the caller passed in ({@link #hdrBackbufferView()}, already PQ + UI-composited
-     * by {@link #presentHdr}); the hudless resource is {@link #fgHdrHudlessImage} (copied by {@link
-     * #presentHdr} <em>before</em> its own UI composite ran, mirroring {@link #captureFgHudless}'s pre-UI
-     * timing); and DLSSG's own (also PQ-encoded) output is returned as-is, since the swapchain itself is
-     * PQ-native and can blit it directly. The UI resource itself needs no HDR-specific handling — it's the
-     * same combined {@link RtUiOverlay} texture used by both present paths (only the *compositing* math that
-     * consumes it differs, done separately by {@code presentHdr}/{@code RtUiOverlay}, not here).
+     * that format. HDR UI is resolved into a premultiplied PQ layer against this frame's preserved
+     * PQ hudless image, so NGX receives a backbuffer, hudless and UI triplet in the same encoded space.
      */
     public RtImage fgInterpolate(VulkanCommandEncoder enc, long backbufferView, long backbufferImage,
             int swapW, int swapH, int index, int count, boolean hdrBackbuffer) {
@@ -2185,24 +2153,36 @@ public final class RtComposite {
         RtImage out = fgInterp[index - 1];
         // Only feed hudless/ui when they exist AND match this frame's backbuffer size — a stale or mismatched
         // size (e.g. mid-resize) is worse than skipping, so fall back to 0/0/0 (DLSSG just does without).
-        RtImage hudlessSrc = hdrBackbuffer ? fgHdrHudlessImage : fgHudlessImage;
-        boolean hudlessReady = hudlessSrc != null && hudlessSrc.width == swapW && hudlessSrc.height == swapH;
-        long hudlessView = hudlessReady ? hudlessSrc.view : 0L;
-        long hudlessImg = hudlessReady ? hudlessSrc.image : 0L;
+        RtGuiBlend.Image sdrHudless = RtGuiBlend.sdrHudless(swapW, swapH);
+        boolean hudlessReady = hdrBackbuffer
+                ? fgHdrHudlessCaptured && fgHdrHudlessImage != null
+                    && fgHdrHudlessImage.width == swapW && fgHdrHudlessImage.height == swapH
+                : sdrHudless != null;
+        long hudlessView = !hudlessReady ? 0L : hdrBackbuffer ? fgHdrHudlessImage.view : sdrHudless.view();
+        long hudlessImg = !hudlessReady ? 0L : hdrBackbuffer ? fgHdrHudlessImage.image : sdrHudless.image();
         int hudlessFmt = hdrBackbuffer ? VK10.VK_FORMAT_R16G16B16A16_SFLOAT : VK10.VK_FORMAT_R8G8B8A8_UNORM;
-        boolean uiReady = RtUiOverlay.populatedThisFrame()
+        RtGuiBlend.Image sdrResolved = RtGuiBlend.resolvedSdrUi(swapW, swapH);
+        boolean hdrUiReady = hdrBackbuffer && fgHdrUiReady && fgHdrUiImage != null
+                && fgHdrUiImage.width == swapW && fgHdrUiImage.height == swapH;
+        boolean overlayReady = RtUiOverlay.populatedThisFrame()
                 && RtUiOverlay.overlayWidth() == swapW && RtUiOverlay.overlayHeight() == swapH
                 && RtUiOverlay.overlayColorView() != 0L && RtUiOverlay.overlayColorImage() != 0L;
-        long uiView = uiReady ? RtUiOverlay.overlayColorView() : 0L;
-        long uiImg = uiReady ? RtUiOverlay.overlayColorImage() : 0L;
+        boolean uiReady = hudlessReady && (hdrBackbuffer ? hdrUiReady : (sdrResolved != null || overlayReady));
+        long uiView = !uiReady ? 0L : hdrBackbuffer ? fgHdrUiImage.view
+                : sdrResolved != null ? sdrResolved.view() : RtUiOverlay.overlayColorView();
+        long uiImg = !uiReady ? 0L : hdrBackbuffer ? fgHdrUiImage.image
+                : sdrResolved != null ? sdrResolved.image() : RtUiOverlay.overlayColorImage();
 
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            VulkanCommandEncoder.memoryBarrier(cmd, stack);
+        }
         boolean ok = RtDlssFg.INSTANCE.evaluate(cmd.address(),
                 backbufferView, backbufferImage, fmt,
                 gDepth.view, gDepth.image, VK10.VK_FORMAT_R32_SFLOAT,
                 gMotion.view, gMotion.image, VK10.VK_FORMAT_R16G16_SFLOAT,
                 hudlessView, hudlessImg, hudlessReady ? hudlessFmt : 0,
-                uiView, uiImg, uiReady ? VK10.VK_FORMAT_R8G8B8A8_UNORM : 0,
+                uiView, uiImg, uiReady ? hudlessFmt : 0,
                 out.view, out.image, fmt,
                 swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
                 true /* depthInverted (reversed-Z) */, hdrBackbuffer /* colorBuffersHDR */,

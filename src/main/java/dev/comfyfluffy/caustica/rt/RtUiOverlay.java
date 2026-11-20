@@ -1,66 +1,66 @@
 package dev.comfyfluffy.caustica.rt;
 
-import java.util.Optional;
-
 import org.joml.Vector4f;
 
 import com.mojang.renderpearl.api.GpuFormat;
-import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
-import com.mojang.renderpearl.api.pipeline.BlendFunction;
-import com.mojang.renderpearl.api.pipeline.ColorTargetState;
-import com.mojang.renderpearl.api.pipeline.RenderPipeline;
 import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.pipeline.TextureTarget;
 import com.mojang.renderpearl.api.commands.CommandEncoder;
-import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.renderpearl.api.textures.FilterMode;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.renderer.BindGroupLayouts;
-import net.minecraft.client.renderer.RenderPipelines;
 
 /**
- * Transparent final-UI overlay. World-space overlay features and the vanilla GUI/HUD
- * are routed into one transparent {@code RGBA8} target, then that single image is composited back over the
- * world (from {@code GameRendererMixin}, right after {@code GuiRenderer.render} returns). In SDR this
- * reproduces vanilla; the point is to keep SDR-authored UI out of the world's HDR tonemap with the HDR compositor blending this overlay at paper white.
- *
- * <p>Composite blend: vanilla GUI pipelines use {@code BlendFunction.TRANSLUCENT} (colour {@code SRC_ALPHA,
- * ONE_MINUS_SRC_ALPHA}; alpha {@code ONE, ONE_MINUS_SRC_ALPHA}), so drawing onto a cleared target
- * accumulates <em>premultiplied</em> colour ({@code rgb = C*A}, {@code a = A}). The composite therefore uses
- * premultiplied-over ({@code TRANSLUCENT_PREMULTIPLIED_ALPHA}); {@code ENTITY_OUTLINE_BLIT} expects straight
- * alpha and would double-darken semi-transparent UI. The pipeline is unregistered, so its shaders are not
- * preloaded — it lazily compiles fine once resources are loaded, but cannot compile during the loading
- * screen; hence the {@link #enabled()} {@code isGameLoadFinished} guard, plus a defensive try/catch.
- *
- * <p>Depth: the overlay clears depth to 0.0 each frame, exactly as {@code GameRenderer.render} clears the
- * main depth right before the GUI. Blur ({@code GameRenderer.processBlurEffect}) still operates on the real
- * main target, so the world behind screens is blurred as usual and the overlay composites over the result.
+ * World overlays, hands and ordinary GUI draws accumulate as premultiplied UI in a shared RGBA8 target.
+ * GUI blends that depend on the destination resolve in draw order against the actual display images;
+ * their temporary masks reuse the same color attachment without disturbing GUI depth.
  */
 public final class RtUiOverlay {
     private static final Vector4f TRANSPARENT = new Vector4f(0.0f, 0.0f, 0.0f, 0.0f);
-
-    /** Fullscreen blit that composites the premultiplied overlay over the destination (premultiplied-over). */
-    private static final RenderPipeline COMPOSITE_PIPELINE = RenderPipeline.builder(RenderPipelines.GLOBALS_SNIPPET)
-            .withLocation("pipeline/caustica_ui_overlay_composite")
-            .withVertexShader("core/screenquad")
-            .withFragmentShader("core/blit_screen")
-            .withBindGroupLayout(BindGroupLayouts.IN_SAMPLER)
-            .withColorTargetState(new ColorTargetState(
-                    Optional.of(BlendFunction.TRANSLUCENT_PREMULTIPLIED_ALPHA), GpuFormat.RGBA8_UNORM, ColorTargetState.WRITE_COLOR))
-            .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
-            .build();
+    private static final Vector4f WHITE_MASK = new Vector4f(1.0f, 1.0f, 1.0f, 0.0f);
 
     private static TextureTarget overlay;
-    private static boolean usedThisFrame;
+    private static final FrameState frameState = new FrameState();
     private static boolean compositeFailed;
     // The overlay is cleared once per frame, before the first thing that renders into it (RT world overlays,
     // the hand/screen-effects redirects in HDR mode, or the GUI). Reset at the start of GameRenderer.render
     // via beginFrame().
     private static boolean overlayClearedThisFrame;
+    private static boolean guiDepthCleared;
 
     private RtUiOverlay() {
+    }
+
+    /** Content remains valid for frame generation after the display composite consumes it. */
+    static final class FrameState {
+        private boolean populated;
+        private boolean compositePending;
+
+        void beginFrame() {
+            populated = false;
+            compositePending = false;
+        }
+
+        void populate() {
+            populated = true;
+            compositePending = true;
+        }
+
+        boolean populated() {
+            return populated;
+        }
+
+        boolean compositePending() {
+            return compositePending;
+        }
+
+        void compositeSdr(boolean hdrPresentActive) {
+            compositePending = populated && hdrPresentActive;
+        }
+
+        void consume() {
+            compositePending = false;
+        }
     }
 
     /**
@@ -79,14 +79,19 @@ public final class RtUiOverlay {
         compositeFailed = false;
     }
 
-    /** Whether the overlay holds this frame's UI (for the HDR present path to composite + consume). */
+    /** Whether the overlay holds this frame's UI, including after display compositing. */
     public static boolean populatedThisFrame() {
-        return usedThisFrame && overlay != null;
+        return frameState.populated() && overlay != null;
+    }
+
+    /** Whether the HDR display composite still needs to consume this frame's overlay. */
+    public static boolean pendingHdrComposite() {
+        return frameState.compositePending() && overlay != null;
     }
 
     /** Mark the overlay consumed by the HDR present composite (so it isn't reused next frame). */
     public static void markConsumed() {
-        usedThisFrame = false;
+        frameState.consume();
     }
 
     public static int overlayWidth() {
@@ -140,7 +145,9 @@ public final class RtUiOverlay {
     /** Reset the per-frame clear and population latches. Called at the start of {@code GameRenderer.render}. */
     public static void beginFrame() {
         overlayClearedThisFrame = false;
-        usedThisFrame = false;
+        guiDepthCleared = false;
+        frameState.beginFrame();
+        RtGuiBlend.beginFrame();
     }
 
     /**
@@ -159,8 +166,76 @@ public final class RtUiOverlay {
             }
             overlayClearedThisFrame = true;
         }
-        usedThisFrame = true;
+        frameState.populate();
         return target;
+    }
+
+    public static boolean owns(RenderTarget target) {
+        return target != null && target == overlay;
+    }
+
+    public static void beginGuiRange() {
+        if (!guiDepthCleared) {
+            // GameRenderer has cleared main's depth for GUI. The overlay may still hold hand depth.
+            RenderSystem.getDevice().createCommandEncoder().clearDepthTexture(overlay.getDepthTexture(), 0.0);
+            guiDepthCleared = true;
+        }
+    }
+
+    public static void noteGuiDraws() {
+        frameState.populate();
+    }
+
+    public static void beginGuiEffect(RtGuiBlend.Mode mode) {
+        RenderTarget main = mainTarget();
+        RtComposite.INSTANCE.captureFgHudless(main);
+        RtGuiBlend.beginSegments(overlay);
+        flushOrdinaryLayer(main);
+        clearGuiColor(mode == RtGuiBlend.Mode.MULTIPLY ? WHITE_MASK : TRANSPARENT);
+    }
+
+    public static void finishGuiEffect(RtGuiBlend.Mode mode) {
+        commitLayer(mainTarget(), mode, true);
+        // The next ordinary layer and the final FG alpha hint both assume a transparent seed.
+        clearGuiColor(TRANSPARENT);
+    }
+
+    public static void flushSegmentedGuiBeforeBlur() {
+        if (RtGuiBlend.segmented() && flushOrdinaryLayer(mainTarget())) {
+            clearGuiColor(TRANSPARENT);
+        }
+    }
+
+    private static boolean flushOrdinaryLayer(RenderTarget main) {
+        if (!frameState.compositePending()) {
+            return false;
+        }
+        commitLayer(main, RtGuiBlend.Mode.OVER, true);
+        return true;
+    }
+
+    private static void clearGuiColor(Vector4f color) {
+        RenderSystem.getDevice().createCommandEncoder().clearColorTexture(overlay.getColorTexture(), color);
+    }
+
+    private static RenderTarget mainTarget() {
+        return Minecraft.getInstance().gameRenderer.mainRenderTarget();
+    }
+
+    private static void commitLayer(RenderTarget main, RtGuiBlend.Mode mode, boolean early) {
+        if (RtGuiBlend.segmented()) {
+            // A layer can span several draw ranges; accumulate its completed coverage only once.
+            RtGuiBlend.mergeCoverage(overlay, mode);
+        }
+        if (main != null && main.getColorTextureView() != null) {
+            RtGuiBlend.compositeSdr(main, overlay, mode);
+        }
+        if (early) {
+            RtComposite.INSTANCE.compositeHdrGuiLayer(mode);
+            frameState.consume();
+        } else {
+            frameState.compositeSdr(RtComposite.INSTANCE.isHdrPresentActive());
+        }
     }
 
     /**
@@ -168,25 +243,21 @@ public final class RtUiOverlay {
      * after {@code GuiRenderer.render} returns. A compile/render failure latches the overlay off rather than crashing the frame.
      */
     public static void compositeIfUsed() {
-        if (!usedThisFrame || overlay == null) {
-            usedThisFrame = false;
+        if (overlay == null || (!frameState.compositePending() && !RtGuiBlend.segmented())) {
+            frameState.consume();
             return;
         }
-        // Keep usedThisFrame set when HDR present is active so presentHdr also composites the UI over the
-        // PQ swapchain image, while still compositing onto the SDR main target so F2 PNG screenshots
-        // retain HUD/GUI in HDR mode (captureFgHudless already ran before GuiRenderer.render).
-        usedThisFrame = RtComposite.INSTANCE.isHdrPresentActive();
-        RenderTarget main = Minecraft.getInstance().gameRenderer.mainRenderTarget();
+        RenderTarget main = mainTarget();
         if (main == null || main.getColorTextureView() == null) {
             return;
         }
-        CommandEncoder enc = RenderSystem.getDevice().createCommandEncoder();
-        try (RenderPass pass = enc.createRenderPass(() -> "UI overlay composite", main.getColorTextureView(), Optional.empty())) {
-            pass.setPipeline(RenderSystem.getCompiledPipeline(COMPOSITE_PIPELINE));
-            RenderSystem.bindDefaultUniforms(pass);
-            pass.setUniform("InSampler", overlay.getColorTextureView(),
-                    RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
-            pass.draw(3, 1, 0, 0);
+        try {
+            if (frameState.compositePending()) {
+                commitLayer(main, RtGuiBlend.Mode.OVER, false);
+            }
+            if (RtGuiBlend.segmented()) {
+                RtGuiBlend.resolveSdrUi(main, overlay);
+            }
         } catch (Throwable t) {
             compositeFailed = true;
             org.slf4j.LoggerFactory.getLogger("Caustica")
@@ -204,8 +275,8 @@ public final class RtUiOverlay {
     }
 
     public static void destroy() {
-        usedThisFrame = false;
-        overlayClearedThisFrame = false;
+        beginFrame();
+        RtGuiBlend.destroy();
         if (overlay != null) {
             overlay.destroyBuffers();
             overlay = null;

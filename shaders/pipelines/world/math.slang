@@ -318,6 +318,16 @@ public float surfaceBsdfPdf(float3 n, float3 v, float3 l, float rough, float ps,
     return specPdf + diffPdf;
 }
 
+// A terminal shading vertex has only the NEE estimator; no BSDF continuation exists to contribute the
+// complementary weight. Both celestial sampling and the static-emitter RIS target use this rule.
+public float surfaceNeeMisWeight(float lightPdf, float3 n, float3 v, float3 l,
+        float rough, float ps, bool exactSpecular, bool hasBsdfContinuation) {
+    if (!hasBsdfContinuation) {
+        return 1.0;
+    }
+    return powerHeuristic(lightPdf, surfaceBsdfPdf(n, v, l, rough, ps, exactSpecular));
+}
+
 // Exact solid-angle PDF of sampleSquare(bodyDir, halfAngle) for directions inside the celestial tangent
 // square: dOmega = dA_tan * cos^3(theta), with tangent-square area 4 * tan^2(halfAngle).
 public float celestialSquarePdf(float3 dir, float3 bodyDir, float halfAngle) {

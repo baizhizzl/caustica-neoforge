@@ -76,3 +76,14 @@ JAVA_TOOL_OPTIONS='-Xmx8G -XX:+UseCompactObjectHeaders -XX:+AlwaysPreTouch -XX:+
 ## Performance comparisons
 
 See [PERFORMANCE.md](../PERFORMANCE.md) (Chinese) for the performance switches, frame-stat counters, and how to compare them.
+
+## Shader regression checks
+
+Run the transport and GUI compositing checks using Python 3 and the full Slang 2026.19 distribution, including its LLVM backend:
+
+```bash
+python core-tests/verify_shader_transport.py --slangc /path/to/slangc
+python core-tests/verify_gui_blend.py --slangc /path/to/slangc
+```
+
+Both scripts also accept `CAUSTICA_SLANGC` or `slangc` on `PATH`. They execute the production shader helpers on the CPU and do not require a Minecraft client or a Vulkan device.

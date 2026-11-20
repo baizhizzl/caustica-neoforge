@@ -406,6 +406,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
 
         int hitDepth = indirectDepth++;
         uint risCandidates = hitDepth == 0 ? primaryRisCandidates : indirectRisCandidates;
+        bool hasBsdfContinuation = bounce < maxBounces;
 
         // Particles (material == 2): camera-facing receiver billboard.
         if (material == MATERIAL_PARTICLE) {
@@ -431,10 +432,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             if (risOn) {
                 float3 v = -rd;
                 Reservoir r = risInitial(hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                                         float3(1.0, 1.0, 1.0), true, 0.0, risCandidates, seed,
+                                         float3(1.0, 1.0, 1.0), true, hasBsdfContinuation, 0.0, risCandidates, seed,
                                          proposalSeed);
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                                                 float3(1.0, 1.0, 1.0), true, 0.0);
+                                                 float3(1.0, 1.0, 1.0), true, hasBsdfContinuation, 0.0);
             }
 
             if (dynLightsOn) {
@@ -446,7 +447,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
                                                         float3(1.0, 1.0, 1.0), true, 0.0, medium.current);
             }
 
-            if (bounce >= maxBounces) {
+            if (!hasBsdfContinuation) {
                 break;
             }
             throughput *= albedo;
@@ -515,8 +516,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             if (lightHalfAngle > 0.0) {
                 lightDir = sampleSquare(lightDir, lightHalfAngle, seed);
                 float pSun = celestialSquarePdf(lightDir, celestialLight.dir, lightHalfAngle);
-                float pBsdf = surfaceBsdfPdf(n, v, lightDir, rough, ps, exactSpecular);
-                wSunNee = powerHeuristic(pSun, pBsdf);
+                wSunNee = surfaceNeeMisWeight(pSun, n, v, lightDir, rough, ps, exactSpecular,
+                        hasBsdfContinuation);
             }
             float ndl = max(0.0, dot(n, lightDir));
             if (ndl > 0.0 && wSunNee > 0.0) {
@@ -544,10 +545,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
         // RIS direct lighting from static block emitters.
         if (risOn) {
             float activeSss = hitDepth <= MAX_SSS_INDIRECT_DEPTH ? sss : 0.0;
-            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, msScale, false, activeSss,
-                                     risCandidates, seed, proposalSeed);
+            Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
+                                     hasBsdfContinuation, activeSss, risCandidates, seed, proposalSeed);
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
-                                             activeSss);
+                                             hasBsdfContinuation, activeSss);
         }
 
         // RIS direct + first-bounce indirect lighting from dynamic spherical emitters (handheld torches,
@@ -579,7 +580,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             }
         }
 
-        if (bounce >= maxBounces) {
+        if (!hasBsdfContinuation) {
             break;
         }
 

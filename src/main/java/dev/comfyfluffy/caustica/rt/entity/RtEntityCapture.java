@@ -88,6 +88,32 @@ public final class RtEntityCapture implements VertexConsumer {
         uvRemap = false;
     }
 
+    /** Hash every captured geometry/shading lane used by cached block entities, including glyph UVs. */
+    long meshHash() {
+        long h = 1469598103934665603L;
+        float[] positions = verts.elements();
+        for (int i = 0; i < verts.size(); i++) {
+            h = (h ^ (Float.floatToRawIntBits(positions[i]) & 0xffffffffL)) * 1099511628211L;
+        }
+        int[] indices = idx.elements();
+        for (int i = 0; i < idx.size(); i++) {
+            h = (h ^ (indices[i] & 0xffffffffL)) * 1099511628211L;
+        }
+        float[] uvs = uvList.elements();
+        for (int i = 0; i < uvList.size(); i++) {
+            h = (h ^ (Float.floatToRawIntBits(uvs[i]) & 0xffffffffL)) * 1099511628211L;
+        }
+        float[] primitives = prim.elements();
+        for (int i = 0; i < prim.size(); i++) {
+            h = (h ^ (Float.floatToRawIntBits(primitives[i]) & 0xffffffffL)) * 1099511628211L;
+        }
+        int[] buckets = alphaBuckets.elements();
+        for (int i = 0; i < alphaBuckets.size(); i++) {
+            h = (h ^ (buckets[i] & 0xffffffffL)) * 1099511628211L;
+        }
+        return h;
+    }
+
     private void ensureVertexCapacity(int vertexCount) {
         if (vertexCount <= 0) {
             return;

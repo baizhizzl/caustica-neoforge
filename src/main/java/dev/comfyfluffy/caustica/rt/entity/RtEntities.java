@@ -36,11 +36,8 @@ import net.minecraft.world.level.block.ChestBlock;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.ChestBlockEntity;
 import net.minecraft.world.level.block.entity.EnderChestBlockEntity;
-import net.minecraft.world.level.block.entity.HangingSignBlockEntity;
 import net.minecraft.world.level.block.entity.LidBlockEntity;
 import net.minecraft.world.level.block.entity.ShulkerBoxBlockEntity;
-import net.minecraft.world.level.block.entity.SignBlockEntity;
-import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.minecraft.world.level.block.entity.SkullBlockEntity;
 import net.minecraft.world.level.block.entity.TrappedChestBlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -334,8 +331,6 @@ public final class RtEntities {
         float[] prevVerts;                       // block-local verts at this build, for the per-vertex MV diff
         BlockEntity beRef;                       // exact live BE instance this entry was built from
         BlockState blockState;                   // canonical state reference at build time
-        Object auxStateA;                        // immutable auxiliary state (e.g. SignText front / Skull profile)
-        Object auxStateB;                        // immutable auxiliary state (e.g. SignText back)
         boolean staticEligible;                  // true when known-static while state references match
         final TrackedGraphicsUse graphicsUse = new TrackedGraphicsUse();
     }
@@ -1300,7 +1295,7 @@ public final class RtEntities {
         if (entry != null) {
             entry.lastSeen = now;
         }
-        long hash = meshHash();
+        long hash = capture.meshHash();
         float[] disp = null; // static unless the mesh changed this frame (chest lid / spawner animation)
         if (entry == null || entry.meshHash != hash) {
             // Geometry changed (or new BE) → rebuild, but only within this frame's budget. Over budget: keep
@@ -1346,11 +1341,6 @@ public final class RtEntities {
             ShulkerBoxBlockEntity shulker = (ShulkerBoxBlockEntity) be;
             return shulker.getProgress(0.0f) == 0.0f && shulker.getProgress(1.0f) == 0.0f;
         }
-        if (cls == SignBlockEntity.class || cls == HangingSignBlockEntity.class) {
-            SignBlockEntity sign = (SignBlockEntity) be;
-            return entry.auxStateA == sign.getText(SignTextSlot.FRONT)
-                    && entry.auxStateB == sign.getText(SignTextSlot.BACK);
-        }
         if (cls == SkullBlockEntity.class) {
             return true;
         }
@@ -1361,9 +1351,9 @@ public final class RtEntities {
         entry.beRef = be;
         BlockState state = be.getBlockState();
         entry.blockState = state;
-        entry.auxStateA = null;
-        entry.auxStateB = null;
         entry.staticEligible = false;
+        // Sign geometry also depends on text filtering, camera distance and scoping. Let its renderer
+        // extract those inputs every frame; the captured mesh hash still avoids unchanged GPU uploads.
         Class<?> cls = be.getClass();
         if (cls == EnderChestBlockEntity.class) {
             LidBlockEntity lid = (LidBlockEntity) be;
@@ -1378,11 +1368,6 @@ public final class RtEntities {
         } else if (cls == ShulkerBoxBlockEntity.class) {
             ShulkerBoxBlockEntity shulker = (ShulkerBoxBlockEntity) be;
             entry.staticEligible = shulker.getProgress(0.0f) == 0.0f && shulker.getProgress(1.0f) == 0.0f;
-        } else if (cls == SignBlockEntity.class || cls == HangingSignBlockEntity.class) {
-            SignBlockEntity sign = (SignBlockEntity) be;
-            entry.auxStateA = sign.getText(SignTextSlot.FRONT);
-            entry.auxStateB = sign.getText(SignTextSlot.BACK);
-            entry.staticEligible = true;
         } else if (cls == SkullBlockEntity.class) {
             // Exclude animated heads (dragon/piglin) and player heads whose skin textures resolve asynchronously.
             if (!state.is(Blocks.DRAGON_HEAD) && !state.is(Blocks.DRAGON_WALL_HEAD)
@@ -1445,31 +1430,6 @@ public final class RtEntities {
         e.prevVerts = java.util.Arrays.copyOf(capture.verts.elements(), capture.verts.size());
         recordStaticBlockEntityState(e, be);
         return e;
-    }
-
-    /** FNV-1a hash of the currently captured mesh (positions + indices + per-prim data) for rebuild detection. */
-    private long meshHash() {
-        long h = 1469598103934665603L;
-        float[] v = capture.verts.elements();
-        int vn = capture.verts.size();
-        for (int i = 0; i < vn; i++) {
-            h = (h ^ (Float.floatToRawIntBits(v[i]) & 0xffffffffL)) * 1099511628211L;
-        }
-        int[] x = capture.idx.elements();
-        int xn = capture.idx.size();
-        for (int i = 0; i < xn; i++) {
-            h = (h ^ (x[i] & 0xffffffffL)) * 1099511628211L;
-        }
-        float[] pr = capture.prim.elements();
-        int pn = capture.prim.size();
-        for (int i = 0; i < pn; i++) {
-            h = (h ^ (Float.floatToRawIntBits(pr[i]) & 0xffffffffL)) * 1099511628211L;
-        }
-        int[] buckets = capture.alphaBuckets.elements();
-        for (int i = 0; i < capture.alphaBuckets.size(); i++) {
-            h = (h ^ (buckets[i] & 0xffffffffL)) * 1099511628211L;
-        }
-        return h;
     }
 
     /** Emit a cached block entity into this frame: its geometry-table entry + a TLAS instance (no GPU build). */
