@@ -59,6 +59,11 @@ public final class RtDlssFg {
         return available && !failed && surfaceFrameLimit > 0;
     }
 
+    /** Whether hardware/surface support FG regardless of a transient runtime failure latch. */
+    public boolean isSupported() {
+        return available && surfaceFrameLimit > 0;
+    }
+
     /** Selectable generated-frame count, limited by both the driver and the surface's maximum image count. */
     public int multiFrameCountMax() {
         return Math.min(DlssSettings.generatedFrameLimit(multiFrameCountMax), surfaceFrameLimit);
@@ -219,7 +224,7 @@ public final class RtDlssFg {
             long uiView, long uiImage, int uiFormat,
             long outputInterpView, long outputInterpImage, int outputInterpFormat,
             int width, int height, int mvecDepthWidth, int mvecDepthHeight,
-            int multiFrameCount, int multiFrameIndex, float mvScaleX, float mvScaleY,
+            int multiFrameCount, int multiFrameIndex, float jitterX, float jitterY, float mvScaleX, float mvScaleY,
             boolean depthInverted, boolean colorBuffersHDR, boolean cameraMotionIncluded, boolean reset,
             Matrix4fc clipToPrevClip, Matrix4fc prevClipToClip) {
         if (!isReady()) {
@@ -228,6 +233,7 @@ public final class RtDlssFg {
         try {
             MemorySegment clipToPrev = writeMatrixSegment(clipToPrevScratch, clipToPrevClip);
             MemorySegment prevToClip = writeMatrixSegment(prevToClipScratch, prevClipToClip);
+            lib.setDlssgJitter(feature, jitterX, jitterY);
             int rc = lib.evaluateDlssg(cmd, feature,
                     backbufferView, backbufferImage, backbufferFormat,
                     depthView, depthImage, depthFormat,
@@ -244,7 +250,9 @@ public final class RtDlssFg {
                 throw new IllegalStateException("ngxshim_evaluate_dlssg failed: 0x" + Integer.toHexString(rc)
                         + " last=0x" + Integer.toHexString(lib.lastResult()));
             }
-            resetHistory = false;
+            if (multiFrameIndex >= multiFrameCount) {
+                resetHistory = false;
+            }
             return true;
         } catch (Throwable t) {
             failed = true;
@@ -279,9 +287,15 @@ public final class RtDlssFg {
 
     /** Release the FG feature. NGX itself is shut down by {@link NgxRuntime} at device teardown. */
     public void destroy() {
-        if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
-            releaseFeature(device);
+        VulkanDevice device = null;
+        try {
+            if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice d) {
+                device = d;
+            }
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.debug("DLSS-FG destroy: VulkanDevice unavailable", t);
         }
+        releaseFeature(device);
         initialized = false;
         lib = null;
         failed = false;
@@ -293,13 +307,21 @@ public final class RtDlssFg {
 
     private void releaseFeature(VulkanDevice device) {
         if (lib != null && !isNull(feature)) {
-            RtContext ctx = RtContext.currentOrNull();
-            if (ctx != null && ctx.device() == device) {
-                ctx.waitIdle();
-            } else {
-                VK10.vkDeviceWaitIdle(device.vkDevice());
+            try {
+                RtContext ctx = RtContext.currentOrNull();
+                if (ctx != null && (device == null || ctx.device() == device)) {
+                    ctx.waitIdle();
+                } else if (device != null) {
+                    VK10.vkDeviceWaitIdle(device.vkDevice());
+                }
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("DLSS-FG waitIdle failed during release; continuing teardown", t);
             }
-            lib.release(feature);
+            try {
+                lib.release(feature);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("DLSS-FG native feature release failed", t);
+            }
         }
         feature = MemorySegment.NULL;
         featureWidth = -1;

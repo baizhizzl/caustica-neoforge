@@ -1069,7 +1069,10 @@ public final class RtAccel {
         if (slot == null || count > slot.capacity || slot.allowUpdate != updateEnabled) {
             int capacity = slot != null && count <= slot.capacity ? slot.capacity
                     : Math.max(TlasRing.MIN_CAPACITY, (int) (count * TlasRing.GROWTH));
-            if (slot != null) slot.destroy();
+            if (slot != null) {
+                ring.slots[ring.cursor] = null;
+                slot.destroy();
+            }
             slot = createTlasSlot(ctx, capacity, updateEnabled);
             ring.slots[ring.cursor] = slot;
         }
@@ -1129,35 +1132,50 @@ public final class RtAccel {
         TlasRing.Slot slot = new TlasRing.Slot();
         slot.capacity = capacity;
         slot.allowUpdate = allowUpdate;
-        slot.instanceBuffer = ctx.createSequentialAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
-                org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
-                label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
-            // every per-frame build with count ≤ capacity fits the same backing/scratch.
-            VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.instanceBuffer.deviceAddress,
-                    allowUpdate);
-            VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
-            vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                    build.get(0), stack.ints(capacity), sizes);
+        RtBuffer backing = null;
+        long handle = 0L;
+        try {
+            slot.instanceBuffer = ctx.createSequentialAlignedBuffer((long) VkAccelerationStructureInstanceKHR.SIZEOF * capacity,
+                    org.lwjgl.vulkan.KHRAccelerationStructure.VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR,
+                    label + " instance buffer", TLAS_INSTANCE_ADDRESS_ALIGNMENT);
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                // Size the AS + scratch for the slot CAPACITY: build sizes are monotonic in instance count, so
+                // every per-frame build with count ≤ capacity fits the same backing/scratch.
+                VkAccelerationStructureBuildGeometryInfoKHR.Buffer build = tlasBuildInfo(stack, slot.instanceBuffer.deviceAddress,
+                        allowUpdate);
+                VkAccelerationStructureBuildSizesInfoKHR sizes = VkAccelerationStructureBuildSizesInfoKHR.calloc(stack).sType$Default();
+                vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                        build.get(0), stack.ints(capacity), sizes);
 
-            RtBuffer backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
-                    label + " backing");
-            VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
-                    .buffer(backing.handle).offset(0).size(sizes.accelerationStructureSize()).type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
-            java.nio.LongBuffer pAs = stack.mallocLong(1);
-            RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
-            long handle = pAs.get(0);
-            RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
-            long scratchSize = allowUpdate ? Math.max(sizes.buildScratchSize(), sizes.updateScratchSize())
-                    : sizes.buildScratchSize();
-            slot.scratch = createScratchBuffer(ctx, scratchSize, label + " build scratch");
-            VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
-                    .sType$Default().accelerationStructure(handle);
-            long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
-            slot.accel = new RtAccel(vk, handle, deviceAddress, backing);
+                backing = ctx.createBuffer(sizes.accelerationStructureSize(), VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR, false,
+                        label + " backing");
+                VkAccelerationStructureCreateInfoKHR ci = VkAccelerationStructureCreateInfoKHR.calloc(stack).sType$Default()
+                        .buffer(backing.handle).offset(0).size(sizes.accelerationStructureSize()).type(VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR);
+                java.nio.LongBuffer pAs = stack.mallocLong(1);
+                RtContext.check(vkCreateAccelerationStructureKHR(vk, ci, null, pAs), "vkCreateAccelerationStructureKHR");
+                handle = pAs.get(0);
+                RtDebugLabels.nameAccelerationStructure(ctx, handle, label);
+                long scratchSize = allowUpdate ? Math.max(sizes.buildScratchSize(), sizes.updateScratchSize())
+                        : sizes.buildScratchSize();
+                slot.scratch = createScratchBuffer(ctx, scratchSize, label + " build scratch");
+                VkAccelerationStructureDeviceAddressInfoKHR addrInfo = VkAccelerationStructureDeviceAddressInfoKHR.calloc(stack)
+                        .sType$Default().accelerationStructure(handle);
+                long deviceAddress = vkGetAccelerationStructureDeviceAddressKHR(vk, addrInfo);
+                slot.accel = new RtAccel(vk, handle, deviceAddress, backing);
+                handle = 0L;
+                backing = null;
+            }
+            return slot;
+        } catch (Throwable t) {
+            if (handle != 0L) {
+                vkDestroyAccelerationStructureKHR(vk, handle, null);
+            }
+            if (backing != null) {
+                backing.destroy();
+            }
+            slot.destroy();
+            throw t;
         }
-        return slot;
     }
 
     private static VkAccelerationStructureBuildGeometryInfoKHR.Buffer tlasBuildInfo(MemoryStack stack, long instanceBufferAddr,

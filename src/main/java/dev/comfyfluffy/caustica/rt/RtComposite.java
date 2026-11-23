@@ -271,6 +271,8 @@ public final class RtComposite {
     private float mvCamDeltaX;
     private float mvCamDeltaY;
     private float mvCamDeltaZ;
+    private float frameJitterX;
+    private float frameJitterY;
     private boolean mvHasPrev;
     private float previousWaterWaveTime;
     private boolean waterWaveTimeValid;
@@ -391,8 +393,8 @@ public final class RtComposite {
                     value *= residualExposure;
                 }
                 // Residual exposure is expected to keep this seam comfortably centred in fp16. Clamp only
-                // true outliers/infinities so a pathological light cannot poison a grading application.
-                value = Math.clamp(value, -65504.0f, 65504.0f);
+                // true outliers/infinities and scrub NaN so a pathological sample cannot poison grading tools.
+                value = Float.isFinite(value) ? Math.clamp(value, -65504.0f, 65504.0f) : 0.0f;
                 exposedRgba[sample] = Float.floatToFloat16(value);
             }
 
@@ -1077,6 +1079,13 @@ public final class RtComposite {
 
     private void recordFrame(RtContext ctx, RtPipeline active, GpuTexture nativeColor) {
         long dstImage = vkImage(nativeColor);
+        boolean rrPath = RtDlssRr.enabled();
+        if (rrPath && !RtDlssRr.INSTANCE.featureReadyFor(renderW, renderH, displayW, displayH)) {
+            // Create the RR feature in its own synchronous submit so an aborted frame command buffer
+            // never leaves an unsubmitted native feature handle cached as ready.
+            ctx.submitSync(c -> RtDlssRr.INSTANCE.ensureFeature(c.address(), renderW, renderH, displayW, displayH));
+        }
+        boolean rrReady = rrPath && RtDlssRr.INSTANCE.featureReadyFor(renderW, renderH, displayW, displayH);
         var encoder = (VulkanCommandEncoder) ((CommandEncoderAccessor) RenderSystem.getDevice().createCommandEncoder()).caustica$getBackend();
         RtGpuExecutor gpuExecutor = ctx.gpuExecutor();
         // Reserve the graphics-use value that guards this frame's reusable TLAS and entity resources.
@@ -1087,6 +1096,7 @@ public final class RtComposite {
         exposure.beginFrame(graphicsUseWaiter);
         pendingGraphicsUse = graphicsUse;
         boolean executed = false;
+        boolean skyStaticBaked = false;
         RtEntities.FrameEntities frameEntities = null;
         RtAccel.PreparedTlas frameTlas;
         try {
@@ -1097,14 +1107,15 @@ public final class RtComposite {
             try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope frameLabel = RtDebugLabels.scope(ctx, cmd, "composite frame")) {
                 // RR drives the upscale: trace + jitter at render res, DLSS-RR denoises+upscales to display.
                 // A debug view observes this ordinary path; it never changes jitter or disables RR.
-                boolean rrPath = RtDlssRr.enabled();
                 float jitterX = 0f;
                 float jitterY = 0f;
-                if (rrPath) {
+                if (rrReady) {
                     CausticaJitter.INSTANCE.prepare(renderW, renderH, displayW);
                     jitterX = CausticaJitter.INSTANCE.jitterPixelsX() * jitterSignX();
                     jitterY = CausticaJitter.INSTANCE.jitterPixelsY() * jitterSignY();
                 }
+                frameJitterX = jitterX;
+                frameJitterY = jitterY;
 
                 boolean rrDone = false;
                 // Select the next BDA ring slot; the generated WorldPushData serializer fills it once all
@@ -1298,7 +1309,7 @@ public final class RtComposite {
                     }
                 }
                 try (RtFrameStats.Scope ignored = RtFrameStats.FRAME.stage("frame.skyLut")) {
-                    skyLut.record(cmd, pushBuf.deviceAddress);
+                    skyStaticBaked = skyLut.record(cmd, pushBuf.deviceAddress);
                 }
                 RtContext.memoryBarrier2(cmd, stack,
                         KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
@@ -1323,7 +1334,7 @@ public final class RtComposite {
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.traceIndirect")) {
                     active.trace(cmd, renderW, renderH, pushConstants, 1);
                 }
-                if (rrPath && RtDlssRr.INSTANCE.ensureFeature(cmd.address(), renderW, renderH, displayW, displayH)) {
+                if (rrReady) {
                     VulkanCommandEncoder.memoryBarrier(cmd, stack); // NGX DLSS-RR external compute boundary
                     try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "DLSS-RR evaluate");
                          RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.dlssRr")) {
@@ -1408,11 +1419,18 @@ public final class RtComposite {
                     }
                     hdrWrittenThisFrame = false;
                 }
+                // Synchronize both displayImage compute writes (RAW) and any earlier vanilla color/transfer
+                // writes to mainRenderTarget dstImage (WAW) before copying displayImage into dstImage.
                 RtContext.memoryBarrier2(cmd, stack,
-                        KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
-                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
+                        KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR
+                                | KHRSynchronization2.VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT_KHR
+                                | KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
+                        KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR,
                         KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR,
-                        KHRSynchronization2.VK_ACCESS_2_TRANSFER_READ_BIT_KHR);
+                        KHRSynchronization2.VK_ACCESS_2_TRANSFER_READ_BIT_KHR
+                                | KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR);
 
                 try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "copy composite to main target");
                      RtFrameStats.Scope ignoredStats = RtFrameStats.FRAME.stage("frame.copyOutput")) {
@@ -1426,6 +1444,9 @@ public final class RtComposite {
             }
             encoder.execute(cmd); // deferred into the frame's submission — correct for per-frame work
             executed = true;
+            if (skyStaticBaked) {
+                skyLut.acceptStaticLutBake();
+            }
             RtAccel.acceptTlasBuild(frameTlas);
             // Do not attach a merely reserved token: failed recording may never signal it. Once execute succeeds,
             // every owner in this frame's manifest is protected through the final overlay consumer.
@@ -1553,7 +1574,17 @@ public final class RtComposite {
      */
     private CelestialUv celestialUv(float moonPhaseIndex) {
         if (celestialUvAtlasHandle == 0L) {
-            setCelestialUvAtlas(celestialsAtlasView());
+            long celView = celestialsAtlasView();
+            if (celView != 0L) {
+                if (worldPipeline != null && worldPipeline.hasSkyAtlas() && atlasSampler != 0L) {
+                    RtContext ctx = RtContext.currentOrNull();
+                    if (ctx != null) {
+                        ctx.waitIdle();
+                    }
+                    worldPipeline.setSkyAtlas(celView, atlasSampler);
+                }
+                setCelestialUvAtlas(celView);
+            }
         }
         int phase = Math.clamp((int) moonPhaseIndex, 0, MOON_IDS.length - 1);
         if (phase != celestialUvMoonPhase) {
@@ -1812,6 +1843,14 @@ public final class RtComposite {
         return hdrDisplayImage != null ? hdrDisplayImage.image : 0L;
     }
 
+    public int hdrBackbufferWidth() {
+        return hdrDisplayImage != null ? hdrDisplayImage.width : 0;
+    }
+
+    public int hdrBackbufferHeight() {
+        return hdrDisplayImage != null ? hdrDisplayImage.height : 0;
+    }
+
     /**
      * Blit this frame's PQ-encoded HDR image straight into the swapchain image, replacing Minecraft's SDR
      * blit. Replicates {@code VulkanGpuSurface.blitFromTexture}'s barrier + acquire-wait/present-signal
@@ -1830,11 +1869,12 @@ public final class RtComposite {
             if (RtDlssFg.enabled()) {
                 captureFgHdrHudless(cmd, stack, src);
             }
+            boolean segmented = RtGuiBlend.segmented();
             if (RtUiOverlay.pendingHdrComposite()) {
-                recordHdrGuiLayer(cmd, stack, RtGuiBlend.Mode.OVER);
+                recordHdrGuiLayer(cmd, stack, RtGuiBlend.Mode.OVER, !segmented);
                 RtUiOverlay.markConsumed();
             }
-            if (RtGuiBlend.segmented() && fgHdrHudlessCaptured
+            if (segmented && fgHdrHudlessCaptured
                     && hdrCompositePipeline != null && fgHdrUiImage != null) {
                 // Resolve against the original world, rather than the background of only the last layer.
                 hdrCompositePipeline.setImages(1, src.view, fgHdrHudlessImage.view, fgHdrUiImage.view,
@@ -1844,9 +1884,12 @@ public final class RtComposite {
                 VulkanCommandEncoder.memoryBarrier(cmd, stack);
                 fgHdrUiReady = true;
             }
-            // Swapchain UNDEFINED -> TRANSFER_DST, plus make the HDR compute writes visible to the blit read.
+            // Swapchain UNDEFINED -> TRANSFER_DST: srcStageMask chains with the acquireSem wait stage.
             VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
-            toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
+            toDst.get(0).srcStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .srcAccessMask(0L)
+                    .dstStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .dstAccessMask(KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR)
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
             toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -1893,13 +1936,13 @@ public final class RtComposite {
         VkCommandBuffer cmd = encoder.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             if (RtDlssFg.enabled()) captureFgHdrHudless(cmd, stack, hdrDisplayImage);
-            recordHdrGuiLayer(cmd, stack, mode);
+            recordHdrGuiLayer(cmd, stack, mode, false);
         }
         RtContext.check(VK10.vkEndCommandBuffer(cmd), "vkEndCommandBuffer(HDR GUI layer)");
         encoder.execute(cmd);
     }
 
-    private void recordHdrGuiLayer(VkCommandBuffer cmd, MemoryStack stack, RtGuiBlend.Mode mode) {
+    private void recordHdrGuiLayer(VkCommandBuffer cmd, MemoryStack stack, RtGuiBlend.Mode mode, boolean singlePass) {
         ensureHdrUiResources();
         RtContext ctx = RtContext.currentOrNull();
         if (hdrCompositePipeline == null || ctx == null) return;
@@ -1911,13 +1954,21 @@ public final class RtComposite {
             fgHdrUiImage = ctx.createStorageImage(hdrDisplayImage.width, hdrDisplayImage.height,
                     VK10.VK_FORMAT_R16G16B16A16_SFLOAT, "FG HDR resolved UI");
         }
-        hdrCompositePipeline.setImages(0, hdrDisplayImage.view, RtUiOverlay.overlayColorView(), fgHdrUiImage.view,
-                RtGuiBlend.coverageViewOr(RtUiOverlay.overlayColorView()), hdrUiSampler);
+        long overlayView = RtUiOverlay.overlayColorView();
+        // Single-pass non-segmented OVER uses slot 2 and sets SINGLE_PASS_FLAG so transparent pixels
+        // zero resolvedUiImage without sampling coverageImage and without rebinding slot 0.
+        int slot = singlePass ? 2 : 0;
+        long coverageView = singlePass ? overlayView : RtGuiBlend.coverageViewOr(overlayView);
+        int encodedMode = singlePass ? (mode.id() | RtHdrCompositePipeline.SINGLE_PASS_FLAG) : mode.id();
+        hdrCompositePipeline.setImages(slot, hdrDisplayImage.view, overlayView, fgHdrUiImage.view,
+                coverageView, hdrUiSampler);
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
-        hdrCompositePipeline.dispatch(cmd, 0, hdrDisplayImage.width, hdrDisplayImage.height,
-                CausticaConfig.Rt.Hdr.uiNits(), mode.id());
+        hdrCompositePipeline.dispatch(cmd, slot, hdrDisplayImage.width, hdrDisplayImage.height,
+                CausticaConfig.Rt.Hdr.uiNits(), encodedMode);
         VulkanCommandEncoder.memoryBarrier(cmd, stack);
-        fgHdrUiReady = true;
+        if (singlePass) {
+            fgHdrUiReady = true;
+        }
     }
 
     /** Lazily create the HDR UI-composite compute pipeline + its nearest/clamp sampler (first HDR present). */
@@ -1955,14 +2006,13 @@ public final class RtComposite {
 
     /**
      * Whether a non-RT frame (menu, title panorama, loading screen) should be SDR-&gt;PQ converted for
-     * present instead of vanilla's raw SDR blit. True when the PQ swapchain is active but this frame did
-     * not produce an HDR image ({@link #isHdrPresentActive()} false).
+     * present instead of vanilla's raw SDR blit. True when the PQ swapchain is active, RT is enabled
+     * and ready, and this frame did not produce an HDR image ({@link #isHdrPresentActive()} false).
      */
     public boolean isPqSdrPresentActive() {
-        // The conversion is needed only while the CURRENT swapchain is PQ and this frame has no HDR
-        // image (menus/loading, or the short interval after the toggle changed but before configure()).
-        // Once configure recreates a native-SDR swapchain, vanilla's ordinary blit is correct.
         return CausticaConfig.Rt.Hdr.swapchainPqActive()
+                && RtComposite.enabled()
+                && RtDeviceBringup.isRtReady()
                 && !isHdrPresentActive();
     }
 
@@ -1975,7 +2025,7 @@ public final class RtComposite {
      */
     public boolean presentSdrToPq(VulkanCommandEncoder enc, long swapchainImage, int swapW, int swapH,
             long sdrMainView, long acquireSem, long presentSem) {
-        if (sdrMainView == 0L || failed) {
+        if (sdrMainView == 0L || failed || !RtComposite.enabled() || !RtDeviceBringup.isRtReady()) {
             return false;
         }
         RtContext ctx = RtContext.get();
@@ -2008,9 +2058,12 @@ public final class RtComposite {
             sdrPresentPipeline.setImages(dst.view, sdrMainView, hdrUiSampler);
             sdrPresentPipeline.dispatch(cmd, dst.width, dst.height, CausticaConfig.Rt.Hdr.uiNits());
 
-            // Swapchain UNDEFINED -> TRANSFER_DST, plus make the compute write visible to the blit read.
+            // Swapchain UNDEFINED -> TRANSFER_DST: srcStageMask chains with the acquireSem wait stage.
             VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
-            toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
+            toDst.get(0).srcStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .srcAccessMask(0L)
+                    .dstStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .dstAccessMask(KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR)
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(swapchainImage);
             toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -2111,8 +2164,9 @@ public final class RtComposite {
      * never happen once RT is actively producing frames (DLSSG feature creation failing, an out-of-range
      * index, the evaluate itself failing) — the caller treats those as fatal and disables FG for the
      * session, same as any other FG present-record failure, rather than silently degrading to duplicated
-     * (non-interpolated) frames forever with no visible sign anything is wrong. Rotation-only matrices;
-     * camera translation is carried by the mvecs (cameraMotionIncluded).
+     * (non-interpolated) frames forever with no visible sign anything is wrong. Reprojection matrices
+     * include both camera rotation and camera translation ({@code mvCamDelta}); sub-pixel jitter is passed
+     * separately via {@code jitterOffset} so the matrices remain jitter-free.
      *
      * <p>{@code hdrBackbuffer} selects the HDR path. Per the DLSS-FG programming guide's HDR section, scRGB is
      * explicitly unsupported as a DLSS-FG input ("not suitable as inputs to DLSS-FG" — it wants a
@@ -2137,14 +2191,13 @@ public final class RtComposite {
                 throw new IllegalStateException("DLSSG feature not ready (ensureFgFeature failed)");
             }
             ensureFgInterp(ctx, count, swapW, swapH, fmt);
-            // clipToPrevClip = prevVP * inverse(curVP); prevClipToClip = curVP * inverse(prevVP). Both from
-            // the (rotation-only, camera-relative) MV view-projections, so jitter-free. updateMotion() has
-            // already advanced mvPrevProjView to the current frame, so this frame's previous view-projection
-            // is mvPushMatrix.
+            // Current camera-relative point p_cur maps to previous camera-relative p_prev = p_cur + camDelta.
+            // Both matrices are built from the unjittered view-projections; updateMotion() has already
+            // advanced mvPrevProjView to the current frame, so the previous view-projection is mvPushMatrix.
             fgMatTmp.set(mvCurProjView).invert();
-            fgClipToPrev.set(mvPushMatrix).mul(fgMatTmp);
+            fgClipToPrev.set(mvPushMatrix).translate(mvCamDeltaX, mvCamDeltaY, mvCamDeltaZ).mul(fgMatTmp);
             fgMatTmp.set(mvPushMatrix).invert();
-            fgPrevToClip.set(mvCurProjView).mul(fgMatTmp);
+            fgPrevToClip.set(mvCurProjView).translate(-mvCamDeltaX, -mvCamDeltaY, -mvCamDeltaZ).mul(fgMatTmp);
         }
         if (index < 1 || index > fgInterp.length || fgInterp[index - 1] == null) {
             throw new IllegalStateException(
@@ -2173,6 +2226,9 @@ public final class RtComposite {
         long uiImg = !uiReady ? 0L : hdrBackbuffer ? fgHdrUiImage.image
                 : sdrResolved != null ? sdrResolved.image() : RtUiOverlay.overlayColorImage();
 
+        float fgJitterX = renderW > 0 ? (-2.0f * frameJitterX / renderW) : 0.0f;
+        float fgJitterY = renderH > 0 ? (-2.0f * frameJitterY / renderH) : 0.0f;
+
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VulkanCommandEncoder.memoryBarrier(cmd, stack);
@@ -2184,14 +2240,16 @@ public final class RtComposite {
                 hudlessView, hudlessImg, hudlessReady ? hudlessFmt : 0,
                 uiView, uiImg, uiReady ? hudlessFmt : 0,
                 out.view, out.image, fmt,
-                swapW, swapH, renderW, renderH, count, index, 1.0f, 1.0f,
+                swapW, swapH, renderW, renderH, count, index, fgJitterX, fgJitterY, 1.0f, 1.0f,
                 true /* depthInverted (reversed-Z) */, hdrBackbuffer /* colorBuffersHDR */,
                 true /* cameraMotionIncluded (in mvecs) */, fgReset,
                 fgClipToPrev, fgPrevToClip);
         if (VK10.vkEndCommandBuffer(cmd) != VK10.VK_SUCCESS) {
             throw new IllegalStateException("vkEndCommandBuffer(fg interpolate) failed");
         }
-        fgReset = false;
+        if (index >= count) {
+            fgReset = false;
+        }
         if (!ok) {
             throw new IllegalStateException("ngxshim_evaluate_dlssg failed (RtDlssFg.evaluate returned false)");
         }

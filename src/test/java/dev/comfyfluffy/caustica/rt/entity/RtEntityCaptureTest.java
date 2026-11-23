@@ -76,6 +76,45 @@ final class RtEntityCaptureTest {
         assertEquals(expectedHash, capture.meshHash());
     }
 
+    @Test
+    void streamingVertexConsumerBuffersFourVerticesIntoAQuad() {
+        RtEntityCapture capture = new RtEntityCapture();
+        capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_OPAQUE;
+        capture.currentMaterialId = 7;
+
+        capture.addVertex(0f, 0f, 0f).setColor(255, 128, 64, 255).setUv(0f, 0f).setNormal(0f, 0f, 1f);
+        capture.addVertex(1f, 0f, 0f).setColor(255, 128, 64, 255).setUv(1f, 0f).setNormal(0f, 0f, 1f);
+        capture.addVertex(1f, 1f, 0f).setColor(255, 128, 64, 255).setUv(1f, 1f).setNormal(0f, 0f, 1f);
+        capture.addVertex(0f, 1f, 0f).setColor(255, 128, 64, 255).setUv(0f, 1f).setNormal(0f, 0f, 1f);
+        capture.finishStreamedVertices();
+
+        RtEntityCapture.PackedGeometry packed = capture.packGeometry();
+        assertArrayEquals(new int[] {2, 0}, packed.bucketTris());
+        assertEquals(12, capture.verts.size());
+        assertEquals(0f, packed.primitives().getFloat(0), 1.0e-6f);
+        assertEquals(0f, packed.primitives().getFloat(1), 1.0e-6f);
+        assertEquals(1f, packed.primitives().getFloat(2), 1.0e-6f);
+        assertEquals(1f, packed.primitives().getFloat(4), 1.0e-5f);
+        assertEquals(128f / 255f, packed.primitives().getFloat(5), 1.0e-5f);
+    }
+
+    @Test
+    void degenerateFirstTriangleFallsBackToSecondTriangleNormal() {
+        RtEntityCapture capture = new RtEntityCapture();
+        capture.currentAlphaBucket = RtAccel.ENTITY_BUCKET_OPAQUE;
+        // First triangle (0, 1, 2) is degenerate (v1 == v2), second triangle (0, 2, 3) has valid area.
+        float[] dx = {0f, 1f, 1f, 0f};
+        float[] dy = {0f, 0f, 0f, 1f};
+        float[] dz = {0f, 0f, 0f, 0f};
+        capture.addDirectQuad(dx, dy, dz, U, V, 0f, 0f, 0f, -1);
+
+        float nx = capture.prim.getFloat(0);
+        float ny = capture.prim.getFloat(1);
+        float nz = capture.prim.getFloat(2);
+        assertEquals(1f, Math.sqrt(nx * nx + ny * ny + nz * nz), 1.0e-5f);
+        assertEquals(1f, Math.abs(nz), 1.0e-5f);
+    }
+
     private static void addQuad(RtEntityCapture capture, int bucket, int materialId) {
         capture.currentAlphaBucket = bucket;
         capture.currentMaterialId = materialId;

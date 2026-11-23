@@ -20,7 +20,7 @@ float4 main(FragmentInput input) : SV_Target0 {
     ray.Direction = input.cameraRelative / distanceToEdge;
     ray.TMax = max(distanceToEdge - 0.01, 0.001);
 
-    RayQuery<RAY_FLAG_FORCE_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    RayQuery<RAY_FLAG_CULL_NON_OPAQUE | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(tlas, RAY_FLAG_NONE, CULL_PRIMARY, ray);
     while (query.Proceed()) {
     }

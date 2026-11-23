@@ -263,7 +263,7 @@ public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, inout uint s) {
     orthonormalBasis(n, t, b);
     float3 Ve = float3(dot(ve, t), dot(ve, b), dot(ve, n)); // view in tangent space (z = n)
     float a = alpha;
-    float3 Vh = normalize(float3(a * Ve.x, a * Ve.y, Ve.z));
+    float3 Vh = normalize(float3(a * Ve.x, a * Ve.y, max(Ve.z, 1.0e-5)));
     float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
     float3 T1 = lensq > 0.0 ? float3(-Vh.y, Vh.x, 0.0) * rsqrt(lensq) : float3(1.0, 0.0, 0.0);
     float3 T2 = cross(Vh, T1);
@@ -274,7 +274,7 @@ public float3 sampleGGXVNDF(float3 n, float3 ve, float alpha, inout uint s) {
     float p1 = r * cos(phi);
     float p2 = r * sin(phi);
     float ss = 0.5 * (1.0 + Vh.z);
-    p2 = (1.0 - ss) * sqrt(1.0 - p1 * p1) + ss * p2;
+    p2 = (1.0 - ss) * sqrt(max(0.0, 1.0 - p1 * p1)) + ss * p2;
     float3 Nh = p1 * T1 + p2 * T2 + sqrt(max(0.0, 1.0 - p1 * p1 - p2 * p2)) * Vh;
     float3 Ne = normalize(float3(a * Nh.x, a * Nh.y, max(0.0, Nh.z))); // microfacet normal, tangent space
     return normalize(Ne.x * t + Ne.y * b + Ne.z * n);                 // -> world space

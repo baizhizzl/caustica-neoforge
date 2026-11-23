@@ -22,7 +22,6 @@ static const float ENTITY_ALPHA_CUTOFF = 0.1; // entities: only discard near-ful
 // perfect transmitter either). Additive with the color-derived extinction below, not a floor/clamp — a
 // tinted pane still absorbs its own color on top of this.
 static const float TRANSLUCENT_NEUTRAL_EXTINCTION = 0.15;
-static const float WATER_SHADOW_TINT = 0.5;
 
 // Progressive 8x8 blue-noise-style alpha threshold pattern, with a golden-ratio temporal rotation. This keeps
 // translucent entity hits stochastic, but trades per-pixel white noise for a stable spatial distribution
@@ -64,6 +63,30 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         int texSlot = int(epr.tint.w + 0.5);
         float4 texel = entityAlbedoTex[NonUniformResourceIndex(texSlot)].SampleLevel(uv, 0.0);
         uint primFlags = epr.flags;
+        bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
+        uint entityModel = primFlags & PAYLOAD_MATERIAL_MASK;
+        if (instanceKind == ENTITY_BIT && entityModel == MATERIAL_DIELECTRIC) {
+            if (shadowRay) {
+                float3 tint709 = lerp(float3(1.0),
+                        srgbToLinear(texel.rgb) * srgbToLinear(epr.tint.rgb), texel.a);
+                float3 tint = bt709ToAcesCg(tint709);
+                packAlbedo(payload, unpackAlbedo(payload) * tint * clamp(asfloat(epr.aux0), 0.0, 1.0));
+                IgnoreHit();
+            }
+            return;
+        }
+        if (instanceKind == ENTITY_BIT && entityModel == MATERIAL_WATER) {
+            if (shadowRay) {
+                float hitT = RayTCurrent();
+                float3x3 entityO2w = (float3x3)ObjectToWorld3x4();
+                bool enteringWater = dot(WorldRayDirection(), mul(entityO2w, epr.normal.xyz)) < 0.0;
+                payload.hitT = payload.hitT < 0.0 ? hitT : min(payload.hitT, hitT);
+                payload.roughMetal = asuint(asfloat(payload.roughMetal) + (enteringWater ? -hitT : hitT));
+                payload.iorTransmission += enteringWater ? 1u : 0x10000u;
+                IgnoreHit();
+            }
+            return;
+        }
         bool stochasticAlpha = (instanceKind == ENTITY_BIT)
                 && ((primFlags & ENTITY_PRIM_STOCHASTIC_ALPHA) != 0u);
         if (stochasticAlpha) {
@@ -76,32 +99,6 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         } else if (texel.a < ENTITY_ALPHA_CUTOFF) {
             IgnoreHit();
         }
-
-        // Radiance rays accept the surface and continue to closest-hit. Shadow rays read the inlined
-        // model/transmission lanes directly from Prim instead of fetching the 80-byte MaterialHeader.
-        bool shadowRay = (RayFlags() & RAY_FLAG_SKIP_CLOSEST_HIT_SHADER) != 0u;
-        uint entityModel = primFlags & PAYLOAD_MATERIAL_MASK;
-        if (instanceKind == ENTITY_BIT && shadowRay && entityModel == MATERIAL_DIELECTRIC) {
-            float3 tint709 = lerp(float3(1.0),
-                    srgbToLinear(texel.rgb) * srgbToLinear(epr.tint.rgb), texel.a);
-            float3 tint = bt709ToAcesCg(tint709);
-            packAlbedo(payload, unpackAlbedo(payload) * tint * clamp(asfloat(epr.aux0), 0.0, 1.0));
-            IgnoreHit();
-        }
-        if (instanceKind == ENTITY_BIT && shadowRay && entityModel == MATERIAL_WATER) {
-            float3 tint = bt709ToAcesCg(
-                    srgbToLinear(texel.rgb) * srgbToLinear(epr.tint.rgb));
-            packAlbedo(payload, unpackAlbedo(payload)
-                    * lerp(float3(1.0, 1.0, 1.0), tint, WATER_SHADOW_TINT)
-                    * clamp(asfloat(epr.aux0), 0.0, 1.0));
-            float hitT = RayTCurrent();
-            float3x3 entityO2w = (float3x3)ObjectToWorld3x4();
-            bool enteringWater = dot(WorldRayDirection(), mul(entityO2w, epr.normal.xyz)) < 0.0;
-            payload.hitT = payload.hitT < 0.0 ? hitT : min(payload.hitT, hitT);
-            payload.roughMetal = asuint(asfloat(payload.roughMetal) + (enteringWater ? -hitT : hitT));
-            payload.iorTransmission += enteringWater ? 1u : 0x10000u;
-            IgnoreHit();
-        }
         return;
     }
 
@@ -109,15 +106,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     uint bucket = GeometryIndex();
     uint tri = pid + sec.triBase[bucket];
 
-    // Water radiance rays use a closest-hit-only SBT record. Shadow rays run this record: tint sunlight by
-    // the biome water color, then keep walking so submerged terrain is lit by colored transmission.
+    // Water radiance rays use a closest-hit-only SBT record. Shadow rays record water crossings here so
+    // callers apply Beer-Lambert absorption over the exact underwater distance without double-tinting.
     if (bucket == BUCKET_WATER) {
         TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[tri];
-        float3 tint = bt709ToAcesCg(srgbToLinear(pr.tint.rgb));
-        packAlbedo(payload, unpackAlbedo(payload) * lerp(float3(1.0), tint, WATER_SHADOW_TINT));
         // Record the nearest water crossing in hitT for underwater caustics, and accumulate signed
         // entry/exit boundary crossings in roughMetal/iorTransmission (order-independent under
-        // NO_DUPLICATE_ANY_HIT_INVOCATION) so finite-range shadow rays recover exact water thickness.
+        // NO_DUPLICATE_ANY_HIT_INVOCATION) so shadow rays recover exact water thickness.
         float hitT = RayTCurrent();
         bool enteringWater = dot(WorldRayDirection(), pr.normal.xyz) < 0.0;
         payload.hitT = payload.hitT < 0.0 ? hitT : min(payload.hitT, hitT);

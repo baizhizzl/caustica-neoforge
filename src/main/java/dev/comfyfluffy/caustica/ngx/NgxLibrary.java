@@ -33,6 +33,7 @@ public final class NgxLibrary {
 	private final MethodHandle dlssgAvailable;
 	private final MethodHandle dlssgMultiFrameCountMax;
 	private final MethodHandle createDlssg;
+	private final MethodHandle setDlssgJitter;
 	private final MethodHandle evaluateDlssg;
 	private final MethodHandle release;
 	private final MethodHandle shutdown;
@@ -104,6 +105,9 @@ public final class NgxLibrary {
 		this.createDlssg = optionalHandle(lookup, "ngxshim_create_dlssg",
 				FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
 						ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+		// void ngxshim_set_dlssg_jitter(feature, float jitterX, float jitterY)
+		this.setDlssgJitter = optionalHandle(lookup, "ngxshim_set_dlssg_jitter",
+				FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT));
 		// int ngxshim_evaluate_dlssg(cmd, feature, [backbuffer/depth/mvec/hudless/ui/outInterp/outReal: view,img,fmt]*7,
 		//   w,h, mvecDepthW, mvecDepthH, mfCount, mfIndex, mvScaleX, mvScaleY, depthInv, hdr, camMotion, reset, 4 matrices)
 		this.evaluateDlssg = optionalHandle(lookup, "ngxshim_evaluate_dlssg",
@@ -229,7 +233,7 @@ public final class NgxLibrary {
 	public int queryOptimalDlssd(int displayWidth, int displayHeight, int quality,
 	                             MemorySegment outRenderWidth, MemorySegment outRenderHeight, MemorySegment outSharpness) {
 		if (queryOptimalDlssd == null) {
-			return -1;
+			return 0xBAD00001; // NVSDK_NGX_Result_FAIL_FeatureNotSupported
 		}
 		try {
 			return (int) this.queryOptimalDlssd.invokeExact(displayWidth, displayHeight, quality,
@@ -316,6 +320,17 @@ public final class NgxLibrary {
 					nativeBackbufferFormat);
 		} catch (Throwable t) {
 			throw new RuntimeException("ngxshim_create_dlssg failed", t);
+		}
+	}
+
+	public void setDlssgJitter(MemorySegment feature, float jitterX, float jitterY) {
+		if (setDlssgJitter == null) {
+			return;
+		}
+		try {
+			this.setDlssgJitter.invokeExact(feature, jitterX, jitterY);
+		} catch (Throwable t) {
+			throw new RuntimeException("ngxshim_set_dlssg_jitter failed", t);
 		}
 	}
 

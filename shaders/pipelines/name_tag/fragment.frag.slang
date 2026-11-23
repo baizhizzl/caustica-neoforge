@@ -7,6 +7,6 @@ struct FragmentInput {
 
 [shader("fragment")]
 float4 main(FragmentInput input) : SV_Target0 {
-    float alpha = fontAtlas.Sample(input.uv).a;
-    return float4(input.color.rgb, input.color.a * alpha);
+    float4 texel = fontAtlas.Sample(input.uv);
+    return input.color * texel;
 }

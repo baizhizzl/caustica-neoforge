@@ -40,7 +40,7 @@ public abstract class GameRendererMixin {
             if (swapchain != 0L
                     && ((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
                 RtReflex.INSTANCE.marker(device.vkDevice(), swapchain, RtReflex.MARKER_RENDERSUBMIT_START,
-                        RtReflex.INSTANCE.currentSimFrameId());
+                        RtReflex.INSTANCE.beginRenderSubmitId());
             }
         }
     }

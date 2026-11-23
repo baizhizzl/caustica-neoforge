@@ -150,6 +150,7 @@ public final class RtTerrain {
     // task whose token no longer matches is discarded. The active-task barrier spans worker + GPU lifetime.
     private final Long2LongOpenHashMap inFlight = new Long2LongOpenHashMap();
     private final Long2LongOpenHashMap inFlightDirtyGroup = new Long2LongOpenHashMap();
+    private final Long2LongOpenHashMap completedDirtyGroup = new Long2LongOpenHashMap();
     private final Long2ObjectOpenHashMap<DirtyGroup> dirtyGroups = new Long2ObjectOpenHashMap<>();
     private final ConcurrentLinkedQueue<SectionResult> completedBuilds = new ConcurrentLinkedQueue<>();
     private final Object activeTaskLock = new Object();
@@ -160,7 +161,7 @@ public final class RtTerrain {
     private long dirtyGroupSeq;
     private final RtSectionTable table = new RtSectionTable();
     private long staticInstancesRevision;
-    private boolean ready;
+    private volatile boolean ready;
     // Full-residency invalidation requested via LevelExtractor.allChanged() (dimension change via setLevel,
     // render-distance change, F3+A) or resource reload. Consumed on the next render-frame stream or tick.
     private volatile boolean fullClearRequested;
@@ -191,6 +192,7 @@ public final class RtTerrain {
         queuedDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
         inFlight.defaultReturnValue(NO_TESS_TOKEN);
         inFlightDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
+        completedDirtyGroup.defaultReturnValue(NO_DIRTY_GROUP);
     }
 
     /**
@@ -204,11 +206,22 @@ public final class RtTerrain {
     }
 
     public static boolean isSectionReady(BlockPos blockPos) {
+        if (!INSTANCE.ready) {
+            return false;
+        }
         int scx = SectionPos.blockToSectionCoord(blockPos.getX());
         int scy = SectionPos.blockToSectionCoord(blockPos.getY());
         int scz = SectionPos.blockToSectionCoord(blockPos.getZ());
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level != null) {
+            int minSecY = level.getMinY() >> 4;
+            int maxSecY = (level.getMinY() + level.getHeight() - 1) >> 4;
+            scy = Math.clamp(scy, minSecY, maxSecY);
+        } else if (INSTANCE.windowValid) {
+            scy = Math.clamp(scy, INSTANCE.windowLoY, INSTANCE.windowHiY);
+        }
         long key = sectionKey(scx, scy, scz);
-        return INSTANCE.ready && ((INSTANCE.resident.containsKey(key) && INSTANCE.published.contains(key)) || INSTANCE.empty.contains(key));
+        return (INSTANCE.resident.containsKey(key) && INSTANCE.published.contains(key)) || INSTANCE.empty.contains(key);
     }
 
     /** Monotonic render-thread publication token, including world resets and coordinate rebases. */
@@ -331,6 +344,9 @@ public final class RtTerrain {
      */
     public static void markBlocksDirty(int minX, int minY, int minZ, int maxX, int maxY, int maxZ) {
         RtTerrain terrain = INSTANCE;
+        if (!terrain.ready || !RtComposite.enabled()) {
+            return;
+        }
         synchronized (terrain.dirtyLock) {
             LongArrayList keys = new LongArrayList();
             for (int scx = (minX - 1) >> 4; scx <= (maxX + 1) >> 4; scx++) {
@@ -682,6 +698,7 @@ public final class RtTerrain {
         removeKeysNotIn(empty, desired);
         removeInFlightNotIn(desired);
         removeQueuedGroupsNotIn(desired);
+        removeCompletedGroupsNotIn(desired);
     }
 
     private void handleDirtyEvent(DirtyEvent event) {
@@ -715,12 +732,10 @@ public final class RtTerrain {
 
     private boolean handleDirtySection(long key, long dirtyGroup) {
         snapshots.invalidate(key); // block data changed — the cached palette snapshot is stale
-        boolean wasEmpty = empty.remove(key);
-        if (wasEmpty && dirtyGroup != NO_DIRTY_GROUP) {
-            DirtyGroup group = dirtyGroups.get(dirtyGroup);
-            if (group != null) {
-                group.restoreEmptyKeys.add(key);
-            }
+        empty.remove(key);
+        long completedGroup = completedDirtyGroup.remove(key);
+        if (completedGroup != NO_DIRTY_GROUP && completedGroup != dirtyGroup) {
+            cancelDirtyGroup(completedGroup);
         }
         invalidateInFlight(key); // invalidate any in-flight build of the now-stale section
         if (!desired.contains(key)) {
@@ -835,6 +850,23 @@ public final class RtTerrain {
             long key = it.nextLong();
             if (!keep.contains(key)) {
                 long groupId = queuedDirtyGroup.get(key);
+                it.remove();
+                if (groupId != NO_DIRTY_GROUP) {
+                    cancelGroups.add(groupId);
+                }
+            }
+        }
+        for (LongIterator it = cancelGroups.iterator(); it.hasNext(); ) {
+            cancelDirtyGroup(it.nextLong());
+        }
+    }
+
+    private void removeCompletedGroupsNotIn(LongOpenHashSet keep) {
+        LongArrayList cancelGroups = new LongArrayList();
+        for (LongIterator it = completedDirtyGroup.keySet().iterator(); it.hasNext(); ) {
+            long key = it.nextLong();
+            if (!keep.contains(key)) {
+                long groupId = completedDirtyGroup.get(key);
                 it.remove();
                 if (groupId != NO_DIRTY_GROUP) {
                     cancelGroups.add(groupId);
@@ -1347,16 +1379,11 @@ public final class RtTerrain {
             }
             if (dirtyGroup != NO_DIRTY_GROUP && dirtyGroups.containsKey(dirtyGroup)) {
                 DirtyGroup group = dirtyGroups.get(dirtyGroup);
+                group.completedKeys.add(task.key);
+                completedDirtyGroup.put(task.key, dirtyGroup);
                 if (built == null) {
-                    SectionGeom prev = resident.get(task.key);
-                    if (prev != null) {
-                        group.removed.add(prev);
-                    } else {
-                        group.restoreEmptyKeys.add(task.key);
-                    }
                     group.emptyKeys.add(task.key);
                 } else {
-                    empty.remove(task.key);
                     group.prepared.add(built);
                 }
                 completeDirtyGroupMember(group, prepared, removed);
@@ -1392,10 +1419,23 @@ public final class RtTerrain {
             return;
         }
         dirtyGroups.remove(group.id);
-        prepared.addAll(group.prepared);
-        removed.addAll(group.removed);
+        for (LongIterator it = group.completedKeys.iterator(); it.hasNext(); ) {
+            long key = it.nextLong();
+            if (completedDirtyGroup.get(key) == group.id) {
+                completedDirtyGroup.remove(key);
+            }
+        }
+        for (PreparedSection ps : group.prepared) {
+            empty.remove(ps.key());
+            prepared.add(ps);
+        }
         for (LongIterator it = group.emptyKeys.iterator(); it.hasNext(); ) {
-            empty.add(it.nextLong());
+            long key = it.nextLong();
+            SectionGeom prev = resident.remove(key);
+            if (prev != null) {
+                removed.add(prev);
+            }
+            empty.add(key);
         }
     }
 
@@ -1407,12 +1447,6 @@ public final class RtTerrain {
         for (PreparedSection ps : group.prepared) {
             destroyPreparedSection(ps);
         }
-        for (LongIterator it = group.restoreEmptyKeys.iterator(); it.hasNext(); ) {
-            long key = it.nextLong();
-            if (desired.contains(key) && !resident.containsKey(key) && !inFlight.containsKey(key) && !isQueuedAnywhere(key)) {
-                empty.add(key);
-            }
-        }
         for (LongIterator it = group.keys.iterator(); it.hasNext(); ) {
             long key = it.nextLong();
             if (queuedDirtyGroup.get(key) == groupId) {
@@ -1421,11 +1455,31 @@ public final class RtTerrain {
             if (inFlightDirtyGroup.get(key) == groupId) {
                 inFlightDirtyGroup.remove(key);
             }
+            if (completedDirtyGroup.get(key) == groupId) {
+                completedDirtyGroup.remove(key);
+            }
+        }
+        // Members that already completed inside this canceled group had their results discarded; re-queue
+        // any still-desired member that is not already queued or in flight so its block edit is not lost.
+        for (LongIterator it = group.completedKeys.iterator(); it.hasNext(); ) {
+            long key = it.nextLong();
+            if (!desired.contains(key) || inFlight.containsKey(key) || isQueuedAnywhere(key)) {
+                continue;
+            }
+            if (resident.containsKey(key)) {
+                if (queuedReextract.add(key)) {
+                    reextract.add(key);
+                }
+            } else {
+                empty.remove(key);
+                enqueueMissing(key, NO_DIRTY_GROUP);
+            }
         }
     }
 
     private void cancelAllDirtyGroups() {
         if (dirtyGroups.isEmpty()) {
+            completedDirtyGroup.clear();
             return;
         }
         for (DirtyGroup group : dirtyGroups.values()) {
@@ -1436,6 +1490,7 @@ public final class RtTerrain {
         dirtyGroups.clear();
         queuedDirtyGroup.clear();
         inFlightDirtyGroup.clear();
+        completedDirtyGroup.clear();
     }
 
     private void destroyPreparedSection(PreparedSection ps) {
@@ -1460,10 +1515,9 @@ public final class RtTerrain {
     private static final class DirtyGroup {
         final long id;
         final LongArrayList keys;
+        final LongArrayList completedKeys = new LongArrayList();
         final ArrayList<PreparedSection> prepared = new ArrayList<>();
-        final ArrayList<SectionGeom> removed = new ArrayList<>();
         final LongArrayList emptyKeys = new LongArrayList();
-        final LongArrayList restoreEmptyKeys = new LongArrayList();
         int remaining;
 
         DirtyGroup(long id, int remaining, LongArrayList keys) {
@@ -1588,18 +1642,11 @@ public final class RtTerrain {
             published.clear();
             // The instance list + slot registry were just reset, but evicted geometry can still be waiting
             // in the `removed` accumulator (window sync runs while a build is in flight — e.g. a respawn
-            // evicts everything at once) or in a dirty group's removed list. Their instanceIndex/slot point
-            // into the cleared lists; neutralize them so the eventual removePublishedSection is a no-op
-            // (their buffers are still retired normally when the accumulator is consumed).
+            // evicts everything at once). Their instanceIndex/slot point into the cleared lists; neutralize
+            // them so the eventual removePublishedSection is a no-op (their buffers are still retired normally).
             for (SectionGeom g : this.removed) {
                 g.instanceIndex = -1;
                 g.slot = -1;
-            }
-            for (DirtyGroup group : dirtyGroups.values()) {
-                for (SectionGeom g : group.removed) {
-                    g.instanceIndex = -1;
-                    g.slot = -1;
-                }
             }
             // Zero resident sections (e.g. every section just evicted on a respawn) is a transient
             // streaming state, not "no world" — keep tracing (sky/entities only) instead of handing the
@@ -1702,6 +1749,7 @@ public final class RtTerrain {
         }
         inFlight.clear();
         inFlightDirtyGroup.clear();
+        completedDirtyGroup.clear();
         if (failure != null) {
             throw new RuntimeException("RT terrain worker/build failed during teardown", failure);
         }

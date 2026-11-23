@@ -89,6 +89,13 @@ public final class RtDlssRr {
         return initialized && !failed && !isNull(feature);
     }
 
+    /** Whether a live RR feature already matches the requested resolutions, quality, and preset. */
+    public boolean featureReadyFor(int renderWidth, int renderHeight, int displayWidth, int displayHeight) {
+        return isReady() && featureRenderWidth == renderWidth && featureRenderHeight == renderHeight
+                && featureDisplayWidth == displayWidth && featureDisplayHeight == displayHeight
+                && featureQuality == quality() && featurePreset == renderPreset();
+    }
+
     /**
      * Record a DLSS-RR evaluation: denoise + upscale the noisy path-traced color (at render res) using
      * the guide buffers, writing the display-res result into {@code out}. {@code jitterX/jitterY} is the
@@ -249,9 +256,15 @@ public final class RtDlssRr {
      * teardown ({@code NgxRuntime.shutdown()} in {@code CausticaClient.shutdownRt}), so FG can keep using NGX.
      */
     public void destroy() {
-        if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
-            releaseFeature(device);
+        VulkanDevice device = null;
+        try {
+            if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice d) {
+                device = d;
+            }
+        } catch (Throwable t) {
+            CausticaMod.LOGGER.debug("DLSS-RR destroy: VulkanDevice unavailable", t);
         }
+        releaseFeature(device);
         initialized = false;
         lib = null;
         failed = false;
@@ -260,16 +273,24 @@ public final class RtDlssRr {
     }
 
     private void releaseFeature(VulkanDevice device) {
-        if (!isNull(feature)) {
-            RtContext ctx = RtContext.currentOrNull();
-            if (ctx != null && ctx.device() == device) {
-                ctx.waitIdle();
-            } else {
-                VK10.vkDeviceWaitIdle(device.vkDevice());
+        if (lib != null && !isNull(feature)) {
+            try {
+                RtContext ctx = RtContext.currentOrNull();
+                if (ctx != null && (device == null || ctx.device() == device)) {
+                    ctx.waitIdle();
+                } else if (device != null) {
+                    VK10.vkDeviceWaitIdle(device.vkDevice());
+                }
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("DLSS-RR waitIdle failed during release; continuing teardown", t);
             }
-            lib.release(feature);
-            feature = MemorySegment.NULL;
+            try {
+                lib.release(feature);
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.warn("DLSS-RR native feature release failed", t);
+            }
         }
+        feature = MemorySegment.NULL;
         featureRenderWidth = -1;
         featureRenderHeight = -1;
         featureDisplayWidth = -1;

@@ -59,6 +59,9 @@ public final class RtEntityCapture implements VertexConsumer {
     private float uvU0, uvV0, uvDU, uvDV;
 
     private int n; // quad vertex accumulator (0..3)
+    private boolean builderPending;
+    private float bx, by, bz, bu, bv, bnx, bny, bnz;
+    private int bcol = -1;
     private final float[] qx = new float[4], qy = new float[4], qz = new float[4];
     private final float[] qu = new float[4], qv = new float[4];
     private final float[] qnx = new float[4], qny = new float[4], qnz = new float[4];
@@ -81,6 +84,7 @@ public final class RtEntityCapture implements VertexConsumer {
         packedPrim.clear();
         ensureVertexCapacity(expectedVertices);
         n = 0;
+        builderPending = false;
         currentTexSlot = 0;
         currentMaterialId = 0;
         currentAlphaBucket = RtAccel.ENTITY_BUCKET_ANY_HIT;
@@ -242,7 +246,17 @@ public final class RtEntityCapture implements VertexConsumer {
         }
     }
 
+    /** Flush any pending builder-style vertex before finishing a submission or switching emit paths. */
+    public void finishStreamedVertices() {
+        if (!builderPending) {
+            return;
+        }
+        builderPending = false;
+        addVertexInternal(bx, by, bz, bcol, bu, bv, bnx, bny, bnz);
+    }
+
     public boolean isEmpty() {
+        finishStreamedVertices();
         return idx.isEmpty();
     }
 
@@ -251,6 +265,7 @@ public final class RtEntityCapture implements VertexConsumer {
      * each Vulkan geometry, so the returned counts also define the triangle bases written to EntityGeom.
      */
     PackedGeometry packGeometry() {
+        finishStreamedVertices();
         int triangleCount = idx.size() / 3;
         if (alphaBuckets.size() != triangleCount || prim.size() != triangleCount * 12) {
             throw new IllegalStateException("Malformed entity capture: triangles=" + triangleCount
@@ -294,6 +309,12 @@ public final class RtEntityCapture implements VertexConsumer {
     @Override
     public void addVertex(float x, float y, float z, int color, float u, float v,
                           int overlay, int light, float nx, float ny, float nz) {
+        finishStreamedVertices();
+        addVertexInternal(x, y, z, color, u, v, nx, ny, nz);
+    }
+
+    private void addVertexInternal(float x, float y, float z, int color, float u, float v,
+                                   float nx, float ny, float nz) {
         if (uvRemap) { // ModelPart 0..1 UV → sprite's atlas region (block-entity Material sprites)
             u = uvU0 + u * uvDU;
             v = uvV0 + v * uvDV;
@@ -319,6 +340,7 @@ public final class RtEntityCapture implements VertexConsumer {
     }
 
     public void addBakedQuad(Matrix4f pose, BakedQuad quad, int color, float emission) {
+        finishStreamedVertices();
         for (int i = 0; i < 4; i++) {
             Vector3fc p = quad.position(i);
             pose.transformPosition(p.x(), p.y(), p.z(), scratch);
@@ -352,11 +374,13 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Append a direct quad with an explicit per-primitive emission strength. */
     void addDirectQuad(float[] x, float[] y, float[] z, float[] u, float[] v,
                        float nx, float ny, float nz, int color, float emission) {
+        finishStreamedVertices();
         appendQuad(x, y, z, null, u, v, nx, ny, nz, color, uvRemap, emission);
     }
 
     /** Fail fast before a later submission can accidentally complete a malformed custom-geometry quad. */
     void requireCompleteQuads(String label) {
+        finishStreamedVertices();
         if (n != 0) {
             int incomplete = n;
             n = 0;
@@ -367,6 +391,7 @@ public final class RtEntityCapture implements VertexConsumer {
     /** Append a face whose positions reference a transformed eight-corner cube template. */
     void addIndexedDirectQuad(float[] x, float[] y, float[] z, int[] corners, float[] u, float[] v,
                               float nx, float ny, float nz, int color) {
+        finishStreamedVertices();
         appendQuad(x, y, z, corners, u, v, nx, ny, nz, color, uvRemap, 0f);
     }
 
@@ -374,31 +399,53 @@ public final class RtEntityCapture implements VertexConsumer {
                             float nx, float ny, float nz, int color, boolean remapUv, float emission) {
         // Authored model normal (pose-transformed by compile); planar quad, so vertex 0's normal is the
         // face normal. Baked quads (items/blocks) pass no normal → fall back to a geometric one from the
-        // quad edges. The closest-hit flips it toward the viewer, as for terrain. Computed BEFORE the
-        // positions are staged so a same-order offset (below) can push along it.
+        // quad edges (checking the second triangle when the first is degenerate). The closest-hit flips it
+        // toward the viewer, as for terrain. Computed BEFORE positions are staged for order offsets.
         float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
         if (len <= 1.0e-6f) {
             int p0 = positionIndex(corners, 0);
             int p1 = positionIndex(corners, 1);
             int p2 = positionIndex(corners, 2);
+            int p3 = positionIndex(corners, 3);
             float ex1 = x[p1] - x[p0], ey1 = y[p1] - y[p0], ez1 = z[p1] - z[p0];
             float ex2 = x[p2] - x[p0], ey2 = y[p2] - y[p0], ez2 = z[p2] - z[p0];
             nx = ey1 * ez2 - ez1 * ey2;
             ny = ez1 * ex2 - ex1 * ez2;
             nz = ex1 * ey2 - ey1 * ex2;
             len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len <= 1.0e-6f) {
+                float fx1 = x[p2] - x[p0], fy1 = y[p2] - y[p0], fz1 = z[p2] - z[p0];
+                float fx2 = x[p3] - x[p0], fy2 = y[p3] - y[p0], fz2 = z[p3] - z[p0];
+                nx = fy1 * fz2 - fz1 * fy2;
+                ny = fz1 * fx2 - fx1 * fz2;
+                nz = fx1 * fy2 - fy1 * fx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
+            if (len <= 1.0e-6f) {
+                float gx1 = x[p2] - x[p1], gy1 = y[p2] - y[p1], gz1 = z[p2] - z[p1];
+                float gx2 = x[p3] - x[p1], gy2 = y[p3] - y[p1], gz2 = z[p3] - z[p1];
+                nx = gy1 * gz2 - gz1 * gy2;
+                ny = gz1 * gx2 - gx1 * gz2;
+                nz = gx1 * gy2 - gy1 * gx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
         }
-        if (len > 1.0e-6f) {
+        boolean hasValidNormal = len > 1.0e-6f;
+        if (hasValidNormal) {
             nx /= len;
             ny /= len;
             nz /= len;
+        } else {
+            nx = 0f;
+            ny = 1f;
+            nz = 0f;
         }
         // Stacked decal layers (banner/shield patterns: base cloth + per-pattern cutout layers, all the
         // SAME coplanar mesh submitted repeatedly via SubmitNodeCollector#order) tie exactly in the BVH —
         // push each later layer outward along the face normal by rank, same fix as terrain's coincident
         // grass-overlay resolution (RtTerrain.QuadCapture), so any-hit cutout lets the ray fall through a
         // discarded pattern texel to the layer behind instead of a random BVH pick.
-        boolean offset = currentOrder != 0 && len > 1.0e-6f;
+        boolean offset = currentOrder != 0 && hasValidNormal;
         float off = offset ? ORDER_OFFSET * currentOrder : 0f;
 
         int base = verts.size() / 3;
@@ -445,14 +492,53 @@ public final class RtEntityCapture implements VertexConsumer {
         return corners == null ? vertex : corners[vertex];
     }
 
-    // Unused VertexConsumer surface — ModelPart.Cube.compile only calls the bulk addVertex above.
-    @Override public VertexConsumer addVertex(float x, float y, float z) { return this; }
-    @Override public VertexConsumer setColor(int r, int g, int b, int a) { return this; }
-    @Override public VertexConsumer setColor(int color) { return this; }
-    @Override public VertexConsumer setUv(float u, float v) { return this; }
+    // Builder-style VertexConsumer surface for custom/modded Model.renderToBuffer implementations.
+    @Override
+    public VertexConsumer addVertex(float x, float y, float z) {
+        finishStreamedVertices();
+        bx = x;
+        by = y;
+        bz = z;
+        bu = 0f;
+        bv = 0f;
+        bnx = 0f;
+        bny = 0f;
+        bnz = 0f;
+        bcol = -1;
+        builderPending = true;
+        return this;
+    }
+
+    @Override
+    public VertexConsumer setColor(int r, int g, int b, int a) {
+        bcol = ((a & 0xFF) << 24) | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+        return this;
+    }
+
+    @Override
+    public VertexConsumer setColor(int color) {
+        bcol = color;
+        return this;
+    }
+
+    @Override
+    public VertexConsumer setUv(float u, float v) {
+        bu = u;
+        bv = v;
+        return this;
+    }
+
     @Override public VertexConsumer setUv1(int u, int v) { return this; }
     @Override public VertexConsumer setUv3(float u, float v) { return this; }
     @Override public VertexConsumer setUv2(int u, int v) { return this; }
-    @Override public VertexConsumer setNormal(float x, float y, float z) { return this; }
+
+    @Override
+    public VertexConsumer setNormal(float x, float y, float z) {
+        bnx = x;
+        bny = y;
+        bnz = z;
+        return this;
+    }
+
     @Override public VertexConsumer setLineWidth(float width) { return this; }
 }

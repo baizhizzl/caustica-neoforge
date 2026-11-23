@@ -17,22 +17,26 @@ import net.minecraft.client.renderer.texture.TextureAtlas;
 import net.minecraft.resources.Identifier;
 
 import java.lang.reflect.Method;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
+import it.unimi.dsi.fastutil.ints.IntArrayList;
 
 /**
  * Resolves the texture backing an entity {@link RenderType} to a Vulkan image-view handle, for the
  * bindless entity-texture array. Entities use per-type texture files (zombie.png, …), not the block
- * atlas, so each distinct texture maps to its own bindless slot. Slots are keyed by the resolved image
- * view rather than the {@link RenderType}: some render types are rebuilt every frame with a fresh
- * identity (the charged-creeper energy swirl scrolls its texture transform, so {@code energySwirl()}
- * allocates a new RenderType per frame), and keying by RenderType there would leak a slot per frame
- * until the array exhausts and everything falls back to slot 0.
+ * atlas, so each distinct texture maps to its own bindless slot. Slots are keyed by the live
+ * image-view handle paired with its owning {@link GpuTextureView}: some render types are rebuilt every
+ * frame with a fresh identity (the charged-creeper energy swirl scrolls its texture transform), while
+ * dynamic textures (skins, maps, mod overlays) can close and recreate views whose Vulkan handle may be
+ * reused by the driver. Tracking the {@link GpuTextureView} detects closed views and recycles their
+ * slots after in-flight frames finish.
  *
  * <p>The view is obtained through the <b>public</b> {@code RenderType.prepare()} → {@link
  * PreparedRenderType#textures()} API (a list of {@code Texture(name, GpuTextureView, sampler)}): the
@@ -53,6 +57,10 @@ public final class RtEntityTextures {
 
     public static final RtEntityTextures INSTANCE = new RtEntityTextures();
 
+    // Wait more than KEEP_FRAMES (3) before reusing a slot freed by a closed dynamic texture so
+    // update-after-bind descriptor writes never overwrite a slot referenced by an in-flight frame.
+    private static final long RECYCLE_DELAY_FRAMES = 4L;
+
     // RenderType identity → resolved primary GpuTextureView. WEAK: some render types are rebuilt every
     // frame with a fresh identity (e.g. the charged-creeper energy-swirl layer, whose scrolling texture
     // transform makes RenderTypes.energySwirl() allocate a new RenderType each frame). Caching the
@@ -61,12 +69,11 @@ public final class RtEntityTextures {
     private final Map<RenderType, GpuTextureView> viewCache = new WeakHashMap<>();
     private final Set<RenderType> untexturedCache = Collections.newSetFromMap(new WeakHashMap<>());
     private final Map<RenderType, Identifier> locationCache = new WeakHashMap<>();
-    // Resolved image-view handle → bindless slot. The slot identifies a *texture*, not a RenderType, so
-    // many render types that differ only by a texture transform we don't replicate (the swirl's scroll)
-    // collapse to ONE slot — instead of leaking a slot per frame until the array exhausts and everything
-    // falls back to slot 0 (the block atlas). Append-only: a handle's slot never changes once assigned,
-    // so update-after-bind writes for new slots never disturb in-flight frames.
-    private final Map<Long, Integer> viewSlotCache = new HashMap<>();
+    // Live VkImageView handle → owning slot entry. Checking owner.isClosed() detects destroyed views even
+    // when the driver reuses the same VkImageView handle address for a newly created dynamic texture.
+    private final Map<Long, SlotEntry> handleSlots = new HashMap<>();
+    private final ArrayDeque<RetiredSlot> retiredSlots = new ArrayDeque<>();
+    private final IntArrayList freeSlots = new IntArrayList();
     // Atlas-location → resolved GpuTextureView, checked for isClosed() so recreated dynamic textures
     // obtain a fresh slot instead of keeping a stale VkImageView. Block atlas always maps to slot 0.
     private final Map<Identifier, GpuTextureView> atlasViewCache = new HashMap<>();
@@ -75,6 +82,7 @@ public final class RtEntityTextures {
     // reset/recreate; a lower value stops allocating new slots immediately without invalidating old ones.
     private int capacity = maxTextures();
     private int nextSlot = 1;
+    private long frameTick;
     private boolean loggedFailure;
     private boolean loggedMaterialFailure;
     // 1x1 solid-white DynamicTexture for untextured geometry (leash/line ribbons); see whiteSlot().
@@ -84,14 +92,20 @@ public final class RtEntityTextures {
     // Cached RenderSetup.TextureBinding#location() (the class is package-private, the method public).
     private Method locationMethod;
 
-    private record Pending(int slot, long view) {
+    private record SlotEntry(int slot, GpuTextureView owner, long handle) {
+    }
+
+    private record RetiredSlot(int slot, long readyFrame) {
+    }
+
+    private record Pending(int slot, GpuTextureView owner, long view) {
     }
 
     private RtEntityTextures() {
     }
 
     /**
-     * The bindless slot for {@code renderType}'s texture. Keyed by the resolved image view, not the
+     * The bindless slot for {@code renderType}'s texture. Keyed by the live image view, not the
      * RenderType, so per-frame-allocated render types sharing one texture reuse a single slot. Returns 0
      * (the fallback slot = block atlas) if the texture can't be resolved or the array is full.
      */
@@ -99,7 +113,7 @@ public final class RtEntityTextures {
         if (renderType == null) {
             return 0;
         }
-        return slotForView(resolveView(renderType));
+        return slotForTextureView(resolveTextureView(renderType));
     }
 
     /** Canonical material ID for a full entity texture, or the neutral runtime-texture fallback. */
@@ -136,7 +150,7 @@ public final class RtEntityTextures {
                 }
             }
         }
-        return slotForView(vkImageView(cached));
+        return slotForTextureView(cached);
     }
 
     /**
@@ -161,35 +175,88 @@ public final class RtEntityTextures {
     }
 
     /**
-     * Map a resolved image-view handle to a stable bindless slot, allocating one on first sight (queued
-     * for upload via {@link #uploadPending}). Returns 0 (fallback) when the view is unresolved or the
-     * array is full. Deduping by handle is what bounds slot use: distinct render types backed by the same
-     * texture share a slot instead of each consuming one.
+     * Map a live {@link GpuTextureView} to a bindless slot, allocating or reusing one on first sight
+     * (queued for upload via {@link #uploadPending}). Returns 0 (fallback) when the view is unresolved,
+     * closed, or the array is full.
      */
-    private int slotForView(long view) {
+    private int slotForTextureView(GpuTextureView textureView) {
+        if (textureView == null || textureView.isClosed()) {
+            return 0;
+        }
+        long view = vkImageView(textureView);
         if (view == 0L) {
             return 0;
         }
-        Integer cached = viewSlotCache.get(view);
-        if (cached != null) {
-            return cached;
+        SlotEntry existing = handleSlots.get(view);
+        if (existing != null) {
+            if (!existing.owner().isClosed()) {
+                return existing.slot();
+            }
+            // The previous GpuTextureView closed and the driver reused its VkImageView handle address.
+            // Retire the stale slot and bind the new view freshly so Vulkan updates the descriptor.
+            handleSlots.remove(view);
+            retireSlot(existing.slot());
         }
-        if (nextSlot >= slotLimit()) {
+        int slot = allocateSlot();
+        if (slot <= 0) {
             return 0;
         }
-        int slot = nextSlot++;
-        viewSlotCache.put(view, slot);
-        pending.add(new Pending(slot, view));
+        handleSlots.put(view, new SlotEntry(slot, textureView, view));
+        pending.add(new Pending(slot, textureView, view));
         return slot;
     }
 
-    /** Write any newly-registered entity textures into the pipeline's bindless set (before the trace). */
+    private int allocateSlot() {
+        int limit = slotLimit();
+        while (!freeSlots.isEmpty()) {
+            int recycled = freeSlots.removeInt(freeSlots.size() - 1);
+            if (recycled > 0 && recycled < limit) {
+                return recycled;
+            }
+        }
+        if (nextSlot >= limit) {
+            return 0;
+        }
+        return nextSlot++;
+    }
+
+    private void retireSlot(int slot) {
+        if (slot > 0) {
+            retiredSlots.addLast(new RetiredSlot(slot, frameTick + RECYCLE_DELAY_FRAMES));
+        }
+    }
+
+    private void sweepClosedSlots() {
+        if (!handleSlots.isEmpty()) {
+            for (Iterator<Map.Entry<Long, SlotEntry>> it = handleSlots.entrySet().iterator(); it.hasNext(); ) {
+                SlotEntry entry = it.next().getValue();
+                if (entry.owner().isClosed()) {
+                    it.remove();
+                    retireSlot(entry.slot());
+                }
+            }
+        }
+        while (!retiredSlots.isEmpty() && retiredSlots.peekFirst().readyFrame() <= frameTick) {
+            freeSlots.add(retiredSlots.removeFirst().slot());
+        }
+    }
+
+    /** Sweep closed views, recycle matured slots, and upload pending bindless descriptors before tracing. */
     public void uploadPending(RtPipeline pipeline, long sampler) {
+        frameTick++;
+        sweepClosedSlots();
         if (pending.isEmpty()) {
             return;
         }
         for (Pending p : pending) {
-            pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
+            if (p.owner().isClosed()) {
+                // Closed before upload: never write a destroyed VkImageView into the descriptor set.
+                continue;
+            }
+            SlotEntry current = handleSlots.get(p.view());
+            if (current != null && current.slot() == p.slot() && current.owner() == p.owner()) {
+                pipeline.setEntityAlbedoTexture(p.slot(), p.view(), sampler);
+            }
         }
         pending.clear();
     }
@@ -205,10 +272,13 @@ public final class RtEntityTextures {
         viewCache.clear();
         untexturedCache.clear();
         locationCache.clear();
-        viewSlotCache.clear();
+        handleSlots.clear();
+        retiredSlots.clear();
+        freeSlots.clear();
         atlasViewCache.clear();
         pending.clear();
         nextSlot = 1;
+        frameTick = 0L;
     }
 
     private int slotLimit() {
@@ -252,17 +322,21 @@ public final class RtEntityTextures {
 
     /** The Vulkan image-view handle of {@code renderType}'s primary texture, or 0 if it can't be resolved. */
     public long resolveView(RenderType renderType) {
+        return vkImageView(resolveTextureView(renderType));
+    }
+
+    private GpuTextureView resolveTextureView(RenderType renderType) {
         if (renderType == null) {
-            return 0L;
+            return null;
         }
         GpuTextureView cached = viewCache.get(renderType);
         if (cached != null) {
             if (!cached.isClosed()) {
-                return vkImageView(cached);
+                return cached;
             }
             viewCache.remove(renderType);
         } else if (untexturedCache.contains(renderType)) {
-            return 0L;
+            return null;
         }
         try {
             PreparedRenderType prepared = renderType.prepare();
@@ -283,7 +357,7 @@ public final class RtEntityTextures {
             }
             if (chosen != null && !chosen.isClosed()) {
                 viewCache.put(renderType, chosen);
-                return vkImageView(chosen);
+                return chosen;
             }
             if (chosen == null) {
                 untexturedCache.add(renderType);
@@ -294,7 +368,7 @@ public final class RtEntityTextures {
                 CausticaMod.LOGGER.warn("RT entity texture resolution failed for {}", renderType, t);
             }
         }
-        return 0L;
+        return null;
     }
 
     private static long vkImageView(GpuTextureView view) {

@@ -77,7 +77,7 @@ float karisWeight(float3 color) {
 // 13-tap downsample. The five overlapping 2x2 groups (one centred, four at the corners) reconstruct a
 // smooth kernel with no sample landing on the destination lattice, which is what keeps the chain free of
 // the aliasing pattern a plain 2x2 box downsample produces.
-float3 downsample(float2 uv, float2 srcTexel, bool karis) {
+float3 downsample(float2 uv, float2 srcTexel, bool karis, float exposure) {
     float3 a = tap(uv, float2(-2.0, -2.0) * srcTexel);
     float3 b = tap(uv, float2( 0.0, -2.0) * srcTexel);
     float3 c = tap(uv, float2( 2.0, -2.0) * srcTexel);
@@ -92,11 +92,11 @@ float3 downsample(float2 uv, float2 srcTexel, bool karis) {
     float3 l = tap(uv, float2( 0.0,  2.0) * srcTexel);
     float3 m = tap(uv, float2( 2.0,  2.0) * srcTexel);
 
-    float3 group0 = (d + e + i + j) * 0.25; // centre 2x2
-    float3 group1 = (a + b + g + f) * 0.25;
-    float3 group2 = (b + c + h + g) * 0.25;
-    float3 group3 = (f + g + l + k) * 0.25;
-    float3 group4 = (g + h + m + l) * 0.25;
+    float3 group0 = (d + e + i + j) * (0.25 * exposure); // centre 2x2
+    float3 group1 = (a + b + g + f) * (0.25 * exposure);
+    float3 group2 = (b + c + h + g) * (0.25 * exposure);
+    float3 group3 = (f + g + l + k) * (0.25 * exposure);
+    float3 group4 = (g + h + m + l) * (0.25 * exposure);
 
     if (!karis) {
         return group0 * 0.5 + (group1 + group2 + group3 + group4) * 0.125;
@@ -135,14 +135,14 @@ void main(uint3 dispatchId : SV_DispatchThreadID) {
     float2 uv = (float2(pixel) + 0.5) / float2(float(width), float(height));
 
     if (pc.mode == MODE_PREFILTER) {
-        // The pyramid works on EXPOSED values so the threshold is a display-referred decision (how far
-        // above mid-grey a highlight has to be), not one that drifts with the scene's absolute level.
+        // The pyramid works on EXPOSED values so both Karis weights and the threshold are display-referred
+        // decisions that stay invariant across preExposure changes.
         float rawExposure = exposureImage[int2(0, 0)];
         float exposure = (rawExposure > 0.0 && rawExposure < 1.0e30) ? rawExposure : 0.0;
-        float3 color = downsample(uv, srcTexel, true) * exposure;
+        float3 color = downsample(uv, srcTexel, true, exposure);
         dstImage[pixel] = float4(prefilter(color), 1.0);
     } else if (pc.mode == MODE_DOWNSAMPLE) {
-        dstImage[pixel] = float4(downsample(uv, srcTexel, false), 1.0);
+        dstImage[pixel] = float4(downsample(uv, srcTexel, false, 1.0), 1.0);
     } else {
         // In-place accumulate: this level already holds its own downsampled band, and the coarser level
         // tented up onto it adds the next-wider band. Summing on the way down the pyramid is what turns

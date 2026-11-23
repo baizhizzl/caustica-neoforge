@@ -128,6 +128,33 @@ public float3 applyWaterWaves(float3 nGeo, float2 worldXZ, float t, float footpr
     return nGeo.y >= 0.0 ? up : -up;
 }
 
+// Keep a wave-perturbed water normal facing the viewer and reflecting strictly above the geometric
+// surface plane so grazing air-side reflections never cross underwater while keeping airMedium().
+public float3 clampWaterWaveNormal(float3 nWave, float3 nGeo, float3 rd) {
+    float3 vdir = -rd;
+    float ndv = dot(nGeo, vdir);
+    if (ndv <= 1.0e-4) {
+        return nGeo;
+    }
+    float minRefl = min(0.005, 0.25 * ndv);
+    if (dot(nWave, vdir) >= 0.01 && dot(reflect(rd, nWave), nGeo) >= minRefl) {
+        return nWave;
+    }
+    float lo = 0.0;
+    float hi = 1.0;
+    [unroll]
+    for (int i = 0; i < 6; ++i) {
+        float mid = 0.5 * (lo + hi);
+        float3 cand = normalize(lerp(nGeo, nWave, mid));
+        if (dot(cand, vdir) >= 0.01 && dot(reflect(rd, cand), nGeo) >= minRefl) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    return normalize(lerp(nGeo, nWave, lo));
+}
+
 // ---- Water caustics. Light refracting through the waved surface converges/diverges before reaching an
 // underwater receiver. Evaluating the wave normal once at each finite-difference corner and refracting
 // with Cauchy's dispersion indices for water (n_R = 1.330, n_G = 1.334, n_B = 1.340) produces spectral

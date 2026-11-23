@@ -104,7 +104,8 @@ public final class RtFramePresenter {
             LongList swapchainImages, long[] presentSemaphores, int swapW, int swapH,
             long backbufferView, long srcImage, int srcW, int srcH, int generatedCount, boolean hdrBackbuffer) {
         pendingCount = 0;
-        if (failed || swapchain == 0L || srcImage == 0L || generatedCount <= 0) {
+        if (failed || swapchain == 0L || srcImage == 0L || generatedCount <= 0
+                || swapW <= 0 || swapH <= 0 || srcW <= 0 || srcH <= 0) {
             return;
         }
         try {
@@ -112,7 +113,7 @@ public final class RtFramePresenter {
             // so the ring cursor cannot wrap onto a semaphore still pending on the graphics queue.
             int minSemaphores = Math.max(swapchainImages.size() + 1, generatedCount * 4 + 2);
             ensureCapacity(device, minSemaphores, generatedCount);
-            boolean extentsMatch = swapW > 0 && swapH > 0 && swapW == srcW && swapH == srcH;
+            boolean extentsMatch = swapW == srcW && swapH == srcH;
             if (!extentsMatch) {
                 RtDlssFg.INSTANCE.requestHistoryReset();
             }
@@ -236,9 +237,12 @@ public final class RtFramePresenter {
             long acquireSem, long presentSem) {
         VkCommandBuffer cmd = enc.allocateAndBeginTransientCommandBuffer();
         try (MemoryStack stack = MemoryStack.stackPush()) {
-            // Swapchain UNDEFINED -> TRANSFER_DST (stage/access values mirror MC's blitFromTexture).
+            // Swapchain UNDEFINED -> TRANSFER_DST: srcStageMask chains with the acquireSem wait stage.
             VkImageMemoryBarrier2.Buffer toDst = VkImageMemoryBarrier2.calloc(1, stack).sType$Default();
-            toDst.get(0).srcStageMask(0L).srcAccessMask(0L).dstStageMask(4096L).dstAccessMask(4096L)
+            toDst.get(0).srcStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .srcAccessMask(0L)
+                    .dstStageMask(KHRSynchronization2.VK_PIPELINE_STAGE_2_TRANSFER_BIT_KHR)
+                    .dstAccessMask(KHRSynchronization2.VK_ACCESS_2_TRANSFER_WRITE_BIT_KHR)
                     .oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
                     .srcQueueFamilyIndex(-1).dstQueueFamilyIndex(-1).image(dstImage);
             toDst.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1);
@@ -290,10 +294,15 @@ public final class RtFramePresenter {
             return;
         }
         if (acquireSemaphores.length > 0) {
-            VK10.vkDeviceWaitIdle(device.vkDevice());
+            RtContext ctx = RtContext.currentOrNull();
+            if (ctx != null) {
+                ctx.waitIdle();
+            } else {
+                VK10.vkDeviceWaitIdle(device.vkDevice());
+            }
         }
-        destroy(device);
-        acquireSemaphores = new long[semaphoreCount];
+        long[] next = new long[semaphoreCount];
+        int created = 0;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkSemaphoreCreateInfo sci = VkSemaphoreCreateInfo.calloc(stack).sType$Default();
             LongBuffer p = stack.mallocLong(1);
@@ -301,9 +310,17 @@ public final class RtFramePresenter {
                 if (VK10.vkCreateSemaphore(device.vkDevice(), sci, null, p) != VK10.VK_SUCCESS) {
                     throw new IllegalStateException("vkCreateSemaphore(fg acquire) failed");
                 }
-                acquireSemaphores[i] = p.get(0);
+                next[i] = p.get(0);
+                created = i + 1;
             }
+        } catch (Throwable t) {
+            for (int i = 0; i < created; i++) {
+                VK10.vkDestroySemaphore(device.vkDevice(), next[i], null);
+            }
+            throw t;
         }
+        destroy(device);
+        acquireSemaphores = next;
         acquireCursor = 0;
     }
 

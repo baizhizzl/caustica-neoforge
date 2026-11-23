@@ -76,6 +76,7 @@ final class RtTerrainMesher {
             capture.spriteFinder = spriteFinder;
             capture.cutoutLeaves = cutoutLeaves;
             capture.discardBlock(); // defensive: a prior job's throw could leave buffered quads
+            fluidCapture.spriteFinder = spriteFinder;
             fluidCapture.reset();
             mesh.reset();
         }
@@ -207,9 +208,10 @@ final class RtTerrainMesher {
                     // (15) rides the emission channel (water emits 0).
                     FluidState fluid = state.getFluidState();
                     if (!fluid.isEmpty()) {
+                        fluidCapture.state = state;
                         fluidCapture.emission = state.getLightEmission(region, m) / 15f;
-                        // Water is the dielectric fluid; lava stays an opaque emitter. Tagged per-prim
-                        // so the path tracer can branch (see emitQuad).
+                        // Water is the dielectric fluid; lava stays an opaque emitter. Modded fluids
+                        // resolve through the material snapshot using their sprite and emission level.
                         fluidCapture.water = fluid.is(FluidTags.WATER);
                         fluidCapture.lava = fluid.is(FluidTags.LAVA);
                         RtFluidMesher.tesselate(region, m, fluidCapture, fluidModelSet, fluidRenderer, state, fluid);
@@ -457,7 +459,23 @@ final class RtTerrainMesher {
             float ex2 = q.x[2] - q.x[0], ey2 = q.y[2] - q.y[0], ez2 = q.z[2] - q.z[0];
             float nx = ey1 * ez2 - ez1 * ey2, ny = ez1 * ex2 - ex1 * ez2, nz = ex1 * ey2 - ey1 * ex2;
             float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
-            if (len > 1.0e-6f) { nx /= len; ny /= len; nz /= len; }
+            if (len <= 1.0e-6f) {
+                float fx1 = q.x[2] - q.x[0], fy1 = q.y[2] - q.y[0], fz1 = q.z[2] - q.z[0];
+                float fx2 = q.x[3] - q.x[0], fy2 = q.y[3] - q.y[0], fz2 = q.z[3] - q.z[0];
+                nx = fy1 * fz2 - fz1 * fy2; ny = fz1 * fx2 - fx1 * fz2; nz = fx1 * fy2 - fy1 * fx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
+            if (len <= 1.0e-6f) {
+                float gx1 = q.x[2] - q.x[1], gy1 = q.y[2] - q.y[1], gz1 = q.z[2] - q.z[1];
+                float gx2 = q.x[3] - q.x[1], gy2 = q.y[3] - q.y[1], gz2 = q.z[3] - q.z[1];
+                nx = gy1 * gz2 - gz1 * gy2; ny = gz1 * gx2 - gx1 * gz2; nz = gx1 * gy2 - gy1 * gx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
+            if (len > 1.0e-6f) {
+                nx /= len; ny /= len; nz /= len;
+            } else {
+                nx = 0f; ny = 1f; nz = 0f;
+            }
             q.nx = nx; q.ny = ny; q.nz = nz;
 
             q.cutout = layer != ChunkSectionLayer.SOLID;
@@ -526,7 +544,7 @@ final class RtTerrainMesher {
                 }
             }
             q.sprite = sprite;
-            q.materialId = materials.resolve(sprite, state, q.translucent);
+            q.materialId = materials.resolve(sprite, state, q.translucent, q.emission > 0f);
         }
 
         /** The cull predicate returns true when the nominal face should be discarded. */
@@ -747,6 +765,8 @@ final class RtTerrainMesher {
     private static final class FluidCapture implements VertexConsumer, FluidRenderer.Output {
         SectionMesh cur;     // set before each section
         RtMaterialRegistry.Snapshot materials;
+        AtlasSpriteFinder spriteFinder;
+        BlockState state;    // current fluid block state
         float emission;      // set per fluid block (lava = 1, water = 0)
         boolean water;       // set per fluid block: true for water (dielectric), false for opaque fluids
         boolean lava;        // set per fluid block: true for lava (keeps untinted emission color)
@@ -794,8 +814,8 @@ final class RtTerrainMesher {
 
         private void emitQuad() {
             // Water gets its own geometry → water bucket: its any-hit only passes shadow rays through (the
-            // closest-hit does the dielectric), classified by geometry index with no memory load. Lava is an
-            // opaque emitter → opaque bucket (no any-hit at all).
+            // closest-hit does the dielectric), classified by geometry index with no memory load. Lava and
+            // other opaque fluids use the opaque bucket (no any-hit at all).
             Geom g = water ? cur.water() : cur.opaque();
             FloatArrayList verts = g.verts;
             IntArrayList idx = g.idx;
@@ -821,12 +841,45 @@ final class RtTerrainMesher {
             float ny = ez1 * ex2 - ex1 * ez2;
             float nz = ex1 * ey2 - ey1 * ex2;
             float len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            if (len <= 1.0e-6f) {
+                float fx1 = qx[2] - qx[0], fy1 = qy[2] - qy[0], fz1 = qz[2] - qz[0];
+                float fx2 = qx[3] - qx[0], fy2 = qy[3] - qy[0], fz2 = qz[3] - qz[0];
+                nx = fy1 * fz2 - fz1 * fy2;
+                ny = fz1 * fx2 - fx1 * fz2;
+                nz = fx1 * fy2 - fy1 * fx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
+            if (len <= 1.0e-6f) {
+                float gx1 = qx[2] - qx[1], gy1 = qy[2] - qy[1], gz1 = qz[2] - qz[1];
+                float gx2 = qx[3] - qx[1], gy2 = qy[3] - qy[1], gz2 = qz[3] - qz[1];
+                nx = gy1 * gz2 - gz1 * gy2;
+                ny = gz1 * gx2 - gx1 * gz2;
+                nz = gx1 * gy2 - gy1 * gx2;
+                len = (float) Math.sqrt(nx * nx + ny * ny + nz * nz);
+            }
             if (len > 1.0e-6f) {
                 nx /= len;
                 ny /= len;
                 nz /= len;
+            } else {
+                nx = 0f;
+                ny = 1f;
+                nz = 0f;
             }
-            int materialId = water ? materials.waterId() : materials.lavaId();
+            int materialId;
+            if (water) {
+                materialId = materials.waterId();
+            } else if (lava) {
+                materialId = materials.lavaId();
+            } else {
+                TextureAtlasSprite sprite = null;
+                if (spriteFinder != null) {
+                    float cu = (qu[0] + qu[1] + qu[2] + qu[3]) * 0.25f;
+                    float cv = (qv[0] + qv[1] + qv[2] + qv[3]) * 0.25f;
+                    sprite = spriteFinder.find(cu, cv);
+                }
+                materialId = materials.resolve(sprite, state, false, emission > 0f);
+            }
             // Biome/custom fluid tint: FluidTintSource bakes the fluid tint into the per-vertex colour,
             // so the average of the quad's four colours is this fluid body's tint. Water turns it into a
             // per-channel Beer-Lambert extinction; non-lava opaque fluids tint their albedo. Lava keeps a

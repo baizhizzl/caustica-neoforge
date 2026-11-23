@@ -155,7 +155,7 @@ public struct Medium {
 // accounts for the segment, and adding the air-haze profile inside it would scatter light in a vacuum
 // and attenuate the surface twice.
 public bool isAirMedium(Medium m) {
-    return !m.water && all(m.extinction <= 0.0);
+    return !m.water && abs(m.ior - 1.0) <= 1.0e-3 && all(m.extinction <= 0.0);
 }
 
 public struct MediumStack {

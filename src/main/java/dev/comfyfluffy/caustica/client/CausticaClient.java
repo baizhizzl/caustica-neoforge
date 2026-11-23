@@ -2,6 +2,7 @@ package dev.comfyfluffy.caustica.client;
 
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.renderpearl.backend.vulkan.VulkanDevice;
+import dev.comfyfluffy.caustica.CausticaConfig;
 import dev.comfyfluffy.caustica.CausticaMod;
 import dev.comfyfluffy.caustica.compat.AtlasSpriteFinder;
 import dev.comfyfluffy.caustica.mixin.GpuDeviceAccessor;
@@ -19,6 +20,7 @@ import dev.comfyfluffy.caustica.rt.material.RtBlockMaterials;
 import dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg;
 import dev.comfyfluffy.caustica.rt.terrain.RtTerrain;
 import dev.comfyfluffy.caustica.rt.terrain.RtWorkerPool;
+import net.minecraft.client.Minecraft;
 import net.neoforged.api.distmarker.Dist;
 import net.neoforged.bus.api.IEventBus;
 import net.neoforged.neoforge.client.event.RegisterDebugEntriesEvent;
@@ -40,15 +42,23 @@ public final class CausticaClient {
     }
 
     private static void onClientTick(ClientTickEvent.Pre event) {
-		if (!VanillaRenderController.rtRuntimeWorkRequested()) {
-			if (rtInitDone || RtContext.currentOrNull() != null || NgxRuntime.INSTANCE.isInitialized()) {
+		if (!VanillaRenderController.rtRuntimeWorkRequested() || !RtDeviceBringup.isRtReady()
+				|| RtComposite.INSTANCE.hasFailed()) {
+			if (CausticaConfig.Rt.Hdr.swapchainPqActive()) {
+				Minecraft minecraft = Minecraft.getInstance();
+				if (minecraft != null) {
+					minecraft.invalidateSurfaceConfiguration();
+				}
+			}
+			if (!VanillaRenderController.rtRuntimeWorkRequested()
+					&& (rtInitDone || RtContext.currentOrNull() != null || NgxRuntime.INSTANCE.isInitialized())) {
 				shutdownRt();
 			}
 			return;
 		}
 
 		// Bring up the RT device/context once; terrain residency + the composite follow below.
-		if (!rtInitDone && RtDeviceBringup.rtRequested()) {
+		if (!rtInitDone && RtDeviceBringup.isRtReady()) {
 			RtContext ctx = RtContext.get();
 			if (ctx != null) {
 				rtInitDone = true;
@@ -83,9 +93,14 @@ public final class CausticaClient {
 		WorldRenderScaler.INSTANCE.destroy();
 		RtUiOverlay.destroy(); // GUI redirect is not gated by rtInitDone; always release its TextureTarget
 		RtContext ctx = RtContext.currentOrNull();
+		VulkanDevice device = ctx != null ? ctx.device() : currentVulkanDevice();
 		if (!rtInitDone && ctx == null && !NgxRuntime.INSTANCE.isInitialized()) {
 			RtWorkerPool.INSTANCE.shutdown();
 			AtlasSpriteFinder.clearCache();
+			if (device != null) {
+				RtFramePresenter.INSTANCE.destroy(device);
+				RtReflex.INSTANCE.destroy(device.vkDevice());
+			}
 			return;
 		}
 
@@ -103,7 +118,6 @@ public final class CausticaClient {
 		RtEntityTextures.INSTANCE.reset();
 		RtBlockMaterials.INSTANCE.destroy();
 		RtDlssFg.INSTANCE.destroy();
-		VulkanDevice device = ctx != null ? ctx.device() : currentVulkanDevice();
 		if (device != null) {
 			RtFramePresenter.INSTANCE.destroy(device);
 			RtReflex.INSTANCE.destroy(device.vkDevice());

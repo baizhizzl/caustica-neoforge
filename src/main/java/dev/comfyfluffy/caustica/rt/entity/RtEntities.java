@@ -21,6 +21,7 @@ import net.minecraft.client.renderer.state.level.QuadParticleRenderState;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.Display;
 import net.minecraft.world.entity.EquipmentSlot;
@@ -284,7 +285,7 @@ public final class RtEntities {
     private static final class EntityPrev {
         float[] verts = new float[0];
         int size;
-        float anchorX, anchorY, anchorZ;
+        double anchorX, anchorY, anchorZ;
     }
 
     private long retainedGeometryBytes;
@@ -763,9 +764,9 @@ public final class RtEntities {
             int baseMask = firstPersonSelf ? MASK_ALL & ~MASK_PRIMARY : MASK_ALL;
             int excludeBit = RtDynamicLights.INSTANCE.excludeBitForEntity(entity.getId());
             int mask = excludeBit != 0 ? baseMask & ~excludeBit : baseMask;
-            float ix;
-            float iy;
-            float iz;
+            double ix;
+            double iy;
+            double iz;
             int id = entity.getId();
             EntityPrev prev = prevVerts.get(id);
             capture.reset(prev != null ? prev.size / 3 : 0);
@@ -779,9 +780,9 @@ public final class RtEntities {
                 }
                 // Derive placement from the extracted state so the submitted pose and TLAS anchor use the
                 // same interpolation result.
-                ix = (float) state.x;
-                iy = (float) state.y;
-                iz = (float) state.z;
+                ix = state.x;
+                iy = state.y;
+                iz = state.z;
                 // extractEntity already ran EntityRenderer.extractNameTags (shouldShowName, crosshair-look,
                 // distance cutoff, the attachment point) as a normal part of building the render state — no
                 // need to reimplement any of that here, just read the result. Name tags billboard to face
@@ -839,6 +840,9 @@ public final class RtEntities {
             if (capture.isEmpty()) {
                 continue; // non-model entity (arrow/etc.) — no body geometry captured
             }
+            float relX = (float) (ix - rbx);
+            float relY = (float) (iy - rby);
+            float relZ = (float) (iz - rbz);
             if (glow && !firstPersonSelf) {
                 // Vanilla never draws the local player's own body in first person (no model to outline —
                 // only the held-item hand), so it never shows the Glowing outline on yourself either. Our
@@ -847,7 +851,7 @@ public final class RtEntities {
                 int glowColor = collector.outlineColor();
                 if (glowColor != 0) {
                     glowBatches.add(new GlowEntity(copyTranslatedVertices(capture.verts,
-                            ix - rbx, iy - rby, iz - rbz), capture.idx.toIntArray(), glowColor));
+                            relX, relY, relZ), capture.idx.toIntArray(), glowColor));
                 }
             }
             // Motion vs last frame's posed mesh. New/topology-changed entities get one frame of camera-only
@@ -865,13 +869,13 @@ public final class RtEntities {
             boolean reused;
             long reuseStart = RtFrameStats.FRAME.startStage();
             try {
-                reused = appendRigidReuse(ctx, build, motion, id, mask, ix - rbx, iy - rby, iz - rbz);
+                reused = appendRigidReuse(ctx, build, motion, id, mask, relX, relY, relZ);
             } finally {
                 RtFrameStats.FRAME.endStage("entity.capture.rigidReuse", reuseStart);
             }
             if (!reused) {
                 appendCapture(ctx, build, motion, id, ENTITY_BIT, mask,
-                        translationTransform(ix - rbx, iy - rby, iz - rbz));
+                        translationTransform(relX, relY, relZ));
             }
             build.logicalCount++;
             RtFrameStats.FRAME.count("entitiesCaptured", 1);
@@ -911,7 +915,7 @@ public final class RtEntities {
      * here just hides occluded tags, a simplification to avoid a second draw/blend mode; revisit if that
      * turns out to look wrong in practice.
      */
-    private void captureNameTag(ClientLevel level, EntityRenderState state, float ix, float iy, float iz,
+    private void captureNameTag(ClientLevel level, EntityRenderState state, double ix, double iy, double iz,
                                  int rbx, int rby, int rbz) {
         Vec3 attach = state.nameTagAttachment;
         if (attach == null) {
@@ -929,7 +933,7 @@ public final class RtEntities {
             return; // a block is between the camera and the tag
         }
         nameTagBatches.add(new NameTagEntity(state.nameTag,
-                (float) wx - rbx, (float) wy - rby, (float) wz - rbz));
+                (float) (wx - rbx), (float) (wy - rby), (float) (wz - rbz)));
     }
 
     /**
@@ -939,15 +943,15 @@ public final class RtEntities {
      * buffer directly.
      */
     private Motion uploadVertexMotion(RtContext ctx, FrameBuild build, FloatArrayList cur,
-                                      EntityPrev prev, float anchorX, float anchorY, float anchorZ) {
+                                      EntityPrev prev, double anchorX, double anchorY, double anchorZ) {
         if (prev == null || prev.size != cur.size()) {
             return NO_MOTION;
         }
         float[] curVerts = cur.elements();
         float[] prevVerts = prev.verts;
-        float sx = anchorX - prev.anchorX;
-        float sy = anchorY - prev.anchorY;
-        float sz = anchorZ - prev.anchorZ;
+        float sx = (float) (anchorX - prev.anchorX);
+        float sy = (float) (anchorY - prev.anchorY);
+        float sz = (float) (anchorZ - prev.anchorZ);
         int vc = cur.size() / 3;
         if (vc == 0) {
             return NO_MOTION;
@@ -988,7 +992,7 @@ public final class RtEntities {
     }
 
     private static EntityPrev storeEntityPrev(EntityPrev prev, FloatArrayList cur,
-                                              float anchorX, float anchorY, float anchorZ) {
+                                              double anchorX, double anchorY, double anchorZ) {
         EntityPrev out = prev != null ? prev : new EntityPrev();
         int size = cur.size();
         if (out.verts.length < size) {
@@ -1087,8 +1091,10 @@ public final class RtEntities {
                         continue; // nothing captured for this particle
                     }
                     particleCenter(vertBefore, vertAfter, particleCenterScratch);
-                    // pointInFrustum wants the world position: rebased center + rebase origin.
-                    if (!frustum.pointInFrustum(particleCenterScratch[0] + rbx, particleCenterScratch[1] + rby, particleCenterScratch[2] + rbz)) {
+                    // pointInFrustum wants the world position: rebased center + rebase origin (in double).
+                    if (!frustum.pointInFrustum((double) particleCenterScratch[0] + rbx,
+                            (double) particleCenterScratch[1] + rby,
+                            (double) particleCenterScratch[2] + rbz)) {
                         capture.verts.size(vb); // off-screen → truncate this particle back out (clean quad boundary)
                         capture.idx.size(ib);
                         capture.uvList.size(ub);
@@ -1198,8 +1204,9 @@ public final class RtEntities {
         BlockEntityRenderDispatcher beDispatcher = mc.getBlockEntityRenderDispatcher();
         beDispatcher.prepare(cameraState.pos); // sets the camera for shouldRender / extract
         long now = RtComposite.frameCounter();
-        int pcx = rbx >> 4, pcz = rbz >> 4;
         Vec3 cam = cameraState.pos;
+        int pcx = Mth.floor(cam.x) >> 4;
+        int pcz = Mth.floor(cam.z) >> 4;
         List<BeCandidate> candidates = beCandidates;
         for (int i = 0; i < candidates.size(); i++) {
             BeCandidate candidate = candidates.get(i);

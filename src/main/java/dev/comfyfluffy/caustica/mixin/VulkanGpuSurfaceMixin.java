@@ -123,20 +123,26 @@ public abstract class VulkanGpuSurfaceMixin {
 		}
 	}
 
-	/** Discover PQ capability during construction and select PQ only when HDR starts enabled. */
+	/** Discover PQ capability during construction and select PQ only when HDR and RT are both active. */
 	@Inject(method = "pickSwapchainSurfaceFormat", at = @At("HEAD"), cancellable = true)
 	private void caustica$pickPqFormat(VkSurfaceFormatKHR.Buffer formats, CallbackInfoReturnable<VkSurfaceFormatKHR> cir) {
 		VkSurfaceFormatKHR pq = caustica$findPq(formats);
 		CausticaConfig.Rt.Hdr.setSwapchainPqAvailable(pq != null);
 		this.caustica$colorSpace = 0;
 		CausticaConfig.Rt.Hdr.setSwapchainPqActive(false);
-		if (CausticaConfig.Rt.Hdr.ENABLED.value() && pq != null) {
+		if (caustica$pqWanted() && pq != null) {
 			this.caustica$colorSpace = VK_COLOR_SPACE_HDR10_ST2084_EXT;
 			CausticaConfig.Rt.Hdr.setSwapchainPqActive(true);
 			CausticaMod.LOGGER.info("HDR: surface supports PQ (format={}, colorSpace=HDR10_ST2084); "
 					+ "creating the initial swapchain in PQ", pq.format());
 			cir.setReturnValue(pq);
 		}
+	}
+
+	/** Clear Reflex's cached swapchain handle before surface teardown destroys the underlying swapchain. */
+	@Inject(method = "close", at = @At("HEAD"))
+	private void caustica$invalidateReflexOnClose(CallbackInfo ci) {
+		RtReflex.INSTANCE.invalidateSwapchain();
 	}
 
 	/**
@@ -147,6 +153,8 @@ public abstract class VulkanGpuSurfaceMixin {
 	 */
 	@Inject(method = "configure", at = @At("HEAD"))
 	private void caustica$refreshFormatForConfigure(GpuSurface.Configuration config, CallbackInfo ci) {
+		// Invalidate before configure() destroys or replaces the existing swapchain handle.
+		RtReflex.INSTANCE.invalidateSwapchain();
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			IntBuffer count = stack.callocInt(1);
 			int countResult = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(
@@ -159,7 +167,7 @@ public abstract class VulkanGpuSurfaceMixin {
 			VkSurfaceFormatKHR.Buffer formats = VkSurfaceFormatKHR.calloc(count.get(0), stack);
 			int formatsResult = KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(
 					this.device.vkDevice().getPhysicalDevice(), this.surface, count, formats);
-			if (formatsResult != VK10.VK_SUCCESS) {
+			if ((formatsResult != VK10.VK_SUCCESS && formatsResult != VK10.VK_INCOMPLETE) || count.get(0) <= 0) {
 				CausticaMod.LOGGER.warn("HDR: failed to read swapchain formats during recreation: {}",
 						formatsResult);
 				return;
@@ -169,7 +177,7 @@ public abstract class VulkanGpuSurfaceMixin {
 			VkSurfaceFormatKHR pq = caustica$findPq(formats);
 			VkSurfaceFormatKHR sdr = caustica$findSdr(formats);
 			CausticaConfig.Rt.Hdr.setSwapchainPqAvailable(pq != null);
-			boolean usePq = CausticaConfig.Rt.Hdr.ENABLED.value() && pq != null;
+			boolean usePq = caustica$pqWanted() && pq != null;
 			if (!usePq && sdr == null && pq != null) {
 				// Extremely unusual, but safer than destroying the only viable presentation path.
 				CausticaMod.LOGGER.warn("HDR: surface exposes PQ but no compatible native-SDR format; "
@@ -195,8 +203,16 @@ public abstract class VulkanGpuSurfaceMixin {
 	}
 
 	@Unique
+	private static boolean caustica$pqWanted() {
+		return CausticaConfig.Rt.Hdr.ENABLED.value()
+				&& RtComposite.enabled()
+				&& RtDeviceBringup.isRtReady()
+				&& !RtComposite.INSTANCE.hasFailed();
+	}
+
+	@Unique
 	private static VkSurfaceFormatKHR caustica$findPq(VkSurfaceFormatKHR.Buffer formats) {
-		for (int i = 0; i < formats.capacity(); i++) {
+		for (int i = 0; i < formats.limit(); i++) {
 			VkSurfaceFormatKHR f = formats.get(i);
 			if (f.colorSpace() == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
 				return f;
@@ -207,7 +223,7 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	@Unique
 	private static VkSurfaceFormatKHR caustica$findSdr(VkSurfaceFormatKHR.Buffer formats) {
-		for (int i = 0; i < formats.capacity(); i++) {
+		for (int i = 0; i < formats.limit(); i++) {
 			VkSurfaceFormatKHR f = formats.get(i);
 			if (f.colorSpace() == 0 && (f.format() == 37 || f.format() == 44)) {
 				return f;
@@ -227,13 +243,14 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	/**
 	 * Reserve enough swapchain images for the FG batch within surface limits. Chain Reflex latency state
-	 * into pNext without disturbing any existing extension chain; Vulkan consumes this stack data in-call.
+	 * into pNext without disturbing any existing extension chain; restore pNext before leaving the stack scope.
 	 */
 	@Redirect(method = "configure",
 			at = @At(value = "INVOKE",
 					target = "Lorg/lwjgl/vulkan/KHRSwapchain;vkCreateSwapchainKHR(Lorg/lwjgl/vulkan/VkDevice;Lorg/lwjgl/vulkan/VkSwapchainCreateInfoKHR;Lorg/lwjgl/vulkan/VkAllocationCallbacks;Ljava/nio/LongBuffer;)I"))
 	private int caustica$createSwapchainWithReflex(VkDevice device, VkSwapchainCreateInfoKHR pCreateInfo,
 			VkAllocationCallbacks pAllocator, LongBuffer pSwapchain) {
+		long origNext = pCreateInfo.pNext();
 		try (MemoryStack stack = MemoryStack.stackPush()) {
 			VkSurfaceCapabilitiesKHR caps = VkSurfaceCapabilitiesKHR.calloc(stack);
 			int result = KHRSurface.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device.getPhysicalDevice(),
@@ -251,11 +268,13 @@ public abstract class VulkanGpuSurfaceMixin {
 			}
 			if (RtDeviceBringup.reflexEnabled()) {
 				VkSwapchainLatencyCreateInfoNV latency = VkSwapchainLatencyCreateInfoNV.calloc(stack).sType$Default();
-				latency.pNext(pCreateInfo.pNext());
+				latency.pNext(origNext);
 				latency.latencyModeEnable(true);
 				pCreateInfo.pNext(latency.address());
 			}
 			return KHRSwapchain.vkCreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+		} finally {
+			pCreateInfo.pNext(origNext);
 		}
 	}
 
@@ -286,7 +305,7 @@ public abstract class VulkanGpuSurfaceMixin {
 
 	/**
 	 * Emit PRESENT_START/END markers around the real frame's present and, when
-	 * {@code VK_KHR_present_id} is enabled) chaining a {@code VkPresentIdKHR} onto it so the marker's
+	 * {@code VK_KHR_present_id} is enabled, chain a {@code VkPresentIdKHR} onto it so the marker's
 	 * {@code presentID} correlates with this exact present call. The FG-generated extra presents
 	 * ({@link RtFramePresenter}) are deliberately NOT marked/present-id'd — Reflex paces/measures the real
 	 * frame only. No-op passthrough unless Reflex has successfully applied sleep mode for this swapchain.
@@ -300,22 +319,21 @@ public abstract class VulkanGpuSurfaceMixin {
 			return KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
 		}
 		VkDevice vkDevice = this.device.vkDevice();
-		// Own counter (not currentSimFrameId()): Minecraft can present outside the normal tick loop (e.g.
-		// Minecraft.setScreenAndShow's synchronous redraw when opening a world), so presentID must advance on
-		// every actual vkQueuePresentKHR call, not just once per sleep()/runTick — otherwise a stale, already-
-		// used id gets resent and VUID-VkPresentIdKHR-presentIds-04999 fires.
-		long presentId = RtReflex.INSTANCE.advancePresentId();
+		long presentId = RtReflex.INSTANCE.consumePresentId();
 		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_RENDERSUBMIT_END, presentId);
 		RtReflex.INSTANCE.marker(vkDevice, this.swapchain, RtReflex.MARKER_PRESENT_START, presentId);
 		int result;
 		if (RtDeviceBringup.presentIdEnabled()) {
+			long origNext = presentInfo.pNext();
 			try (MemoryStack stack = MemoryStack.stackPush()) {
 				VkPresentIdKHR vkPresentId = VkPresentIdKHR.calloc(stack).sType$Default()
-						.pNext(presentInfo.pNext())
+						.pNext(origNext)
 						.swapchainCount(1)
 						.pPresentIds(stack.longs(presentId));
 				presentInfo.pNext(vkPresentId.address());
 				result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
+			} finally {
+				presentInfo.pNext(origNext);
 			}
 		} else {
 			result = KHRSwapchain.vkQueuePresentKHR(queue, presentInfo);
@@ -423,13 +441,15 @@ public abstract class VulkanGpuSurfaceMixin {
 		}
 		long hdrView = rt.hdrBackbufferView();
 		long hdrImage = rt.hdrBackbufferImage();
-		if (hdrImage == 0L) {
+		int hdrW = rt.hdrBackbufferWidth();
+		int hdrH = rt.hdrBackbufferHeight();
+		if (hdrImage == 0L || hdrW <= 0 || hdrH <= 0) {
 			return;
 		}
 		int generatedCount = dev.comfyfluffy.caustica.rt.pipeline.RtDlssFg.INSTANCE.effectiveMultiFrameCount();
 		RtFramePresenter.INSTANCE.prepareExtraFrames(enc, this.device, this.swapchain, this.swapchainImages,
 				this.presentSemaphores, this.swapchainWidth, this.swapchainHeight,
-				hdrView, hdrImage, this.swapchainWidth, this.swapchainHeight, generatedCount, true);
+				hdrView, hdrImage, hdrW, hdrH, generatedCount, true);
 	}
 
 	// Present the FG-generated frame(s) acquired/recorded at blitFromTexture TAIL — at present() HEAD, after

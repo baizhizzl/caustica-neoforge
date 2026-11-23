@@ -266,6 +266,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                     directCubeCounts = cuboidEmitter.emit(directTemplate, poseStack, capture, color);
                 } else {
                     model.renderToBuffer(poseStack, capture, lightCoords, overlayCoords, color);
+                    capture.finishStreamedVertices();
                 }
             } finally {
                 RtFrameStats.FRAME.endStage(directTemplate != null
@@ -293,6 +294,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
                 long parityStart = profileDynamicEntity ? RtFrameStats.FRAME.startStage() : 0L;
                 try {
                     model.renderToBuffer(poseStack, parityCapture, lightCoords, overlayCoords, color);
+                    parityCapture.finishStreamedVertices();
                     capture.assertSubmissionBitwiseIdentical(vertStart, idxStart, uvStart, primStart,
                             parityCapture, "model " + model.getClass().getName());
                     if (profileDynamicEntity) {
@@ -365,16 +367,18 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         boolean transmissive = q.materialInfo().layer() == ChunkSectionLayer.TRANSLUCENT;
         boolean stochasticAlpha = !transmissive && isTranslucent(q.materialInfo().itemRenderType());
         capture.currentAlphaBucket = alphaBucket(q.materialInfo().layer(), stochasticAlpha);
+        int quadEmission = q.materialInfo().lightEmission();
+        boolean emitting = activeSubmittedItemLight > 0 || quadEmission > 0
+                || (activeSubmittedItemState != null && activeSubmittedItemState.getLightEmission() > 0);
         if (activeSubmittedItemState != null) {
-            setBlockSpriteMaterial(sprite, activeSubmittedItemState, transmissive, stochasticAlpha,
-                    activeSubmittedItemLight > 0 || activeSubmittedItemState.getLightEmission() > 0);
+            setBlockSpriteMaterial(sprite, activeSubmittedItemState, transmissive, stochasticAlpha, emitting);
         } else {
             setSpriteMaterial(sprite, transmissive ? RtMaterials.Profile.GLASS : RtMaterials.Profile.DEFAULT,
-                    transmissive, stochasticAlpha, activeSubmittedItemLight > 0);
+                    transmissive, stochasticAlpha, emitting);
         }
         capture.currentOrder = 0; // baked-quad paths never stack decal layers
         int color = ARGB.multiply(averageBakedColor(q), tintColor(q.materialInfo().tintIndex(), tintLayers));
-        float emission = Math.max(activeSubmittedItemLight, q.materialInfo().lightEmission()) / 15f;
+        float emission = Math.max(activeSubmittedItemLight, quadEmission) / 15f;
         capture.addBakedQuad(pose, q, color, emission);
     }
 
@@ -426,6 +430,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         textGlyphVisitor.pose = poseStack.last().pose();
         textGlyphVisitor.lightCoords = lightCoords;
         textGlyphVisitor.displayMode = displayMode;
+        textGlyphVisitor.order = 0;
         textGlyphVisitor.acceptRenderable(Minecraft.getInstance().font.prepareBackground(x0, y0, x1, y1, color));
     }
 
@@ -584,16 +589,19 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         textGlyphVisitor.lightCoords = lightCoords;
         if (outlineColor == 0) {
             textGlyphVisitor.displayMode = displayMode;
+            textGlyphVisitor.order = 0;
             font.prepareText(string, x, y, color, dropShadow, false, backgroundColor).visit(textGlyphVisitor);
         } else {
             // Same two-pass outline technique as vanilla: an 8-directional expanded copy first (flat,
-            // NORMAL), then the real text on top with a polygon-offset display mode so it doesn't z-fight
-            // the outline it's sitting on.
+            // NORMAL), then the real text on top with order=1 so ray tracing separates the coplanar
+            // foreground glyphs from the outline along the glyph normal without Z-fighting.
             Font.PreparedText outline = font.prepare8xTextOutline(string, x, y, outlineColor);
             Font.PreparedText text = font.prepareText(string, x, y, color, false, false, 0);
             textGlyphVisitor.displayMode = Font.DisplayMode.NORMAL;
+            textGlyphVisitor.order = 0;
             outline.visit(textGlyphVisitor);
             textGlyphVisitor.displayMode = Font.DisplayMode.POLYGON_OFFSET;
+            textGlyphVisitor.order = 1;
             text.visit(textGlyphVisitor);
         }
     }
@@ -603,6 +611,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         Matrix4f pose;
         int lightCoords;
         Font.DisplayMode displayMode;
+        int order;
 
         @Override
         public void acceptRenderable(TextRenderable renderable) {
@@ -611,7 +620,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             capture.currentAlphaBucket = alphaBucket(renderType);
             capture.currentTexSlot = RtEntityTextures.INSTANCE.slotFor(renderType);
             capture.currentMaterialId = RtMaterialRegistry.INSTANCE.entityFallbackId(stochasticAlpha);
-            capture.currentOrder = 0;
+            capture.currentOrder = order;
             capture.clearUvRemap(); // glyph U/V are already atlas-space
             renderable.render(pose, textVertexConsumer, lightCoords, false);
         }
@@ -958,7 +967,8 @@ public final class RtEntityCollector implements SubmitNodeCollector {
         int stateEmission = state != null
                 ? (view != null && pos != null ? state.getLightEmission(view, pos) : state.getLightEmission())
                 : 0;
-        boolean emitting = stateEmission > 0;
+        int quadEmission = quad.materialInfo().lightEmission();
+        boolean emitting = stateEmission > 0 || quadEmission > 0;
         if (state != null) {
             setBlockSpriteMaterial(sprite, state, transmissive, stochasticAlpha, emitting);
         } else {
@@ -996,7 +1006,7 @@ public final class RtEntityCollector implements SubmitNodeCollector {
             }
         }
         int color = ARGB.multiply(averageBakedColor(quad), tint);
-        float emission = Math.max(stateEmission, quad.materialInfo().lightEmission()) / 15f;
+        float emission = Math.max(stateEmission, quadEmission) / 15f;
         capture.addDirectQuad(meshX, meshY, meshZ, meshU, meshV, 0f, 0f, 0f, color, emission);
     }
 

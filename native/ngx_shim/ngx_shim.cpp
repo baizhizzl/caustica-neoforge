@@ -24,6 +24,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cstdint>
+#include <mutex>
 
 // Lightweight diagnostic logging. The shim is loaded into the JVM via FFM and a
 // crash here surfaces only as a bare SIGSEGV on the Java side, so we can trace every
@@ -43,13 +45,14 @@ static const bool g_verbose = std::getenv("NGXSHIM_VERBOSE") != nullptr;
 // A fixed GUID-like project id (NGX requires GUID-like ids for CUSTOM engine).
 static const char* kProjectId = "b6f1e9c2-7a44-4d1e-9b3a-1f2c3d4e5a6b";
 
+static std::mutex g_mutex;
 static NVSDK_NGX_Parameter* g_capabilityParams = nullptr;
 static VkDevice g_device = VK_NULL_HANDLE;
 static int g_lastResult = 0;
+static uint64_t g_initGeneration = 0;
 
 // Logging sink wired into NVSDK_NGX_FeatureCommonInfo so the (closed) NGX core/SDK pipes its own
-// init diagnostics back to us. NGX init crashes deep inside the driver core on this setup; the core's
-// last log line before the fault is the best clue to *why*. Flush every line so nothing is lost.
+// init diagnostics back to us. Flush every line so nothing is lost.
 static void NVSDK_CONV ngxshim_log_callback(const char* message,
                                             NVSDK_NGX_Logging_Level level,
                                             NVSDK_NGX_Feature component) {
@@ -64,8 +67,21 @@ static void NVSDK_CONV ngxshim_log_callback(const char* message,
 struct DlssFeature {
     NVSDK_NGX_Handle* handle;
     NVSDK_NGX_Parameter* params;
-    bool ownsParams; // false when params is the shared capability block (DLSS-RR), so release leaves it
+    uint64_t generation;
+    float jitterX;
+    float jitterY;
+    bool ownsParams; // false when params is the shared capability block (DLSS-RR/DLSSG), so release leaves it
 };
+
+static bool featureValidLocked(const DlssFeature* f) {
+    if (!f || !f->handle || !f->params) {
+        return false;
+    }
+    if (!f->ownsParams && (f->generation != g_initGeneration || !g_capabilityParams)) {
+        return false;
+    }
+    return true;
+}
 
 static NVSDK_NGX_Resource_VK makeImageResource(VkImageView view, VkImage image, int format,
                                                unsigned int width, unsigned int height,
@@ -90,6 +106,7 @@ extern "C" {
 
 // Last NVSDK_NGX_Result observed, for diagnostics from the Java side.
 NGX_SHIM_EXPORT int ngxshim_last_result() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     return g_lastResult;
 }
 
@@ -98,6 +115,7 @@ NGX_SHIM_EXPORT int ngxshim_last_result() {
 // the names newline-joined into outBuf. wantDevice != 0 -> device extensions,
 // else instance extensions. Returns the count, or -1 on failure.
 NGX_SHIM_EXPORT int ngxshim_required_extensions(int wantDevice, char* outBuf, int bufLen) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("required_extensions: enter wantDevice=%d outBuf=%p bufLen=%d", wantDevice, (void*) outBuf, bufLen);
     unsigned int instanceCount = 0, deviceCount = 0;
     const char** instanceExts = nullptr;
@@ -142,6 +160,7 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
                                  VkInstance instance, VkPhysicalDevice physicalDevice, VkDevice device,
                                  void* getInstanceProcAddr, void* getDeviceProcAddr,
                                  const wchar_t* featureDllPath) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("init: enter appId=%llu dataPath=%p instance=%p physicalDevice=%p device=%p getInstanceProcAddr=%p getDeviceProcAddr=%p featureDllPath=%p",
             appId, (void*) dataPath, (void*) instance, (void*) physicalDevice, (void*) device,
             getInstanceProcAddr, getDeviceProcAddr, (void*) featureDllPath);
@@ -153,8 +172,6 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
     info.PathListInfo.Path = paths;
     info.PathListInfo.Length = featureDllPath ? 1u : 0u;
 
-    // Route the NGX core/SDK's own logging to our callback at the most verbose level so we capture
-    // exactly what it does (and the last thing it does before crashing) during init.
     if (g_verbose) {
         info.LoggingInfo.LoggingCallback = &ngxshim_log_callback;
         info.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_VERBOSE;
@@ -184,12 +201,15 @@ NGX_SHIM_EXPORT int ngxshim_init(unsigned long long appId, const wchar_t* dataPa
         g_capabilityParams = nullptr;
         NVSDK_NGX_VULKAN_Shutdown1(device);
         g_device = VK_NULL_HANDLE;
+    } else {
+        g_initGeneration++;
     }
     return (int) r;
 }
 
 // 1 if DLSS Super Resolution is available on this system, else 0.
 NGX_SHIM_EXPORT int ngxshim_dlss_available() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("dlss_available: enter g_capabilityParams=%p", (void*) g_capabilityParams);
     if (!g_capabilityParams) {
         return 0;
@@ -205,17 +225,22 @@ NGX_SHIM_EXPORT int ngxshim_dlss_available() {
 NGX_SHIM_EXPORT int ngxshim_query_optimal(unsigned int displayWidth, unsigned int displayHeight, int quality,
                                           unsigned int* outRenderWidth, unsigned int* outRenderHeight,
                                           float* outSharpness) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("query_optimal: enter display=%ux%u quality=%d g_capabilityParams=%p", displayWidth, displayHeight, quality, (void*) g_capabilityParams);
     if (!g_capabilityParams) {
-        return -1;
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
+        return g_lastResult;
+    }
+    if (!outRenderWidth || !outRenderHeight || !outSharpness) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        return g_lastResult;
     }
     unsigned int maxW = 0, maxH = 0, minW = 0, minH = 0;
     NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(
             g_capabilityParams, displayWidth, displayHeight, (NVSDK_NGX_PerfQuality_Value) quality,
             outRenderWidth, outRenderHeight, &maxW, &maxH, &minW, &minH, outSharpness);
     g_lastResult = (int) r;
-    NGX_LOG("query_optimal: exit r=0x%08x render=%ux%u", (unsigned) r,
-            outRenderWidth ? *outRenderWidth : 0u, outRenderHeight ? *outRenderHeight : 0u);
+    NGX_LOG("query_optimal: exit r=0x%08x render=%ux%u", (unsigned) r, *outRenderWidth, *outRenderHeight);
     return (int) r;
 }
 
@@ -227,6 +252,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
                                           unsigned int renderWidth, unsigned int renderHeight,
                                           unsigned int displayWidth, unsigned int displayHeight,
                                           int quality, int featureFlags, int renderPreset) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("create_dlss: enter cmd=%p render=%ux%u display=%ux%u quality=%d featureFlags=0x%x renderPreset=%d",
             (void*) cmd, renderWidth, renderHeight, displayWidth, displayHeight, quality, featureFlags, renderPreset);
     NVSDK_NGX_Parameter* params = nullptr;
@@ -275,6 +301,9 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlss(VkCommandBuffer cmd,
     }
     feature->handle = handle;
     feature->params = params;
+    feature->generation = g_initGeneration;
+    feature->jitterX = 0.0f;
+    feature->jitterY = 0.0f;
     feature->ownsParams = true; // allocated above; release destroys it
     NGX_LOG("create_dlss: exit feature=%p", (void*) feature);
     return feature;
@@ -292,13 +321,15 @@ NGX_SHIM_EXPORT int ngxshim_evaluate(VkCommandBuffer cmd, void* feature,
                                      unsigned int displayWidth, unsigned int displayHeight,
                                      float jitterX, float jitterY, float mvScaleX, float mvScaleY,
                                      int reset, float frameTimeMs) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("evaluate: enter cmd=%p feature=%p render=%ux%u display=%ux%u jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d frameTimeMs=%.3f",
             (void*) cmd, feature, renderWidth, renderHeight, displayWidth, displayHeight,
             jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
     DlssFeature* f = (DlssFeature*) feature;
-    if (!f) {
-        NGX_LOG("evaluate: null feature, returning -1");
-        return -1;
+    if (!featureValidLocked(f)) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        NGX_LOG("evaluate: invalid feature, returning 0x%08x", (unsigned) g_lastResult);
+        return g_lastResult;
     }
     NGX_LOG("evaluate: handle=%p params=%p colorView=%p depthView=%p mvView=%p outputView=%p",
             (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView, (void*) outputView);
@@ -332,6 +363,7 @@ NGX_SHIM_EXPORT int ngxshim_evaluate(VkCommandBuffer cmd, void* feature,
 
 // 1 if DLSS Ray Reconstruction (denoising) is available on this system, else 0.
 NGX_SHIM_EXPORT int ngxshim_dlssd_available() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("dlssd_available: enter g_capabilityParams=%p", (void*) g_capabilityParams);
     if (!g_capabilityParams) {
         return 0;
@@ -343,24 +375,27 @@ NGX_SHIM_EXPORT int ngxshim_dlssd_available() {
 }
 
 // Optimal render resolution + recommended sharpness for a display size and quality mode
-// (NVSDK_NGX_PerfQuality_Value), for the Ray Reconstruction (DLSSD) feature specifically — its
-// render:display ratios are queried from the DLSSD callback rather than assumed to match DLSS-SR's
-// (see NGX_DLSSD_GET_OPTIMAL_SETTINGS; create_dlssd below rejects a mismatched ratio at non-1:1
-// quality values with FAIL_InvalidParameter). Returns NVSDK_NGX_Result.
+// (NVSDK_NGX_PerfQuality_Value), for the Ray Reconstruction (DLSSD) feature specifically.
+// Returns NVSDK_NGX_Result.
 NGX_SHIM_EXPORT int ngxshim_query_optimal_dlssd(unsigned int displayWidth, unsigned int displayHeight, int quality,
                                                 unsigned int* outRenderWidth, unsigned int* outRenderHeight,
                                                 float* outSharpness) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("query_optimal_dlssd: enter display=%ux%u quality=%d g_capabilityParams=%p", displayWidth, displayHeight, quality, (void*) g_capabilityParams);
     if (!g_capabilityParams) {
-        return -1;
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
+        return g_lastResult;
+    }
+    if (!outRenderWidth || !outRenderHeight || !outSharpness) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        return g_lastResult;
     }
     unsigned int maxW = 0, maxH = 0, minW = 0, minH = 0;
     NVSDK_NGX_Result r = NGX_DLSSD_GET_OPTIMAL_SETTINGS(
             g_capabilityParams, displayWidth, displayHeight, (NVSDK_NGX_PerfQuality_Value) quality,
             outRenderWidth, outRenderHeight, &maxW, &maxH, &minW, &minH, outSharpness);
     g_lastResult = (int) r;
-    NGX_LOG("query_optimal_dlssd: exit r=0x%08x render=%ux%u", (unsigned) r,
-            outRenderWidth ? *outRenderWidth : 0u, outRenderHeight ? *outRenderHeight : 0u);
+    NGX_LOG("query_optimal_dlssd: exit r=0x%08x render=%ux%u", (unsigned) r, *outRenderWidth, *outRenderHeight);
     return (int) r;
 }
 
@@ -372,6 +407,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            unsigned int displayWidth, unsigned int displayHeight,
                                            int quality, int featureFlags, int renderPreset) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("create_dlssd: enter cmd=%p render=%ux%u display=%ux%u quality=%d featureFlags=0x%x renderPreset=%d g_device=%p",
             (void*) cmd, renderWidth, renderHeight, displayWidth, displayHeight, quality, featureFlags, renderPreset, (void*) g_device);
     // DLSS Ray Reconstruction must be created with the capability parameter block (it carries the
@@ -427,6 +463,9 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssd(VkCommandBuffer cmd,
     }
     feature->handle = handle;
     feature->params = params;
+    feature->generation = g_initGeneration;
+    feature->jitterX = 0.0f;
+    feature->jitterY = 0.0f;
     feature->ownsParams = false; // shared capability block, freed at shutdown
     NGX_LOG("create_dlssd: exit feature=%p", (void*) feature);
     return feature;
@@ -453,13 +492,15 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
                                            float jitterX, float jitterY, float mvScaleX, float mvScaleY,
                                            int reset, float frameTimeMs,
                                            float* worldToViewMatrix, float* viewToClipMatrix) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("evaluate_dlssd: enter cmd=%p feature=%p render=%ux%u display=%ux%u jitter=(%.3f,%.3f) mvScale=(%.3f,%.3f) reset=%d frameTimeMs=%.3f",
             (void*) cmd, feature, renderWidth, renderHeight, displayWidth, displayHeight,
             jitterX, jitterY, mvScaleX, mvScaleY, reset, frameTimeMs);
     DlssFeature* f = (DlssFeature*) feature;
-    if (!f) {
-        NGX_LOG("evaluate_dlssd: null feature, returning -1");
-        return -1;
+    if (!featureValidLocked(f)) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        NGX_LOG("evaluate_dlssd: invalid feature, returning 0x%08x", (unsigned) g_lastResult);
+        return g_lastResult;
     }
     NGX_LOG("evaluate_dlssd: handle=%p params=%p color=%p depth=%p mv=%p diffuse=%p specular=%p normals=%p specMotion=%p output=%p",
             (void*) f->handle, (void*) f->params, (void*) colorView, (void*) depthView, (void*) mvView,
@@ -510,6 +551,7 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssd(VkCommandBuffer cmd, void* feature,
 
 // 1 if DLSS Frame Generation is available on this system, else 0.
 NGX_SHIM_EXPORT int ngxshim_dlssg_available() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_capabilityParams) {
         return 0;
     }
@@ -520,6 +562,7 @@ NGX_SHIM_EXPORT int ngxshim_dlssg_available() {
 
 // Maximum multi-frame-generation count the driver/DLL supports (1 = 2x only). 0 if unknown.
 NGX_SHIM_EXPORT unsigned int ngxshim_dlssg_multi_frame_count_max() {
+    std::lock_guard<std::mutex> lock(g_mutex);
     if (!g_capabilityParams) {
         return 0;
     }
@@ -536,6 +579,7 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
                                            unsigned int width, unsigned int height,
                                            unsigned int renderWidth, unsigned int renderHeight,
                                            int nativeBackbufferFormat) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NVSDK_NGX_Parameter* params = g_capabilityParams;
     if (!params) {
         g_lastResult = (int) NVSDK_NGX_Result_FAIL_NotInitialized;
@@ -551,14 +595,8 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
     createParams.RenderHeight = renderHeight;
     createParams.DynamicResolutionScaling = false;
 
-    // User Interface Recomposition (UIR): a create-time-only decision (per
-    // nvsdk_ngx_defs_dlssg.h) that must be enabled here for ngxshim_evaluate_dlssg's optional
-    // HUDless/UI resources to actually be used by the algorithm. Without this, feeding HUDless+UI
-    // at eval time with UIR still off produces corrupted/undefined results specifically on fast-
-    // changing UI content (confirmed: F3 debug overlay / inventory tooltips visibly warped) rather
-    // than a clean no-op. Harmless to always enable: when eval doesn't supply HUDless/UI (both
-    // null), the algorithm just behaves like plain frame generation per the header's own docs
-    // ("generate output frames using the HUDless and UI textures if present").
+    // User Interface Recomposition (UIR) is a create-time-only decision (per nvsdk_ngx_defs_dlssg.h)
+    // required whenever HUDless and UI textures are supplied to evaluate.
     NVSDK_NGX_Parameter_SetUI(params, NVSDK_NGX_DLSSG_Parameter_UserInterfaceRecompositionEnabled, 1);
 
     NVSDK_NGX_Handle* handle = nullptr;
@@ -576,8 +614,22 @@ NGX_SHIM_EXPORT void* ngxshim_create_dlssg(VkCommandBuffer cmd,
     }
     feature->handle = handle;
     feature->params = params;
+    feature->generation = g_initGeneration;
+    feature->jitterX = 0.0f;
+    feature->jitterY = 0.0f;
     feature->ownsParams = false; // shared capability block, freed at shutdown
     return feature;
+}
+
+// Sets clip-space jitter offset consumed by subsequent ngxshim_evaluate_dlssg calls on this feature.
+NGX_SHIM_EXPORT void ngxshim_set_dlssg_jitter(void* feature, float jitterX, float jitterY) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    DlssFeature* f = (DlssFeature*) feature;
+    if (!f) {
+        return;
+    }
+    f->jitterX = jitterX;
+    f->jitterY = jitterY;
 }
 
 // Records a DLSS Frame Generation evaluation: generate one interpolated frame (index multiFrameIndex of
@@ -601,9 +653,11 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssg(VkCommandBuffer cmd, void* feature,
                                            int depthInverted, int colorBuffersHDR, int cameraMotionIncluded, int reset,
                                            float* cameraViewToClip, float* clipToCameraView,
                                            float* clipToPrevClip, float* prevClipToClip) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     DlssFeature* f = (DlssFeature*) feature;
-    if (!f) {
-        return -1;
+    if (!featureValidLocked(f)) {
+        g_lastResult = (int) NVSDK_NGX_Result_FAIL_InvalidParameter;
+        return g_lastResult;
     }
 
     NVSDK_NGX_Resource_VK backbuffer = makeImageResource(backbufferView, backbufferImage, backbufferFormat, width, height, VK_IMAGE_ASPECT_COLOR_BIT, false);
@@ -631,6 +685,8 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssg(VkCommandBuffer cmd, void* feature,
     NVSDK_NGX_DLSSG_Opt_Eval_Params opt{};
     opt.multiFrameCount = multiFrameCount;
     opt.multiFrameIndex = multiFrameIndex;
+    opt.jitterOffset[0] = f->jitterX;
+    opt.jitterOffset[1] = f->jitterY;
     opt.mvecScale[0] = mvecScaleX;
     opt.mvecScale[1] = mvecScaleY;
     opt.depthInverted = depthInverted != 0;
@@ -648,6 +704,7 @@ NGX_SHIM_EXPORT int ngxshim_evaluate_dlssg(VkCommandBuffer cmd, void* feature,
 }
 
 NGX_SHIM_EXPORT void ngxshim_release(void* feature) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("release: enter feature=%p", feature);
     DlssFeature* f = (DlssFeature*) feature;
     if (!f) {
@@ -666,12 +723,17 @@ NGX_SHIM_EXPORT void ngxshim_release(void* feature) {
 }
 
 NGX_SHIM_EXPORT void ngxshim_shutdown(VkDevice device) {
+    std::lock_guard<std::mutex> lock(g_mutex);
     NGX_LOG("shutdown: enter device=%p g_device=%p g_capabilityParams=%p", (void*) device, (void*) g_device, (void*) g_capabilityParams);
+    g_initGeneration++;
     if (g_capabilityParams) {
         NVSDK_NGX_VULKAN_DestroyParameters(g_capabilityParams);
         g_capabilityParams = nullptr;
     }
-    NVSDK_NGX_VULKAN_Shutdown1(device ? device : g_device);
+    VkDevice target = device ? device : g_device;
+    if (target != VK_NULL_HANDLE) {
+        NVSDK_NGX_VULKAN_Shutdown1(target);
+    }
     g_device = VK_NULL_HANDLE;
     NGX_LOG("shutdown: exit");
 }

@@ -602,7 +602,8 @@ public final class RtBlockMaterials {
     }
 
     private static int sample(NativeImage image, int x, int y, int width, int height, boolean firstFrameOnly) {
-        int sampledHeight = firstFrameOnly ? Math.min(image.getHeight(), image.getWidth()) : image.getHeight();
+        int frameHeight = Math.max(1, (int) Math.round((double) image.getWidth() * height / width));
+        int sampledHeight = firstFrameOnly ? Math.min(image.getHeight(), frameHeight) : image.getHeight();
         int sx = Math.min(image.getWidth() - 1, x * image.getWidth() / width);
         int sy = Math.min(sampledHeight - 1, y * sampledHeight / height);
         return image.getPixel(sx, sy);

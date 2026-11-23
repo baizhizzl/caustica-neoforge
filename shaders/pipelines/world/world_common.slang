@@ -307,6 +307,8 @@ public static const uint MATERIAL_FEATURE_SPEC = 1u;
 public static const uint MATERIAL_FEATURE_NORMAL = 2u;
 public static const uint MATERIAL_FEATURE_HEURISTIC_EMISSION = 4u;
 public static const uint MATERIAL_FEATURE_STOCHASTIC_ALPHA = 16u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_ROUGHNESS = 32u;
+public static const uint MATERIAL_FEATURE_OVERRIDE_METALNESS = 64u;
 // Final HDR emitting-surface luminance (look-package baseline or absolute JSON cd/m² override), baked in Java
 // at material-compile time (RtMaterialRegistry) and packed here as a 16-bit fraction of the max — every
 // emissive material carries a value (0 for non-emissive), not just resource-pack-overridden ones, so the

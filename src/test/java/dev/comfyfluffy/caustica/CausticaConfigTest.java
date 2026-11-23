@@ -173,4 +173,67 @@ final class CausticaConfigTest {
             CausticaConfig.Rt.Visuals.SHARPNESS.set(prevSharpness);
         }
     }
+
+    @Test
+    void malformedTomlTypesFallBackInsteadOfThrowingClassCastException() {
+        var config = CommentedConfig.inMemory();
+        config.set("enabled", "true");
+        config.set("composite.spp", "4");
+        config.set("exposure.mode", 123);
+
+        assertEquals(null, CausticaConfig.readBoolean(config, "enabled"));
+        assertEquals(null, CausticaConfig.readNumber(config, "composite.spp"));
+        assertEquals(null, CausticaConfig.readString(config, "exposure.mode"));
+    }
+
+    @Test
+    void nonFiniteFloatsFallBackInsteadOfLeakingNaN() {
+        var contrast = CausticaConfig.Rt.Visuals.CONTRAST;
+        var key = CausticaConfig.Rt.Exposure.KEY;
+        float prevContrast = contrast.value();
+        float prevKey = key.value();
+        try {
+            contrast.set(Float.NaN);
+            assertEquals(contrast.defaultValue(), contrast.value(), 1.0e-6f);
+            contrast.set(Float.POSITIVE_INFINITY);
+            assertEquals(contrast.defaultValue(), contrast.value(), 1.0e-6f);
+
+            key.set(Float.NaN);
+            assertEquals(key.defaultValue(), key.value(), 1.0e-6f);
+            assertEquals(1.0f, CausticaConfig.Rt.Exposure.clampScale(Float.NaN), 1.0e-6f);
+            assertEquals(1.0f, CausticaConfig.Rt.Exposure.clampScale(Float.POSITIVE_INFINITY), 1.0e-6f);
+        } finally {
+            contrast.set(prevContrast);
+            key.set(prevKey);
+        }
+    }
+
+    @Test
+    void transientSystemPropertyOverrideIsNotPersistedUntilExplicitlySet() {
+        var debugView = CausticaConfig.Rt.Composite.DEBUG_VIEW;
+        String propKey = debugView.key();
+        String prevProp = System.getProperty(propKey);
+        int prevValue = debugView.value();
+        var config = CommentedConfig.inMemory();
+        try {
+            System.setProperty(propKey, "3");
+            debugView.reloadFromSystemProperties();
+            assertEquals(3, debugView.value());
+
+            debugView.writeToFile(config);
+            assertEquals(debugView.defaultValue(), config.<Integer>get(debugView.tomlPath()));
+
+            debugView.set(2);
+            debugView.writeToFile(config);
+            assertEquals(2, config.<Integer>get(debugView.tomlPath()));
+        } finally {
+            if (prevProp == null) {
+                System.clearProperty(propKey);
+            } else {
+                System.setProperty(propKey, prevProp);
+            }
+            debugView.reloadFromSystemProperties();
+            debugView.set(prevValue);
+        }
+    }
 }

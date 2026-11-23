@@ -20,6 +20,7 @@ TESTS = {
     "testCachedFrostedTransmission": "authored frosted-dielectric transmission after cache round trip",
     "testTerminalCelestialMis": "terminal celestial energy and continuing MIS complement",
     "testTerminalStaticEmitterMis": "terminal static-emitter radiance and reservoir target",
+    "testPackRgb9e5AndSegmentRoundTrip": "packRgb9e5 sub-unit precision, PathSegment round trip, and isAirMedium IOR guard",
 }
 
 

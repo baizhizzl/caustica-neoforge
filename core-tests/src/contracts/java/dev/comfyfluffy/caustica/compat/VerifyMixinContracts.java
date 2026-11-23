@@ -85,7 +85,7 @@ public final class VerifyMixinContracts {
             for (MethodNode handler : mixin.methods) {
                 String context = name + "#" + handler.name;
                 if (annotation(handler.visibleAnnotations, handler.invisibleAnnotations, SHADOW) != null) {
-                    require(!findMethods(target, handler.name + handler.desc).isEmpty(), context + ": missing shadow method");
+                    require(!findMethods(target, handler.name + handler.desc, true).isEmpty(), context + ": missing shadow method");
                 }
                 AnnotationNode accessor = annotation(handler.visibleAnnotations, handler.invisibleAnnotations, ACCESSOR);
                 if (accessor != null) {
@@ -104,7 +104,7 @@ public final class VerifyMixinContracts {
                     if (methodName.isEmpty()) {
                         methodName = inferInvokerTarget(handler.name);
                     }
-                    require(!findMethods(target, methodName + handler.desc).isEmpty(),
+                    require(!findMethods(target, methodName + handler.desc, true).isEmpty(),
                             context + ": missing invoker method " + methodName + handler.desc + " on " + target.name);
                 }
                 for (AnnotationNode injection : annotations(handler.visibleAnnotations, handler.invisibleAnnotations)) {
@@ -115,7 +115,7 @@ public final class VerifyMixinContracts {
                     List<String> selectors = methodValue instanceof List<?> list
                             ? list.stream().map(String.class::cast).toList() : List.of((String) methodValue);
                     for (String selector : selectors) {
-                        List<MethodNode> methods = findMethods(target, selector);
+                        List<MethodNode> methods = findMethods(target, selector, false);
                         require(!methods.isEmpty(), context + ": missing method " + selector + " on " + target.name);
                         for (MethodNode method : methods) {
                             if (injection.desc.equals(INJECT)) {
@@ -259,7 +259,7 @@ public final class VerifyMixinContracts {
         }
         int separator = selector.indexOf(';');
         require(selector.startsWith("L") && separator > 0, context + ": invalid At target " + selector);
-        if (separator < 0) {
+        if (!selector.startsWith("L") || separator <= 0) {
             return;
         }
         String owner = selector.substring(1, separator);
@@ -279,15 +279,15 @@ public final class VerifyMixinContracts {
                 + " (ordinal " + ordinal + ") in " + method.name + method.desc);
     }
 
-    private static List<MethodNode> findMethods(ClassNode target, String selector) throws IOException {
+    private static List<MethodNode> findMethods(ClassNode target, String selector, boolean includeSuper) throws IOException {
         List<MethodNode> methods = new ArrayList<>();
         for (MethodNode method : target.methods) {
             if (selector.equals(method.name) || selector.equals(method.name + method.desc)) {
                 methods.add(method);
             }
         }
-        if (methods.isEmpty() && target.superName != null && !target.superName.equals("java/lang/Object")) {
-            methods.addAll(findMethods(read(target.superName), selector));
+        if (includeSuper && methods.isEmpty() && target.superName != null && !target.superName.equals("java/lang/Object")) {
+            methods.addAll(findMethods(read(target.superName), selector, true));
         }
         return methods;
     }

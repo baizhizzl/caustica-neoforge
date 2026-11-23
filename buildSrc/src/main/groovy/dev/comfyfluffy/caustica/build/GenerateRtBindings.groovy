@@ -89,9 +89,14 @@ abstract class GenerateRtBindings extends DefaultTask {
         def stem = source.name.replaceAll(/\W+/, "-")
         def reflectionFile = new File(scratchDir, "${stem}.json")
         def spvFile = new File(scratchDir, "${stem}.spv")
-        def includeDirs = shaderRoot.get().asFileTree.matching { include "**/*.slang" }.files
-                .collect { it.parentFile }.unique().sort { it.absolutePath }
-        def includes = [source.parentFile] + includeDirs.findAll { it != source.parentFile }
+        def rootDir = shaderRoot.get().asFile
+        def includes = [source.parentFile, new File(rootDir, "common")]
+        def rel = rootDir.toPath().relativize(source.toPath()).toString().replace('\\', '/')
+        if (rel.startsWith("pipelines/sky_lut/") || rel.startsWith("pipelines/light_presample/")
+                || rel.startsWith("layout/")) {
+            includes.add(new File(rootDir, "pipelines/world"))
+        }
+        includes = includes.findAll { it.isDirectory() }.unique { it.canonicalPath }
         execOps.exec {
             commandLine([slangc.get(), source.absolutePath] + includes.collectMany { ["-I", it.absolutePath] } + [
                     "-target", "spirv", "-profile", "spirv_1_5", "-matrix-layout-column-major",

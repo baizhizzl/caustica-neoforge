@@ -99,3 +99,34 @@ export __extern_cpp uint testTerminalStaticEmitterMis() {
     if (any(abs(continuing - terminal * wNee) > expected * 1.0e-5)) return 4u;
     return abs(phatContinuing - phatTerminal * wNee) > phatTerminal * 1.0e-5 ? 8u : 0u;
 }
+
+export __extern_cpp uint testPackRgb9e5AndSegmentRoundTrip() {
+    uint failed = 0u;
+    // Verify sub-unit dielectric Fresnel reflectance (~0.0204), water extinction (~0.01), and tiny
+    // glass extinction (~0.001) round-trip through packRgb9e5 with negative binary exponents intact.
+    float3 samples[5] = {
+        float3(0.0204, 0.0204, 0.0204),
+        float3(0.015, 0.010, 0.008),
+        float3(0.001, 0.0005, 0.00025),
+        float3(0.9796, 0.5, 0.25),
+        float3(123.5, 456.25, 1024.0)
+    };
+    for (int i = 0; i < 5; ++i) {
+        float3 s = samples[i];
+        float3 u = unpackRgb9e5(packRgb9e5(s));
+        float3 tol = max(s * 0.01, float3(1.0e-6));
+        if (any(abs(u - s) > tol)) {
+            failed |= (1u << uint(i));
+        }
+    }
+    Medium glass = makeDielectricMedium(false, 1.5, float3(1.0, 1.0, 1.0), 1.0);
+    if (isAirMedium(glass)) failed |= 32u;
+    if (!isAirMedium(airMedium())) failed |= 64u;
+    MediumStack ms = makeMediumStack(makeDielectricMedium(true, WATER_IOR, float3(0.25, 0.55, 0.85), 1.0));
+    PathSegment seg = makePathSegment(float3(1.0, 2.0, 3.0), normalize(float3(0.2, -0.4, 0.8)),
+            float3(0.0204, 0.0204, 0.0204), ms, 0.01, 0.002, 42u, 1, true, true, 5.5);
+    PathSegment rt = unpackPathSegment(packPathSegment(seg, PATH_NO_NEXT));
+    if (any(abs(rt.throughput - seg.throughput) > float3(2.0e-4))) failed |= 128u;
+    if (any(abs(rt.medium.current.extinction - seg.medium.current.extinction) > float3(1.0e-3))) failed |= 256u;
+    return failed;
+}

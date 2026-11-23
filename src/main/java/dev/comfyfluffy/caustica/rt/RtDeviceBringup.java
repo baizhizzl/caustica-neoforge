@@ -606,8 +606,9 @@ public final class RtDeviceBringup {
      */
     public static void probe(VkDevice device) {
         rtReady = false;
-        if (!rtRequested) {
-            CausticaMod.LOGGER.info("Ray tracing not requested; skipping RT probe");
+        if (!rtRequested || !computeQueueReserved()) {
+            CausticaMod.LOGGER.info("Ray tracing unavailable (rtRequested={}, computeQueueReserved={}); skipping RT probe",
+                    rtRequested, computeQueueReserved());
             maxOpacity4StateSubdivisionLevel = 0;
             return;
         }

@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.BooleanSupplier;
@@ -31,6 +32,7 @@ import java.util.function.Consumer;
 
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT_KHR;
+import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR;
 import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
 /**
@@ -40,10 +42,12 @@ import static org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_RAY_TRACI
  */
 public final class RtGpuExecutor {
     private static final int MAX_BUILD_BATCH = 32;
+    private static final long DESTROY_POLL_MS = 25L;
     private static final Job STOP = new Job(null, null, null, null, null);
     private static final Job WAKE = new Job(null, null, null, null, null);
     private static final long TERRAIN_READ_STAGES =
             VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                    | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR
                     | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
 
     private final RtContext ctx;
@@ -56,6 +60,8 @@ public final class RtGpuExecutor {
     private final AtomicLong nextGraphicsValue = new AtomicLong();
     private final AtomicLong latestGraphicsUseValue = new AtomicLong();
     private final ArrayList<DestroyJob> destroyJobs = new ArrayList<>();
+    private final Object lifecycleLock = new Object();
+    private final Object failureLock = new Object();
     private final Object submissionLock = new Object();
     private long submittedBuildValue;
     private final Thread thread;
@@ -87,16 +93,18 @@ public final class RtGpuExecutor {
      * Enqueue cancellable GPU recording. Cancellation is sampled immediately before a queued job enters
      * a command-buffer batch; already-recording or submitted work still completes normally.
      */
-    public synchronized Build submit(BooleanSupplier cancelled, Consumer<VkCommandBuffer> record,
-                                     Runnable afterSuccess, BiConsumer<Build, Throwable> finished) {
-        checkExecutorFailure();
-        if (closed) {
-            throw new IllegalStateException("RT GPU executor is closed");
+    public Build submit(BooleanSupplier cancelled, Consumer<VkCommandBuffer> record,
+                        Runnable afterSuccess, BiConsumer<Build, Throwable> finished) {
+        synchronized (lifecycleLock) {
+            checkExecutorFailure();
+            if (closed) {
+                throw new IllegalStateException("RT GPU executor is closed");
+            }
+            long value = nextBuildValue.incrementAndGet();
+            Build build = new Build(value);
+            jobs.add(new Job(cancelled, record, afterSuccess, finished, build));
+            return build;
         }
-        long value = nextBuildValue.incrementAndGet();
-        Build build = new Build(value);
-        jobs.add(new Job(cancelled, record, afterSuccess, finished, build));
-        return build;
     }
 
     /** Mark a build visible to publication; the next graphics frame use waits on it. */
@@ -200,12 +208,15 @@ public final class RtGpuExecutor {
         }
     }
 
-    public synchronized void shutdown() {
-        if (closed) {
-            return;
+    public void shutdown() {
+        synchronized (lifecycleLock) {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            jobs.add(STOP);
         }
-        closed = true;
-        jobs.add(STOP);
+        // Join outside lifecycleLock so the executor thread's failure paths never deadlock against shutdown.
         try {
             thread.join();
         } catch (InterruptedException e) {
@@ -215,15 +226,25 @@ public final class RtGpuExecutor {
         // Stop and join first: waiting idle before the executor stops leaves a race where it can
         // submit immediately after vkDeviceWaitIdle returns. The idle wait also makes graphics-side
         // timeline semaphore use complete before those semaphores are destroyed below.
-        ctx.waitIdle();
         Throwable failure = null;
         try {
-            flushDestroysAfterDeviceIdle();
+            ctx.waitIdle();
         } catch (Throwable t) {
             failure = t;
         }
-        VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);
-        commandPool = 0L;
+        try {
+            flushDestroysAfterDeviceIdle();
+        } catch (Throwable t) {
+            if (failure == null) {
+                failure = t;
+            } else {
+                failure.addSuppressed(t);
+            }
+        }
+        if (commandPool != 0L) {
+            VK10.vkDestroyCommandPool(ctx.vk(), commandPool, null);
+            commandPool = 0L;
+        }
         VK10.vkDestroySemaphore(ctx.vk(), graphicsTimeline, null);
         VK10.vkDestroySemaphore(ctx.vk(), buildTimeline, null);
         if (failure != null) {
@@ -235,7 +256,20 @@ public final class RtGpuExecutor {
         while (true) {
             Job first;
             try {
-                first = jobs.take();
+                if (hasPendingDestroys()) {
+                    // Keep polling until deferred destroys complete even when graphics stops submitting
+                    // (for example after returning to the title screen).
+                    first = jobs.poll(DESTROY_POLL_MS, TimeUnit.MILLISECONDS);
+                    if (first == null) {
+                        if (!processDestroyJobsSafely()) {
+                            failQueuedJobs(executorFailure);
+                            return;
+                        }
+                        continue;
+                    }
+                } else {
+                    first = jobs.take();
+                }
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 failQueuedJobs(e);
@@ -322,7 +356,7 @@ public final class RtGpuExecutor {
     }
 
     /** Fail every accepted build before the executor thread exits so task ownership always unwinds. */
-    private synchronized void failQueuedJobs(Throwable failure) {
+    private void failQueuedJobs(Throwable failure) {
         Throwable terminal = failure != null ? failure : new IllegalStateException("RT GPU executor stopped");
         latchFailure(terminal);
         Job job;
@@ -333,11 +367,13 @@ public final class RtGpuExecutor {
         }
     }
 
-    private synchronized void latchFailure(Throwable failure) {
-        if (executorFailure == null) {
-            executorFailure = failure;
-        } else if (executorFailure != failure) {
-            executorFailure.addSuppressed(failure);
+    private void latchFailure(Throwable failure) {
+        synchronized (failureLock) {
+            if (executorFailure == null) {
+                executorFailure = failure;
+            } else if (executorFailure != failure) {
+                executorFailure.addSuppressed(failure);
+            }
         }
         synchronized (submissionLock) {
             submissionLock.notifyAll();
