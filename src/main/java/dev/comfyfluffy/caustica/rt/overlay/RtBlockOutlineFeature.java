@@ -203,10 +203,15 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
                     .descriptorSetLayout(compositeSet.layout)
                     .build(ctx, "block outline composite");
         }
-        boolean resizeMsaa = msaaImage == null || msaaImage.width != width || msaaImage.height != height;
+        boolean useMsaa = RtDeviceBringup.overlayMsaaSamples() != VK10.VK_SAMPLE_COUNT_1_BIT;
+        boolean resizeMsaa = useMsaa && (msaaImage == null || msaaImage.width != width || msaaImage.height != height);
         boolean resizeMask = resolvedMask == null || resolvedMask.width != width || resolvedMask.height != height;
-        if ((resizeMsaa && msaaImage != null) || (resizeMask && resolvedMask != null)) {
+        if ((resizeMsaa && msaaImage != null) || (!useMsaa && msaaImage != null) || (resizeMask && resolvedMask != null)) {
             ctx.waitIdle();
+        }
+        if (!useMsaa && msaaImage != null) {
+            msaaImage.destroy();
+            msaaImage = null;
         }
         if (resizeMsaa) {
             if (msaaImage != null) {
@@ -229,7 +234,11 @@ final class RtBlockOutlineFeature implements RtOverlayFeature {
     public void record(VkCommandBuffer cmd, long targetView, int width, int height) {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             try (RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctxRef, cmd, "block outline mask")) {
-                RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
+                if (msaaImage != null) {
+                    RtWorldOverlay.beginMsaaColorRendering(cmd, stack, msaaImage.view, resolvedMask.view, width, height);
+                } else {
+                    RtWorldOverlay.beginColorRendering(cmd, stack, resolvedMask.view, width, height, true);
+                }
                 try {
                     VK10.vkCmdBindPipeline(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.handle);
                     VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout, 0,

@@ -135,7 +135,8 @@ public final class RtPipeline {
         String label = "world RT pipeline";
         if (bindlessTextures > 0) {
             long requiredCombinedSamplers = Math.addExact(
-                    Math.multiplyExact((long) bindlessTextures, WORLD_BINDLESS_COUNT), 1L);
+                    Math.multiplyExact((long) bindlessTextures, WORLD_BINDLESS_COUNT),
+                    WORLD_SET_SAMPLER_COUNT);
             long deviceLimit = ctx.updateAfterBindCombinedImageSamplerLimit();
             if (requiredCombinedSamplers > deviceLimit) {
                 throw new UnsupportedOperationException("Configured bindless texture capacity " + bindlessTextures

@@ -40,11 +40,8 @@ static const float3x3 BT709_TO_BT2020 = float3x3(
     0.0163916, 0.0880132, 0.8955953
 );
 
-static const float3x3 BT2020_TO_BT709 = float3x3(
-     1.6604910, -0.5876411, -0.0728499,
-    -0.1245505,  1.1328999, -0.0083494,
-    -0.0181508, -0.1005789,  1.1187297
-);
+static const uint GUI_BLEND_MODE_MASK = 0xffu;
+static const uint GUI_BLEND_SINGLE_PASS_FLAG = 0x100u;
 
 [shader("compute")]
 [numthreads(16, 16, 1)]
@@ -54,32 +51,38 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= width || tid.y >= height) return;
 
     int2 pix = int2(tid.xy);
+    uint mode = pc.mode & GUI_BLEND_MODE_MASK;
+    bool singlePass = (pc.mode & GUI_BLEND_SINGLE_PASS_FLAG) != 0u;
     float3 worldPq = outputImage[pix].rgb;
     float4 ui = sourceImage.Load(int3(pix, 0));
-    float coverage = coverageImage.Load(int3(pix, 0)).r;
-    if (pc.mode == GUI_BLEND_RESOLVE) {
+    float coverage = singlePass ? 0.0 : coverageImage.Load(int3(pix, 0)).r;
+    if (mode == GUI_BLEND_RESOLVE) {
         resolvedUiImage[pix] = resolveGuiUi(ui.rgb, worldPq, 0.0, coverage);
         return;
     }
-    if ((pc.mode == GUI_BLEND_OVER && ui.a <= 0.0)
-            || (pc.mode == GUI_BLEND_MULTIPLY && all(ui.rgb == float3(1.0)))
-            || (pc.mode == GUI_BLEND_INVERT && all(ui.rgb == float3(0.0)))
-            || ((pc.mode == GUI_BLEND_ADD || pc.mode == GUI_BLEND_MAX) && all(ui.rgb == float3(0.0)))) {
+    if ((mode == GUI_BLEND_OVER && ui.a <= 0.0)
+            || (mode == GUI_BLEND_MULTIPLY && all(ui.rgb == float3(1.0)))
+            || (mode == GUI_BLEND_INVERT && all(ui.rgb == float3(0.0)))
+            || ((mode == GUI_BLEND_ADD || mode == GUI_BLEND_MAX) && all(ui.rgb == float3(0.0)))) {
+        if (singlePass) {
+            resolvedUiImage[pix] = float4(0.0);
+        }
         return;
     }
     float3 worldNits2020 = float3(pqDecode(worldPq.x), pqDecode(worldPq.y), pqDecode(worldPq.z));
     float3 blended;
-    if (pc.mode == GUI_BLEND_OVER) {
+    if (mode == GUI_BLEND_OVER) {
         float3 straight = ui.a > 0.0 ? saturate(ui.rgb / ui.a) : float3(0.0);
         float3 uiNits2020 = mul(BT709_TO_BT2020, srgbToLinear(straight) * pc.uiNits);
         blended = worldNits2020 * (1.0 - ui.a) + uiNits2020 * ui.a;
     } else {
-        float3 background709 = mul(BT2020_TO_BT709, worldNits2020);
-        // Multiply and inversion retain dimensionless coefficients; additive/max masks carry HDR nits.
-        float3 mask = (pc.mode == GUI_BLEND_ADD || pc.mode == GUI_BLEND_MAX)
-                ? srgbToLinear(saturate(ui.rgb)) * pc.uiNits : ui.rgb;
-        float3 result709 = max(compositeGuiEffect(background709, mask, pc.uiNits, pc.mode), 0.0);
-        blended = mul(BT709_TO_BT2020, result709);
+        // Evaluate effects directly in linear BT.2020 so out-of-BT.709 HDR world colors are not clipped.
+        // Multiply masks are sRGB-encoded transmittance; invert masks hold linear coverage; add/max hold HDR nits.
+        float3 mask709 = (mode == GUI_BLEND_ADD || mode == GUI_BLEND_MAX)
+                ? srgbToLinear(saturate(ui.rgb)) * pc.uiNits
+                : (mode == GUI_BLEND_MULTIPLY ? srgbToLinear(saturate(ui.rgb)) : saturate(ui.rgb));
+        float3 mask2020 = mul(BT709_TO_BT2020, mask709);
+        blended = max(compositeGuiEffect(worldNits2020, mask2020, pc.uiNits, mode), 0.0);
     }
     float3 resultPq = saturate(float3(pqEncode(blended.x), pqEncode(blended.y), pqEncode(blended.z)));
     resolvedUiImage[pix] = resolveGuiUi(worldPq, resultPq, ui.a, coverage);

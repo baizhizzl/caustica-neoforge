@@ -35,8 +35,10 @@ import static dev.comfyfluffy.caustica.rt.pipeline.RtBindings.*;
  * by ordered GUI layers and the final HDR present path before the image is blitted to the PQ swapchain.
  */
 public final class RtHdrCompositePipeline {
+    public static final int SINGLE_PASS_FLAG = 0x100;
     private static final String SHADER_DIR = "/caustica/shaders/pipelines/hdr_composite/";
     private static final int PUSH_BYTES = Float.BYTES + Integer.BYTES;
+    private static final int SET_COUNT = 3;
 
     private final RtContext ctx;
     private final long descriptorSetLayout;
@@ -44,7 +46,7 @@ public final class RtHdrCompositePipeline {
     private final long[] descriptorSets;
     private final long pipelineLayout;
     private final long pipeline;
-    private final long[][] boundImages = new long[2][5];
+    private final long[][] boundImages = new long[SET_COUNT][5];
     private boolean destroyed;
 
     private RtHdrCompositePipeline(RtContext ctx, long dsl, long pool, long[] sets, long layout, long pipeline) {
@@ -77,18 +79,18 @@ public final class RtHdrCompositePipeline {
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET_LAYOUT, dsl, "hdr ui composite descriptor set layout");
 
             VkDescriptorPoolSize.Buffer poolSizes = VkDescriptorPoolSize.calloc(2, stack);
-            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(4);
-            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(4);
-            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(2).pPoolSizes(poolSizes);
+            poolSizes.get(0).type(VK10.VK_DESCRIPTOR_TYPE_STORAGE_IMAGE).descriptorCount(SET_COUNT * 2);
+            poolSizes.get(1).type(VK10.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER).descriptorCount(SET_COUNT * 2);
+            VkDescriptorPoolCreateInfo dpci = VkDescriptorPoolCreateInfo.calloc(stack).sType$Default().maxSets(SET_COUNT).pPoolSizes(poolSizes);
             check(VK10.vkCreateDescriptorPool(vk, dpci, null, p), "vkCreateDescriptorPool(hdr ui composite)");
             long pool = p.get(0);
             RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_POOL, pool, "hdr ui composite descriptor pool");
 
             VkDescriptorSetAllocateInfo dsai = VkDescriptorSetAllocateInfo.calloc(stack).sType$Default()
-                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl, dsl));
-            LongBuffer pSet = stack.mallocLong(2);
+                    .descriptorPool(pool).pSetLayouts(stack.longs(dsl, dsl, dsl));
+            LongBuffer pSet = stack.mallocLong(SET_COUNT);
             check(VK10.vkAllocateDescriptorSets(vk, dsai, pSet), "vkAllocateDescriptorSets(hdr ui composite)");
-            long[] sets = {pSet.get(0), pSet.get(1)};
+            long[] sets = {pSet.get(0), pSet.get(1), pSet.get(2)};
             for (int i = 0; i < sets.length; i++) {
                 RtDebugLabels.name(ctx, VK10.VK_OBJECT_TYPE_DESCRIPTOR_SET, sets[i], "hdr ui composite descriptor set " + i);
             }

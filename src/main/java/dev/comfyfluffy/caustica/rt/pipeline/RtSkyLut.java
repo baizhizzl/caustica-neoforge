@@ -231,12 +231,9 @@ public final class RtSkyLut {
         staticLutsBaked = false;
     }
 
-    /**
-     * Record this frame's sky LUT work: the two static LUTs on the first frame, then the sky-view LUT.
-     * Must be recorded before the trace, with a barrier after (the caller's) — the miss and raygen stages
-     * sample all of these.
-     */
-    public void record(VkCommandBuffer cmd, long worldPushAddress) {
+    /** Record this frame's sky LUT work; call {@link #acceptStaticLutBake()} after the command buffer executes. */
+    public boolean record(VkCommandBuffer cmd, long worldPushAddress) {
+        boolean recordedStatic = false;
         try (MemoryStack stack = MemoryStack.stackPush();
              RtDebugLabels.Scope ignored = RtDebugLabels.scope(ctx, cmd, "sky LUTs")) {
             VK10.vkCmdBindDescriptorSets(cmd, VK10.VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -258,10 +255,15 @@ public final class RtSkyLut {
                         org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT_KHR,
                         org.lwjgl.vulkan.KHRSynchronization2.VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT_KHR,
                         org.lwjgl.vulkan.KHRSynchronization2.VK_ACCESS_2_SHADER_SAMPLED_READ_BIT_KHR);
-                staticLutsBaked = true;
+                recordedStatic = true;
             }
             dispatch(cmd, skyViewPipeline, SKY_VIEW_WIDTH, SKY_VIEW_HEIGHT);
         }
+        return recordedStatic;
+    }
+
+    public void acceptStaticLutBake() {
+        staticLutsBaked = true;
     }
 
     private void dispatch(VkCommandBuffer cmd, long pipeline, int width, int height) {

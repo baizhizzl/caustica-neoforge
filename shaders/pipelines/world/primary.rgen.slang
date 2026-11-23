@@ -154,12 +154,16 @@ public PathSegment tracePrimary(PathSegment seg,
                 waterWaveGradTemporal(waterDomain, waveTime,
                                       wAnchor.z, waterFootprint, currentGrad, previousGrad);
                 float orientation = geometricNormal.y >= 0.0 ? 1.0 : -1.0;
-                n = orientation * normalize(float3(-currentGrad.x, 1.0, -currentGrad.y));
-                previousNormal = orientation
-                        * normalize(float3(-previousGrad.x, 1.0, -previousGrad.y));
+                n = clampWaterWaveNormal(
+                        orientation * normalize(float3(-currentGrad.x, 1.0, -currentGrad.y)),
+                        geometricNormal, rd);
+                previousNormal = clampWaterWaveNormal(
+                        orientation * normalize(float3(-previousGrad.x, 1.0, -previousGrad.y)),
+                        geometricNormal, rd);
             } else {
-                n = applyWaterWaves(geometricNormal, waterDomain,
-                                    waveTime, waterFootprint);
+                n = clampWaterWaveNormal(
+                        applyWaterWaves(geometricNormal, waterDomain, waveTime, waterFootprint),
+                        geometricNormal, rd);
             }
         }
 
@@ -170,6 +174,8 @@ public PathSegment tracePrimary(PathSegment seg,
         float etaT = entering ? entered.ior : medium.outer.ior;
         float F = fresnelDielectric(clamp(dot(-rd, n), 0.0, 1.0), etaI, etaT);
         float3 transmittedDir = refract(rd, n, etaI / etaT);
+        bool validTransmission = dot(transmittedDir, transmittedDir) > 0.0
+                && dot(transmittedDir, geometricNormal) < 0.0;
         float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
         if (bounce == 0) {
@@ -193,7 +199,7 @@ public PathSegment tracePrimary(PathSegment seg,
             }
             // Heavily frosted dielectrics (> SPEC_MOTION_ALPHA_MAX) keep their own surface depth/normal so
             // DLSS-RR does not reproject crisp background silhouettes across blurred refraction.
-            if (dielectricRough <= SPEC_MOTION_ALPHA_MAX && dot(transmittedDir, transmittedDir) > 0.0) {
+            if (dielectricRough <= SPEC_MOTION_ALPHA_MAX && validTransmission) {
                 MediumStack guideMedium = medium;
                 if (entering) {
                     mediumPush(guideMedium, entered);
@@ -212,8 +218,7 @@ public PathSegment tracePrimary(PathSegment seg,
 
         // Split once, write both post-interface continuations, and stop Pass A radiance traversal.
         // Pass B owns every radiance trace after this point.
-        bool splitEligible = dot(transmittedDir, transmittedDir) > 0.0
-                && F > 0.0 && F < 1.0;
+        bool splitEligible = validTransmission && F > 0.0 && F < 1.0;
         if (splitEligible) {
             MediumStack transmittedMedium = medium;
             if (entering) {
@@ -240,7 +245,7 @@ public PathSegment tracePrimary(PathSegment seg,
             return reflected;
         }
 
-        bool hasTransmission = dot(transmittedDir, transmittedDir) > 0.0;
+        bool hasTransmission = validTransmission;
         PathSegment continuation;
         if (!hasTransmission || F >= 1.0) {
             float3 reflectedDir = reflect(rd, n);

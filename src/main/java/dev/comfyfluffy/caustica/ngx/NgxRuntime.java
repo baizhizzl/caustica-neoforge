@@ -22,13 +22,16 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AccessDeniedException;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -87,13 +90,20 @@ public final class NgxRuntime {
 
     /**
      * Shut down NGX. Call only at device teardown, after every feature has been released. Resolves the
-     * device from the current render backend; no-op if NGX was never initialized.
+     * device from the current render backend when available, or falls back to the shim's stored handle.
      */
     public synchronized void shutdown() {
-        if (lib != null && initialized
-                && ((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
+        if (lib != null && initialized) {
+            long vkDeviceHandle = 0L;
             try {
-                lib.shutdown(device.vkDevice().address());
+                if (((GpuDeviceAccessor) RenderSystem.getDevice()).caustica$getBackend() instanceof VulkanDevice device) {
+                    vkDeviceHandle = device.vkDevice().address();
+                }
+            } catch (Throwable t) {
+                CausticaMod.LOGGER.debug("NGX shutdown: VulkanDevice unavailable; falling back to shim handle", t);
+            }
+            try {
+                lib.shutdown(vkDeviceHandle);
             } catch (Throwable t) {
                 CausticaMod.LOGGER.warn("NGX shutdown failed", t);
             }
@@ -103,9 +113,9 @@ public final class NgxRuntime {
         lib = null;
     }
 
-    /** NVSDK_NGX_Result: failure when the top 12 bits == 0xBAD. Shared by all NGX feature wrappers. */
+    /** NVSDK_NGX_Result failure check: top 12 bits == 0xBAD or negative sentinel. */
     public static boolean ngxFailed(int result) {
-        return (result & 0xFFF00000) == 0xBAD00000;
+        return result < 0 || (result & 0xFFF00000) == 0xBAD00000;
     }
 
     private void init(VulkanDevice device) {
@@ -117,7 +127,7 @@ public final class NgxRuntime {
             throw new IllegalStateException(PLATFORM_NATIVES.shimName()
                     + " not found (bundled natives or -Dcaustica.ngx.path)");
         }
-        Path nativesDir = shim.getParent();
+        Path nativesDir = shim.toAbsolutePath().normalize().getParent();
         if (nativesDir != null) {
             List<String> missingFeatures = missingFeatureLibraries(nativesDir);
             if (!missingFeatures.isEmpty()) {
@@ -156,7 +166,7 @@ public final class NgxRuntime {
     private static Path locateShim() {
         String override = CausticaConfig.Ngx.PATH.get();
         if (override != null && !override.isBlank()) {
-            Path p = Path.of(override);
+            Path p = Path.of(override).toAbsolutePath().normalize();
             if (Files.isDirectory(p)) {
                 p = p.resolve(PLATFORM_NATIVES.shimName());
             }
@@ -188,14 +198,23 @@ public final class NgxRuntime {
             }
             byte[] bytes = in.readAllBytes();
             if (!sameBytes(dst, bytes)) {
+                Path parent = dst.getParent();
+                Path tmp = Files.createTempFile(parent, name + ".", ".tmp");
                 try {
-                    Files.write(dst, bytes);
-                } catch (AccessDeniedException e) {
+                    Files.write(tmp, bytes);
+                    try {
+                        Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                    } catch (AtomicMoveNotSupportedException ignored) {
+                        Files.move(tmp, dst, StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (FileSystemException e) {
                     if (Files.isRegularFile(dst)) {
                         CausticaMod.LOGGER.warn("NGX native {} is locked by another process; keeping existing file", dst);
                         return true;
                     }
                     throw e;
+                } finally {
+                    Files.deleteIfExists(tmp);
                 }
             }
             return true;
@@ -203,9 +222,6 @@ public final class NgxRuntime {
     }
 
     private static void extractBundledFeatureLibraries(Path dir) throws IOException {
-        for (String name : PLATFORM_NATIVES.exactFeatureNames()) {
-            extractBundledNative(name, dir.resolve(name));
-        }
         List<String> bundledVersioned = bundledFeatureLibraryNames();
         if (!PLATFORM_NATIVES.featureNamePrefixes().isEmpty() && !bundledVersioned.isEmpty()) {
             Set<String> keep = new HashSet<>(bundledVersioned);
@@ -220,7 +236,9 @@ public final class NgxRuntime {
                 }
             }
         }
-        for (String name : bundledVersioned) {
+        Set<String> toExtract = new LinkedHashSet<>(PLATFORM_NATIVES.exactFeatureNames());
+        toExtract.addAll(bundledVersioned);
+        for (String name : toExtract) {
             extractBundledNative(name, dir.resolve(name));
         }
     }

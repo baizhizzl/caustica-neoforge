@@ -46,6 +46,8 @@ public final class RtMaterialRegistry {
     public static final int FEATURE_NORMAL = 2;
     public static final int FEATURE_HEURISTIC_EMISSION = 4;
     public static final int FEATURE_STOCHASTIC_ALPHA = 16;
+    public static final int FEATURE_OVERRIDE_ROUGHNESS = 32;
+    public static final int FEATURE_OVERRIDE_METALNESS = 64;
     public static final int ENTITY_PRIM_STOCHASTIC_ALPHA = 4;
     // HDR radiance of a full (level-15-equivalent) emitter, modulated by albedo. Baked into every
     // emissive RtMaterialDesc.emissionStrength at compile time (compileDesc/compileEntityDesc), times
@@ -659,8 +661,8 @@ public final class RtMaterialRegistry {
     }
 
     /**
-     * Per-sprite compile inputs gathered in a single pixel pass: the raw average RGBA (matching the
-     * previous translucent shadow-filter input) and the premultiplied-linear uniform emission summary
+     * Per-sprite compile inputs gathered in a single pixel pass: the linear-RGB average RGBA (for the
+     * translucent shadow-filter / average albedo input) and the premultiplied-linear uniform emission summary
      * used when a state emits light but no per-texel mask was compiled.
      */
     private record SpriteStats(float[] average, RtMaterialDesc.EmissionSummary uniformSummary,
@@ -675,7 +677,8 @@ public final class RtMaterialRegistry {
         int height = contents.height();
         NativeImage image = ((SpriteContentsAccessor) contents).caustica$originalImage();
         if (image == null || width <= 0 || height <= 0) return SpriteStats.NEUTRAL;
-        long sr = 0L, sg = 0L, sb = 0L, sa = 0L;
+        double avgR = 0.0, avgG = 0.0, avgB = 0.0;
+        long sa = 0L;
         double lr = 0.0, lg = 0.0, lb = 0.0;
         int covered = 0;
         // A uniform (state-gated) emitter radiates alpha-weighted albedo per texel; its grid mirrors that
@@ -685,14 +688,17 @@ public final class RtMaterialRegistry {
             for (int x = 0; x < width; x++) {
                 int pixel = image.getPixel(x, y); // frame 0 always occupies the image's top-left tile
                 int a = ARGB.alpha(pixel);
-                sr += ARGB.red(pixel);
-                sg += ARGB.green(pixel);
-                sb += ARGB.blue(pixel);
+                float linR = RtMaterialTextureData.srgbToLinear(ARGB.red(pixel));
+                float linG = RtMaterialTextureData.srgbToLinear(ARGB.green(pixel));
+                float linB = RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel));
+                avgR += linR;
+                avgG += linG;
+                avgB += linB;
                 sa += a;
                 float alpha = a / 255.0f;
-                float plr = RtMaterialTextureData.srgbToLinear(ARGB.red(pixel)) * alpha;
-                float plg = RtMaterialTextureData.srgbToLinear(ARGB.green(pixel)) * alpha;
-                float plb = RtMaterialTextureData.srgbToLinear(ARGB.blue(pixel)) * alpha;
+                float plr = linR * alpha;
+                float plg = linG * alpha;
+                float plb = linB * alpha;
                 lr += plr;
                 lg += plg;
                 lb += plb;
@@ -701,8 +707,7 @@ public final class RtMaterialRegistry {
             }
         }
         float inv = 1.0f / (width * (float) height);
-        float scale = inv / 255.0f;
-        float[] average = {sr * scale, sg * scale, sb * scale, sa * scale};
+        float[] average = {(float) (avgR * inv), (float) (avgG * inv), (float) (avgB * inv), sa * (inv / 255.0f)};
         double luminance = 0.2126 * lr + 0.7152 * lg + 0.0722 * lb;
         RtMaterialDesc.EmissionSummary uniform = luminance <= 0.0
                 ? RtMaterialDesc.EmissionSummary.NONE

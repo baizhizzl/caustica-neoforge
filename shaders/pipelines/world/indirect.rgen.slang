@@ -121,7 +121,8 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
                 : baseSigma > 1.0e-7;
         if (hasMediumDensity) {
             float maxRange = max(vp0.y, 4.0);
-            float haloReach = min(segDist, maxRange);
+            float maxVolDist = min(segDist,
+                    currentMedium.water ? MAX_WATER_VOLUMETRIC_DIST : MAX_AIR_VOLUMETRIC_DIST);
             float heightFalloff = vp1.y;
             float seaLevelY = vp1.z;
             float3 chosenHalo = float3(0.0, 0.0, 0.0);
@@ -138,23 +139,31 @@ float3 evaluatePrimaryVolumetrics(float3 ro, float3 rd, float segDist, Medium cu
                 float radius = max(dl.posRadius.w, DYNAMIC_LIGHT_MIN_RADIUS);
                 float3 toC = center - ro;
                 float centerDist2 = dot(toC, toC);
-                if (centerDist2 > (maxRange + haloReach) * (maxRange + haloReach)) {
+                float tc = dot(toC, rd);
+                float dPerp2 = max(centerDist2 - tc * tc, 0.0);
+                float maxRange2 = maxRange * maxRange;
+                if (dPerp2 >= maxRange2) {
                     continue;
                 }
-                float tc = dot(toC, rd);
-                float perp2 = max(centerDist2 - tc * tc, 0.0) + radius * radius;
+                float halfSpan = sqrt(maxRange2 - dPerp2);
+                float tMin = max(0.0, tc - halfSpan);
+                float tMax = min(maxVolDist, tc + halfSpan);
+                if (tMax <= tMin) {
+                    continue;
+                }
+                float perp2 = dPerp2 + radius * radius;
                 float perp = sqrt(perp2);
-                float thetaA = atan((-tc) / perp);
-                float thetaB = atan((haloReach - tc) / perp);
+                float thetaA = atan((tMin - tc) / perp);
+                float thetaB = atan((tMax - tc) / perp);
                 float deltaTheta = max(thetaB - thetaA, 0.0);
                 if (deltaTheta <= 1.0e-5) {
                     continue;
                 }
                 float integral = deltaTheta / perp;
-                float tSample = clamp(tc + perp * tan(lerp(thetaA, thetaB, rndf(seed))), 0.0, haloReach);
+                float tSample = clamp(tc + perp * tan(lerp(thetaA, thetaB, rndf(seed))), tMin, tMax);
                 float3 samplePos = ro + rd * tSample;
                 float d2 = dot(center - samplePos, center - samplePos);
-                float rangeFade = clamp(1.0 - d2 / (maxRange * maxRange), 0.0, 1.0);
+                float rangeFade = clamp(1.0 - d2 / maxRange2, 0.0, 1.0);
                 rangeFade *= rangeFade;
                 float3 trans = float3(1.0, 1.0, 1.0);
                 float3 localSigma = float3(0.0, 0.0, 0.0);
@@ -337,8 +346,10 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             if (isWater && waterWaves) {
                 float2 waterDomain = hitPos.xz + wp[0].waterAnchor.xy;
                 float waterFootprint = rayConeWidth / max(abs(dot(-rd, geometricNormal)), 0.2);
-                n = applyWaterWaves(geometricNormal, waterDomain,
-                                    wp[0].waterParams.w, waterFootprint);
+                n = clampWaterWaveNormal(
+                        applyWaterWaves(geometricNormal, waterDomain,
+                                wp[0].waterParams.w, waterFootprint),
+                        geometricNormal, rd);
             }
 
             Medium entered = makeDielectricMedium(isWater, max(payloadIor(), 1.0), tint, transmission);
@@ -353,7 +364,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             float3 transmittedDir = refract(rd, facetNormal, etaI / etaT);
             float transmitBias = isWater ? SURF_BIAS : INSET_TRANSMIT_BIAS;
 
-            bool hasTransmitted = dot(transmittedDir, transmittedDir) > 0.0;
+            bool hasTransmitted = dot(transmittedDir, transmittedDir) > 0.0
+                    && dot(transmittedDir, geometricNormal) < 0.0;
             bool chooseReflection = !hasTransmitted || (rndf(seed) < F);
             if (chooseReflection) {
                 float3 reflDir = reflect(rd, facetNormal);
@@ -362,6 +374,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
                     if (ndl <= 0.0) break;
                     throughput *= ggxG1(ndl, dielectricRough);
                 }
+                if (dot(reflDir, geometricNormal) <= 0.0) break;
                 rd = reflDir;
                 ro = offsetSurfaceOrigin(hitPos, geometricNormal, rd, SURF_BIAS);
             } else {
@@ -382,10 +395,16 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             if (frostedDielectric) {
                 rayConeSpread = max(rayConeSpread, dielectricRough * RAY_CONE_GLOSSY_SPREAD_SCALE);
             }
-            // Preserve showCelestial & prevBsdfPdf from the incoming path: a camera/mirror chain stays
-            // delta-visible through windows and water, whereas a diffuse/glossy ray that already ran sun
-            // NEE through the window will not re-enable the 33-degree sprite and double-count sunlight.
-            prevSampledDynamic = false; // a dielectric does no dynamic NEE; emission may be seen again
+            if (chooseReflection || frostedDielectric) {
+                // Reflection and rough refraction leave the straight-line NEE visibility domain of the
+                // previous shaded vertex, so emitters/celestials along this new direction were never
+                // sampled there and must be evaluated at full weight.
+                showCelestial = true;
+                prevBsdfPdf = 0.0;
+                prevSampledDynamic = false;
+            }
+            // Smooth transmission preserves showCelestial, prevBsdfPdf, and prevSampledDynamic from
+            // the previous vertex because straight-line shadow rays already pass through water/glass.
             if (max(throughput.r, max(throughput.g, throughput.b)) <= 1.0e-5) {
                 break;
             }
@@ -422,7 +441,9 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
                 float ndl = abs(signedNdl);
                 if (ndl > 0.0) {
                     float3 shadowOrigin = hitPos + (signedNdl >= 0.0 ? n : -n) * SURF_BIAS;
-                    float3 vis = visibility(shadowOrigin, lightDir, 10000.0).transmittance;
+                    VisibilityResult shadow = visibility(shadowOrigin, lightDir, 10000.0);
+                    float3 vis = shadow.transmittance
+                            * waterShadowTransmittance(medium.current, shadow, 10000.0);
                     if (max(vis.r, max(vis.g, vis.b)) > 0.0) {
                         L += throughput * albedo * INV_PI * celestialLight.illuminance * ndl * vis;
                     }
@@ -435,7 +456,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
                                          float3(1.0, 1.0, 1.0), true, hasBsdfContinuation, 0.0, risCandidates, seed,
                                          proposalSeed);
                 L += throughput * shadeReservoir(r, hitPos, n, v, rd, albedo, float3(0.0, 0.0, 0.0), 1.0,
-                                                 float3(1.0, 1.0, 1.0), true, hasBsdfContinuation, 0.0);
+                                                 float3(1.0, 1.0, 1.0), true, hasBsdfContinuation, 0.0,
+                                                 medium.current);
             }
 
             if (dynLightsOn) {
@@ -522,7 +544,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             float ndl = max(0.0, dot(n, lightDir));
             if (ndl > 0.0 && wSunNee > 0.0) {
                 VisibilityResult shadow = visibility(p, lightDir, 10000.0);
-                float3 vis = shadow.transmittance;
+                float3 vis = shadow.transmittance
+                        * waterShadowTransmittance(medium.current, shadow, 10000.0);
                 if (medium.current.water && waterWaves && shadow.waterHitT > 0.0) {
                     vis *= waterCausticSpectral(p + lightDir * shadow.waterHitT, lightDir, shadow.waterHitT,
                             causticsIntensity, rayConeWidth);
@@ -548,7 +571,7 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             Reservoir r = risInitial(hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
                                      hasBsdfContinuation, activeSss, risCandidates, seed, proposalSeed);
             L += throughput * shadeReservoir(r, hitPos, n, v, rd, diffAlb, F0, rough, msScale, false,
-                                             hasBsdfContinuation, activeSss);
+                                             hasBsdfContinuation, activeSss, medium.current);
         }
 
         // RIS direct + first-bounce indirect lighting from dynamic spherical emitters (handheld torches,
@@ -568,7 +591,8 @@ public float3 tracePath(PathSegment seg, uint2 pix, uint sampleIndex, uint cache
             float backNdl = max(0.0, dot(-n, lightDir));
             if (backNdl > 0.0) {
                 VisibilityResult shadowBack = visibility(hitPos - n * SURF_BIAS, lightDir, 10000.0);
-                float3 visB = shadowBack.transmittance;
+                float3 visB = shadowBack.transmittance
+                        * waterShadowTransmittance(medium.current, shadowBack, 10000.0);
                 if (medium.current.water && waterWaves && shadowBack.waterHitT > 0.0) {
                     visB *= waterCausticSpectral(hitPos + lightDir * shadowBack.waterHitT,
                                                  lightDir, shadowBack.waterHitT, causticsIntensity, rayConeWidth);

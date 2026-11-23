@@ -160,11 +160,25 @@ float2 clampEntityUvForGrad(float2 uv, float4 albedoUv, float2 uv0, float2 uv1, 
     return clamp(uv, triMin + rUv, triMax - rUv);
 }
 
+float3 safeUnitNormal(float3 v, float3 p0, float3 p1, float3 p2) {
+    float lenSq = dot(v, v);
+    if (lenSq > 1.0e-12) {
+        return v * rsqrt(lenSq);
+    }
+    float3 geo = cross(p1 - p0, p2 - p0);
+    float geoLenSq = dot(geo, geo);
+    if (geoLenSq > 1.0e-12) {
+        return geo * rsqrt(geoLenSq);
+    }
+    return float3(0.0, 1.0, 0.0);
+}
+
 // LabPBR _n decode (shared): rotate the tangent-space normal into world space via a TBN built from the
 // hit triangle's vertex positions (VK_KHR_ray_tracing_position_fetch) + UVs. `n` must already be
-// oriented toward the viewer (`vdir`). Clamps the result above the horizon so grazing perturbations
-// don't invert it through the surface (the black-spot fix). `normalAtten` tapers unresolved normal
-// slopes past the compiled mip ceiling while folding their variance into GGX roughness (Specular AA).
+// oriented toward the viewer (`vdir`). LabPBR _n follows the OpenGL convention (+X = +u right,
+// +Y = -v up), so bitangent handedness is matched directly against -dP/dv (invariant to winding,
+// UV mirroring, and viewer-side normal flips). Clamps the result above the horizon so grazing
+// perturbations don't invert through the surface.
 float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float2 t1, float2 t2,
         float3 vdir, float4 ntex, float normalAtten, out float ao, out float normalSlopeSq) {
     ao = 1.0;
@@ -176,9 +190,18 @@ float3 perturbNormal(float3 n, float3 p0, float3 p1, float3 p2, float2 t0, float
         return n;
     }
     float r = 1.0 / det;
-    float3 traw = ((p1 - p0) * g2.y - (p2 - p0) * g1.y) * r;
-    float3 T = normalize(traw - n * dot(n, traw));       // Gram-Schmidt against the viewer-oriented normal
-    float3 B = cross(n, T) * (det < 0.0 ? -1.0 : 1.0);   // handedness from the UV winding
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float3 traw = (e1 * g2.y - e2 * g1.y) * r;           // +dP/du (+X right)
+    float3 braw = (e1 * g2.x - e2 * g1.x) * r;           // -dP/dv (+Y up in OpenGL/LabPBR)
+    float3 tProj = traw - n * dot(n, traw);
+    float tLenSq = dot(tProj, tProj);
+    if (tLenSq <= 1.0e-12) {
+        return n;
+    }
+    float3 T = tProj * rsqrt(tLenSq);
+    float3 bCand = cross(n, T);
+    float3 B = dot(bCand, braw) < 0.0 ? -bCand : bCand;
     float2 rawNxy = ntex.xy * 2.0 - 1.0;                 // R,G = tangent-space X,Y
     normalSlopeSq = dot(rawNxy, rawNxy);
     float2 nxy = rawNxy * normalAtten;
@@ -262,13 +285,17 @@ Surface evaluateMaterial(MaterialHeader header, float2 atlasUv, RayConeGradients
         float4 surface0 = samplePageSurface0(page, pageUv, matDdx, matDdy);
         if ((header.features & MATERIAL_FEATURE_SPEC) != 0u) {
             float4 surface1 = samplePageSurface1(page, pageUv, matDdx, matDdy); // LabPBR F0
-            surface.roughness = surface0.r;
-            surface.metalness = surface0.g;
+            surface.roughness = (header.features & MATERIAL_FEATURE_OVERRIDE_ROUGHNESS) != 0u
+                    ? fallbackRoughness : surface0.r;
+            surface.metalness = (header.features & MATERIAL_FEATURE_OVERRIDE_METALNESS) != 0u
+                    ? fallbackMetalness : surface0.g;
             surface.emission = surface0.b;
             surface.sss = allowSss ? surface0.a : 0.0;
             // Canonical LabPBR F0 is authored in the asset's BT.709 RGB basis. Fresnel is evaluated in
             // the transport basis, so coloured metal/custom F0 crosses the same boundary as albedo.
-            surface.f0 = clamp(bt709ToAcesCg(surface1.rgb), float3(0.0), float3(1.0));
+            surface.f0 = (header.features & MATERIAL_FEATURE_OVERRIDE_METALNESS) != 0u
+                    ? lerp(float3(0.04, 0.04, 0.04), albedo, surface.metalness)
+                    : clamp(bt709ToAcesCg(surface1.rgb), float3(0.0), float3(1.0));
         } else {
             // Eligibility is compiled from block-state semantics; the primitive's exact light level
             // supplies strength, while the page supplies only the normalized spatial mask.
@@ -353,7 +380,7 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 pp2 = mul(o2w, HitTriangleVertexPosition(2));
         float particleLod = rayConeTextureLod(rayCone, texSizePx(entityAlbedoTex[NonUniformResourceIndex(pslot)]),
                 pp0, pp1, pp2, uvb[p0], uvb[p1], uvb[p2]);
-        float3 pn = normalize(pr.normal.xyz);
+        float3 pn = safeUnitNormal(pr.normal.xyz, pp0, pp1, pp2);
         if (dot(pn, WorldRayDirection()) > 0.0) {
             pn = -pn;
         }
@@ -389,10 +416,13 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         // normal (and the TBN source positions below) are object-space — rotate them into world space.
         // Identity/translation instances make this a no-op.
         float3x3 entityO2w = (float3x3)ObjectToWorld3x4();
+        float3 ep0 = mul(entityO2w, HitTriangleVertexPosition(0));
+        float3 ep1 = mul(entityO2w, HitTriangleVertexPosition(1));
+        float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
         // Orient the geometric normal toward the viewer first (so the _n TBN is built in the right
         // hemisphere — same fix as terrain).
         float3 vdir = -WorldRayDirection();
-        float3 n = normalize(mul(entityO2w, pr.normal.xyz));
+        float3 n = safeUnitNormal(mul(entityO2w, pr.normal.xyz), ep0, ep1, ep2);
         bool entering = dot(WorldRayDirection(), n) < 0.0;
         if (dot(n, vdir) < 0.0) {
             n = -n;
@@ -407,9 +437,6 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
         float3 ebary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
         float2 euvCoord = ebary.x * euv[e0] + ebary.y * euv[e1] + ebary.z * euv[e2];
         int texSlot = int(pr.tint.w + 0.5);
-        float3 ep0 = mul(entityO2w, HitTriangleVertexPosition(0));
-        float3 ep1 = mul(entityO2w, HitTriangleVertexPosition(1));
-        float3 ep2 = mul(entityO2w, HitTriangleVertexPosition(2));
         MaterialHeader header = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
         RayConeGradients entityGrad = rayConeSurfaceGradients(rayCone, n, vdir,
                 ep0, ep1, ep2, euv[e0], euv[e1], euv[e2]);
@@ -465,7 +492,10 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     uint pid = PrimitiveIndex() + sec.triBase[GeometryIndex()];
     TerrainPrim pr = ConstPtr<TerrainPrim>(sec.primAddr)[pid];
     MaterialHeader materialHeader = ConstPtr<MaterialHeader>(pc.materialTableAddr)[pr.materialId];
-    float3 n = normalize(pr.normal.xyz);
+    float3 tp0 = HitTriangleVertexPosition(0);
+    float3 tp1 = HitTriangleVertexPosition(1);
+    float3 tp2 = HitTriangleVertexPosition(2);
+    float3 n = safeUnitNormal(pr.normal.xyz, tp0, tp1, tp2);
     float3 tint = pr.tint.rgb;
 
     // Water prims are single-sided, wound outward from the fluid volume (RtFluidMesher), so the
@@ -485,9 +515,6 @@ void main(inout Payload payload, in BuiltInTriangleIntersectionAttributes attr) 
     float2 uv2 = uvs[3u * pid + 2u];
     float3 bary = float3(1.0 - attribs.x - attribs.y, attribs.x, attribs.y);
     float2 uv = bary.x * uv0 + bary.y * uv1 + bary.z * uv2;
-    float3 tp0 = HitTriangleVertexPosition(0);
-    float3 tp1 = HitTriangleVertexPosition(1);
-    float3 tp2 = HitTriangleVertexPosition(2);
 
     // Orient the GEOMETRIC normal toward the viewer FIRST (double-sided geometry), so the normal-map TBN
     // is built in the correct hemisphere. Doing this before the map — rather than flipping the perturbed

@@ -40,10 +40,12 @@ public abstract class GuiRendererMixin {
 			if (mode == RtGuiBlend.Mode.OVER) {
 				original.call(label, target, transforms, first, next);
 				RtUiOverlay.noteGuiDraws();
-			} else {
-				RtUiOverlay.beginGuiEffect(mode);
+			} else if (RtUiOverlay.beginGuiEffect(mode)) {
 				original.call(label, target, transforms, first, next);
 				RtUiOverlay.finishGuiEffect(mode);
+			} else {
+				original.call(label, target, transforms, first, next);
+				RtUiOverlay.noteGuiDraws();
 			}
 			first = next;
 		}

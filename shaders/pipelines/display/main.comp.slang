@@ -239,8 +239,8 @@ float3 displayGammaHdr(float3 pqColor) {
 // span in 8-bit UNORM). Kept spatially stationary so post-RR 8-bit SDR quantization eliminates sky,
 // volumetric-haze, and underwater gradient banding without introducing static shimmer into DLSS-FG.
 float3 ditherSdr8Bit(float3 sdrColor, int2 pix) {
-    if (all(sdrColor <= float3(0.0))) {
-        return sdrColor;
+    if (all(sdrColor <= float3(1.0e-5))) {
+        return float3(0.0);
     }
     float u = frac(52.9829189 * frac(dot(float2(pix) + 0.5, float2(0.06711056, 0.00583715))));
     float tri = u < 0.5 ? (sqrt(2.0 * u) - 1.0) : (1.0 - sqrt(2.0 * (1.0 - u)));
@@ -332,7 +332,10 @@ void main(uint3 dispatchId : SV_DispatchThreadID, uint3 groupId : SV_GroupID,
         }
     }
     float3 lookedAcesCg = gradeSceneAcesCg(applyLook(exposedAcesCg));
-    outputImage[pix] = float4(ditherSdr8Bit(tonemap(lookedAcesCg), pix), 1.0);
+    float3 sdr = all(lookedAcesCg <= float3(0.0))
+            ? float3(0.0)
+            : ditherSdr8Bit(tonemap(lookedAcesCg), pix);
+    outputImage[pix] = float4(sdr, 1.0);
 
     if (pc.hdrEnabled != 0) {
         hdrImage[pix] = float4(tonemapHdr(lookedAcesCg), 1.0);

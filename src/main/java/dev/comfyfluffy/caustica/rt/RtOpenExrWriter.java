@@ -137,7 +137,9 @@ final class RtOpenExrWriter {
 
         OffsetDateTime now = OffsetDateTime.now();
         stringAttribute(bytes, "capDate", CAPTURE_DATE.format(now));
-        floatAttribute(bytes, "utcOffset", now.getOffset().getTotalSeconds());
+        int offsetSeconds = now.getOffset().getTotalSeconds();
+        // OpenEXR defines utcOffset as UTC - local time in seconds.
+        floatAttribute(bytes, "utcOffset", offsetSeconds == 0 ? 0.0f : -offsetSeconds);
         stringAttribute(bytes, "software", "Caustica");
         stringAttribute(bytes, "comments",
                 "Residual-exposed scene-linear ACEScg; before Look/LMT, ACES output transform, and UI");

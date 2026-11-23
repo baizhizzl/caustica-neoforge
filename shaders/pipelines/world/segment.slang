@@ -103,9 +103,9 @@ public float2 unpackUnorm16x2(uint p) {
 public uint packRgb9e5(float3 value) {
     float3 v = clamp(value, 0.0, 65408.0);
     float maxChannel = max(v.x, max(v.y, v.z));
-    uint exponent = maxChannel < exp2(-16.0)
-            ? 0u : uint(floor(log2(maxChannel))) + 16u;
-    exponent = min(exponent, 31u);
+    int expSigned = maxChannel < exp2(-16.0)
+            ? 0 : max(int(floor(log2(maxChannel))) + 16, 0);
+    uint exponent = min(uint(expSigned), 31u);
     float scale = exp2(float(int(exponent) - 24));
     uint maxMantissa = uint(floor(maxChannel / scale + 0.5));
     if (maxMantissa == 512u && exponent < 31u) {

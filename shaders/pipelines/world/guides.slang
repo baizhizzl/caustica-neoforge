@@ -107,6 +107,9 @@ public float2 resolveSpecularGuides(SpecSurface surface, float3 primaryDir,
     float3 surfacePos = surface.camRel + wp[0].camOffset;
     float3 n = normalize(surface.normal);
     float3 specDir = reflect(primaryDir, n);
+    if (dot(specDir, surface.biasNormal) <= 0.0) {
+        specDir = reflect(primaryDir, normalize(surface.biasNormal));
+    }
 
     // Pass A stops radiance traversal at the first split, so reflection motion keeps one dedicated,
     // deterministic guide probe.
@@ -178,7 +181,9 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
     uint maxCrossings = (flags & WORLD_FLAG_SPEC_GUIDES) != 0u ? wp[0].maxBounces : min(wp[0].maxBounces, 1u);
 
     for (uint crossing = 0u; crossing < maxCrossings; ++crossing) {
-        traceGuide(CULL_SECONDARY, ro, RAY_TMIN, direction, 10000.0,
+        // Use tmin = 0.0 to match Pass B: ro is already offset by rayBias (INSET_TRANSMIT_BIAS = 1e-4
+        // for inset translucent faces), so RAY_TMIN = 0.001 would skip immediately adjacent solid faces.
+        traceGuide(CULL_SECONDARY, ro, 0.0, direction, 10000.0,
                 rayConeWidth, rayConeSpread);
         if (payload.hitT <= 0.0) {
             setTransmissionGuide((ro + direction * 1.0e6) - camOffset,
@@ -211,9 +216,11 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
         if (isWater && (flags & WORLD_FLAG_WATER_WAVES) != 0u) {
             float waterFootprint = rayConeWidth
                     / max(abs(dot(-direction, geometricNormal)), 0.2);
-            interfaceNormal = applyWaterWaves(geometricNormal,
-                    interfacePos.xz + wp[0].waterAnchor.xy,
-                    wp[0].waterParams.w, waterFootprint);
+            interfaceNormal = clampWaterWaveNormal(
+                    applyWaterWaves(geometricNormal,
+                            interfacePos.xz + wp[0].waterAnchor.xy,
+                            wp[0].waterParams.w, waterFootprint),
+                    geometricNormal, direction);
         }
 
         float transmission = clamp(payloadTransmission(), 0.0, 1.0);
@@ -221,7 +228,7 @@ public void resolveTransmissionGuide(float3 surfacePos, float3 transmittedDir,
                                               payloadAlbedo(), transmission);
         float etaT = entering ? entered.ior : medium.outer.ior;
         float3 nextDirection = refract(direction, interfaceNormal, medium.current.ior / etaT);
-        if (dot(nextDirection, nextDirection) <= 0.0) {
+        if (dot(nextDirection, nextDirection) <= 0.0 || dot(nextDirection, geometricNormal) >= 0.0) {
             // Never let a TIR reflection become ordinary diffuse/depth.
             float tirRough = isWater ? 0.0 : clamp(payloadRoughness(), 0.0, 1.0);
             tirRough = isDeltaAlpha(tirRough) ? 0.0 : tirRough;

@@ -47,13 +47,13 @@ public final class RtVideoOptions {
         RtDlssFg fg = RtDlssFg.INSTANCE;
         // Query even when FG is off, so the user can enable it without a restart or a JVM property.
         fg.probeAvailabilityOnce();
-        boolean available = fg.isAvailable();
-        OptionInstance<Boolean> fgEnabled = frameGenerationEnabled(available);
+        boolean supported = fg.isSupported();
+        OptionInstance<Boolean> fgEnabled = frameGenerationEnabled(supported);
         List<Integer> counts = DlssSettings.generatedFrameChoices(fg.multiFrameCountMax());
-        OptionInstance<Integer> fgMultiplier = frameGenerationMultiplier(counts, available);
+        OptionInstance<Integer> fgMultiplier = frameGenerationMultiplier(counts, supported);
         list.addSmall(runtimeOptions(fgEnabled, fgMultiplier));
-        setActive(list, fgEnabled, available);
-        setActive(list, fgMultiplier, available && counts.size() > 1);
+        setActive(list, fgEnabled, supported);
+        setActive(list, fgMultiplier, supported && counts.size() > 1);
     }
 
     private static void setActive(OptionsList list, OptionInstance<?> option, boolean active) {

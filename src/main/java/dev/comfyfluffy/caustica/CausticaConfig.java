@@ -5,6 +5,8 @@ import com.electronwill.nightconfig.core.file.CommentedFileConfig;
 import com.electronwill.nightconfig.core.file.FileNotFoundAction;
 import com.electronwill.nightconfig.toml.TomlFormat;
 import dev.comfyfluffy.caustica.ngx.DlssSettings;
+import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -19,7 +21,8 @@ import org.slf4j.LoggerFactory;
  * Central mutable runtime configuration. Each setting resolves its value, in order of precedence, from a
  * {@code -Dcaustica.*} system property, then the {@code config/caustica.toml} file, then a hardcoded
  * default. The settings UI and any other code call the same {@code set(...)} methods, and {@link #save()}
- * writes the current values back to the TOML file.
+ * writes the persisted values back to the TOML file without baking transient {@code -D} overrides unless
+ * they were explicitly modified via {@code set(...)}.
  *
  * <p>The system property namespace ({@code caustica.rt.foo}) and the TOML layout are independent: the file
  * uses real nested tables (e.g. {@code [omm]} with a {@code subdivision} key) grouped for readability, while
@@ -66,10 +69,10 @@ public final class CausticaConfig {
         };
     }
 
-    /** Writes the default config file if it does not exist yet. */
+    /** Writes the default config file only when the file does not exist on disk yet. */
     public static void saveIfMissing() {
         ensureRegistered();
-        if (FILE.valueMap().isEmpty()) {
+        if (!Files.exists(CONFIG_PATH)) {
             save();
         }
     }
@@ -77,6 +80,14 @@ public final class CausticaConfig {
     /** Serializes all registered settings to the TOML config file. */
     public static synchronized void save() {
         ensureRegistered();
+        Path parent = CONFIG_PATH.getParent();
+        if (parent != null) {
+            try {
+                Files.createDirectories(parent);
+            } catch (IOException e) {
+                LOGGER.warn("Failed to create Caustica config directory {}: {}", parent, e.toString());
+            }
+        }
         writeComments();
         // lights.presampling is no longer read; drop it so a stale `true` is not mistaken for the active switch.
         FILE.remove("lights.presampling");
@@ -137,28 +148,69 @@ public final class CausticaConfig {
 
     private static CommentedFileConfig loadFile(Path path) {
         CommentedFileConfig config = CommentedFileConfig.builder(path, TomlFormat.instance())
-                .onFileNotFound(FileNotFoundAction.CREATE_EMPTY)
+                .onFileNotFound(FileNotFoundAction.READ_NOTHING)
                 .preserveInsertionOrder()
                 .sync()
                 .build();
-        try {
-            config.load();
-        } catch (Exception e) {
-            LOGGER.warn("Failed to read Caustica config {}: {}", path, e.toString());
+        if (Files.exists(path)) {
+            try {
+                config.load();
+            } catch (Exception e) {
+                LOGGER.warn("Failed to read Caustica config {}: {}", path, e.toString());
+            }
         }
         return config;
     }
 
+    static Boolean readBoolean(CommentedConfig config, String tomlPath) {
+        if (!config.contains(tomlPath)) {
+            return null;
+        }
+        Object raw = config.get(tomlPath);
+        if (raw instanceof Boolean b) {
+            return b;
+        }
+        LOGGER.warn("Ignoring invalid boolean for config key '{}' (got {}): using default",
+                tomlPath, raw == null ? "null" : raw.getClass().getSimpleName());
+        return null;
+    }
+
+    static Number readNumber(CommentedConfig config, String tomlPath) {
+        if (!config.contains(tomlPath)) {
+            return null;
+        }
+        Object raw = config.get(tomlPath);
+        if (raw instanceof Number n) {
+            return n;
+        }
+        LOGGER.warn("Ignoring invalid number for config key '{}' (got {}): using default",
+                tomlPath, raw == null ? "null" : raw.getClass().getSimpleName());
+        return null;
+    }
+
+    static String readString(CommentedConfig config, String tomlPath) {
+        if (!config.contains(tomlPath)) {
+            return null;
+        }
+        Object raw = config.get(tomlPath);
+        if (raw instanceof String s) {
+            return s;
+        }
+        LOGGER.warn("Ignoring invalid string for config key '{}' (got {}): using default",
+                tomlPath, raw == null ? "null" : raw.getClass().getSimpleName());
+        return null;
+    }
+
     private static Boolean fileBoolean(String tomlPath) {
-        return FILE.contains(tomlPath) ? FILE.<Boolean>get(tomlPath) : null;
+        return readBoolean(FILE, tomlPath);
     }
 
     private static Number fileNumber(String tomlPath) {
-        return FILE.contains(tomlPath) ? FILE.<Number>get(tomlPath) : null;
+        return readNumber(FILE, tomlPath);
     }
 
     private static String fileString(String tomlPath) {
-        return FILE.contains(tomlPath) ? FILE.<String>get(tomlPath) : null;
+        return readString(FILE, tomlPath);
     }
 
     public interface RuntimeSetting<T> {
@@ -176,7 +228,7 @@ public final class CausticaConfig {
 
         void reloadFromSystemProperties();
 
-        /** Writes this setting's current value into the given config at {@link #tomlPath()}. */
+        /** Writes this setting's persisted value into the given config at {@link #tomlPath()}. */
         void writeToFile(CommentedConfig config);
     }
 
@@ -185,12 +237,13 @@ public final class CausticaConfig {
         private final String tomlPath;
         private final boolean defaultValue;
         private volatile boolean value;
+        private volatile boolean persistedValue;
 
         private BooleanSetting(String key, String tomlPath, boolean defaultValue) {
             this.key = key;
             this.tomlPath = tomlPath;
             this.defaultValue = defaultValue;
-            this.value = resolveInitial();
+            reloadFromSystemProperties();
             SETTINGS.add(this);
         }
 
@@ -220,26 +273,23 @@ public final class CausticaConfig {
 
         @Override
         public void set(Boolean value) {
-            this.value = value != null ? value : defaultValue;
+            boolean resolved = value != null ? value : defaultValue;
+            this.value = resolved;
+            this.persistedValue = resolved;
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = resolveInitial();
+            Boolean fromFile = fileBoolean(tomlPath);
+            boolean base = fromFile != null ? fromFile : defaultValue;
+            this.persistedValue = base;
+            String prop = System.getProperty(key);
+            this.value = prop != null ? Boolean.parseBoolean(prop.trim()) : base;
         }
 
         @Override
         public void writeToFile(CommentedConfig config) {
-            config.set(tomlPath, value);
-        }
-
-        private boolean resolveInitial() {
-            String prop = System.getProperty(key);
-            if (prop != null) {
-                return Boolean.parseBoolean(prop.trim());
-            }
-            Boolean fromFile = fileBoolean(tomlPath);
-            return fromFile != null ? fromFile : defaultValue;
+            config.set(tomlPath, persistedValue);
         }
     }
 
@@ -249,13 +299,14 @@ public final class CausticaConfig {
         private final int defaultValue;
         private final IntUnaryOperator sanitize;
         private volatile int value;
+        private volatile int persistedValue;
 
         private IntSetting(String key, String tomlPath, int defaultValue, IntUnaryOperator sanitize) {
             this.key = key;
             this.tomlPath = tomlPath;
             this.defaultValue = sanitize.applyAsInt(defaultValue);
             this.sanitize = sanitize;
-            this.value = resolveInitial();
+            reloadFromSystemProperties();
             SETTINGS.add(this);
         }
 
@@ -285,30 +336,31 @@ public final class CausticaConfig {
 
         @Override
         public void set(Integer value) {
-            this.value = sanitize.applyAsInt(value != null ? value : defaultValue);
+            int resolved = sanitize.applyAsInt(value != null ? value : defaultValue);
+            this.value = resolved;
+            this.persistedValue = resolved;
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = resolveInitial();
+            Number fromFile = fileNumber(tomlPath);
+            int base = fromFile != null ? sanitize.applyAsInt(fromFile.intValue()) : defaultValue;
+            this.persistedValue = base;
+            String prop = System.getProperty(key);
+            if (prop != null) {
+                try {
+                    this.value = sanitize.applyAsInt(Integer.parseInt(prop.trim()));
+                } catch (NumberFormatException e) {
+                    this.value = base;
+                }
+            } else {
+                this.value = base;
+            }
         }
 
         @Override
         public void writeToFile(CommentedConfig config) {
-            config.set(tomlPath, value);
-        }
-
-        private int resolveInitial() {
-            String prop = System.getProperty(key);
-            if (prop != null) {
-                try {
-                    return sanitize.applyAsInt(Integer.parseInt(prop.trim()));
-                } catch (NumberFormatException e) {
-                    return defaultValue;
-                }
-            }
-            Number fromFile = fileNumber(tomlPath);
-            return fromFile != null ? sanitize.applyAsInt(fromFile.intValue()) : defaultValue;
+            config.set(tomlPath, persistedValue);
         }
     }
 
@@ -326,6 +378,7 @@ public final class CausticaConfig {
         // Idempotent guard on a value-domain number (clamp / finite check); safe to apply to any source.
         private final DoubleUnaryOperator valueClamp;
         private volatile float value;
+        private volatile float persistedValue;
 
         private FloatSetting(String key, String tomlPath, float rawDefault, DoubleUnaryOperator inputTransform,
                              DoubleUnaryOperator outputTransform, DoubleUnaryOperator valueClamp) {
@@ -335,7 +388,7 @@ public final class CausticaConfig {
             this.outputTransform = outputTransform;
             this.valueClamp = valueClamp;
             this.defaultValue = (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(rawDefault));
-            this.value = resolveInitial();
+            reloadFromSystemProperties();
             SETTINGS.add(this);
         }
 
@@ -365,16 +418,29 @@ public final class CausticaConfig {
 
         @Override
         public void set(Float value) {
-            if (value == null) {
-                this.value = defaultValue;
-            } else {
-                this.value = (float) valueClamp.applyAsDouble(value);
-            }
+            float resolved = value == null ? defaultValue : (float) valueClamp.applyAsDouble(value);
+            this.value = resolved;
+            this.persistedValue = resolved;
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = resolveInitial();
+            Number fromFile = fileNumber(tomlPath);
+            float base = fromFile != null
+                    ? (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(fromFile.doubleValue()))
+                    : defaultValue;
+            this.persistedValue = base;
+            String prop = System.getProperty(key);
+            if (prop != null) {
+                try {
+                    this.value = (float) valueClamp.applyAsDouble(
+                            inputTransform.applyAsDouble(Double.parseDouble(prop.trim())));
+                } catch (NumberFormatException e) {
+                    this.value = base;
+                }
+            } else {
+                this.value = base;
+            }
         }
 
         @Override
@@ -382,24 +448,11 @@ public final class CausticaConfig {
             // Round-trip through Float.toString() so the file gets the shortest decimal that reproduces
             // this float (e.g. "0.6"), not outputTransform's raw double with float's binary noise spelled
             // out to 17 digits (e.g. 0.6000000487130328).
-            float raw = (float) outputTransform.applyAsDouble(value);
+            float raw = (float) outputTransform.applyAsDouble(persistedValue);
+            if (!Float.isFinite(raw)) {
+                raw = (float) outputTransform.applyAsDouble(defaultValue);
+            }
             config.set(tomlPath, Double.parseDouble(Float.toString(raw)));
-        }
-
-        private float resolveInitial() {
-            String prop = System.getProperty(key);
-            if (prop != null) {
-                try {
-                    return (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(Double.parseDouble(prop.trim())));
-                } catch (NumberFormatException e) {
-                    return defaultValue;
-                }
-            }
-            Number fromFile = fileNumber(tomlPath);
-            if (fromFile == null) {
-                return defaultValue;
-            }
-            return (float) valueClamp.applyAsDouble(inputTransform.applyAsDouble(fromFile.doubleValue()));
         }
     }
 
@@ -409,13 +462,14 @@ public final class CausticaConfig {
         private final String defaultValue;
         private final UnaryOperator<String> sanitize;
         private volatile String value;
+        private volatile String persistedValue;
 
         private StringSetting(String key, String tomlPath, String defaultValue, UnaryOperator<String> sanitize) {
             this.key = key;
             this.tomlPath = tomlPath;
             this.defaultValue = sanitize.apply(defaultValue);
             this.sanitize = sanitize;
-            this.value = resolveInitial();
+            reloadFromSystemProperties();
             SETTINGS.add(this);
         }
 
@@ -441,26 +495,23 @@ public final class CausticaConfig {
 
         @Override
         public void set(String value) {
-            this.value = sanitize.apply(value != null ? value : defaultValue);
+            String resolved = sanitize.apply(value != null ? value : defaultValue);
+            this.value = resolved;
+            this.persistedValue = resolved;
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = resolveInitial();
+            String fromFile = fileString(tomlPath);
+            String base = sanitize.apply(fromFile != null ? fromFile : defaultValue);
+            this.persistedValue = base;
+            String prop = System.getProperty(key);
+            this.value = prop != null ? sanitize.apply(prop) : base;
         }
 
         @Override
         public void writeToFile(CommentedConfig config) {
-            config.set(tomlPath, value);
-        }
-
-        private String resolveInitial() {
-            String prop = System.getProperty(key);
-            if (prop != null) {
-                return sanitize.apply(prop);
-            }
-            String fromFile = fileString(tomlPath);
-            return sanitize.apply(fromFile != null ? fromFile : defaultValue);
+            config.set(tomlPath, persistedValue);
         }
     }
 
@@ -468,11 +519,12 @@ public final class CausticaConfig {
         private final String key;
         private final String tomlPath;
         private volatile String value;
+        private volatile String persistedValue;
 
         private OptionalStringSetting(String key, String tomlPath) {
             this.key = key;
             this.tomlPath = tomlPath;
-            this.value = resolveInitial();
+            reloadFromSystemProperties();
             SETTINGS.add(this);
         }
 
@@ -499,25 +551,24 @@ public final class CausticaConfig {
         @Override
         public void set(String value) {
             this.value = value;
+            this.persistedValue = value;
         }
 
         @Override
         public void reloadFromSystemProperties() {
-            this.value = resolveInitial();
+            String base = fileString(tomlPath);
+            this.persistedValue = base;
+            String prop = System.getProperty(key);
+            this.value = prop != null ? prop : base;
         }
 
         @Override
         public void writeToFile(CommentedConfig config) {
-            if (value != null) {
-                config.set(tomlPath, value);
+            if (persistedValue != null) {
+                config.set(tomlPath, persistedValue);
             } else {
                 config.remove(tomlPath);
             }
-        }
-
-        private String resolveInitial() {
-            String prop = System.getProperty(key);
-            return prop != null ? prop : fileString(tomlPath);
         }
     }
 
@@ -815,7 +866,7 @@ public final class CausticaConfig {
              * 3.8e-6 multiplier requested by {@code -18 EV}; min-ev/max-ev provides the artistic bound.
              */
             public static float clampScale(float value) {
-                return Math.clamp(value, 1.0e-8f, 1.0e8f);
+                return Float.isFinite(value) ? Math.clamp(value, 1.0e-8f, 1.0e8f) : 1.0f;
             }
 
             private static String sanitizeMode(String value) {
@@ -1036,11 +1087,13 @@ public final class CausticaConfig {
     }
 
     private static FloatSetting exposureScale(String key, String tomlPath, float fallback) {
-        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v, v -> Math.clamp(v, 1.0e-4, 1.0e4));
+        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v,
+                v -> Double.isFinite(v) ? Math.clamp(v, 1.0e-4, 1.0e4) : fallback);
     }
 
     private static FloatSetting clampedFloat(String key, String tomlPath, float fallback, float min, float max) {
-        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v, v -> Math.clamp(v, min, max));
+        return new FloatSetting(key, tomlPath, fallback, v -> v, v -> v,
+                v -> Double.isFinite(v) ? Math.clamp(v, min, max) : fallback);
     }
 
     private static int defaultWorkerThreads() {

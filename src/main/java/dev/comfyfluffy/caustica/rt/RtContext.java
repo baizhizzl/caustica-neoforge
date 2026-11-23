@@ -376,49 +376,59 @@ public final class RtContext {
         int usage = VK10.VK_IMAGE_USAGE_STORAGE_BIT | VK10.VK_IMAGE_USAGE_SAMPLED_BIT
                 | VK10.VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK10.VK_IMAGE_USAGE_TRANSFER_DST_BIT | extraUsage;
         requireStorageImageSupport(width, height, format, usage, label);
-        long image;
-        long allocation;
-        long view;
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
-                    .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
-                    .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    // SAMPLED so DLSS-RR can read these as input textures (color + guide buffers);
-                    // STORAGE for raygen/compute writes; TRANSFER for the world-target copies.
-                    .usage(usage)
-                    .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
-            ici.extent().set(width, height, 1);
-            VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
-            LongBuffer pImage = stack.mallocLong(1);
-            PointerBuffer pAlloc = stack.mallocPointer(1);
-            check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage");
-            image = pImage.get(0);
-            allocation = pAlloc.get(0);
-            RtDebugLabels.nameImage(this, image, label);
+        long image = 0L;
+        long allocation = 0L;
+        long view = 0L;
+        try {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
+                        .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
+                        .mipLevels(1).arrayLayers(1).samples(VK10.VK_SAMPLE_COUNT_1_BIT).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
+                        // SAMPLED so DLSS-RR can read these as input textures (color + guide buffers);
+                        // STORAGE for raygen/compute writes; TRANSFER for the world-target copies.
+                        .usage(usage)
+                        .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
+                ici.extent().set(width, height, 1);
+                VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
+                LongBuffer pImage = stack.mallocLong(1);
+                PointerBuffer pAlloc = stack.mallocPointer(1);
+                check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage");
+                image = pImage.get(0);
+                allocation = pAlloc.get(0);
+                RtDebugLabels.nameImage(this, image, label);
 
-            VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
-                    .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_2D).format(format);
-            vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-            LongBuffer pView = stack.mallocLong(1);
-            check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView");
-            view = pView.get(0);
-            RtDebugLabels.nameImageView(this, view, label + " view");
-        }
-        long imageFinal = image;
-        submitSync(cmd -> {
-            try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
-                VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
-                b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
-                                | VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
-                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                        .image(imageFinal);
-                b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                        0, null, null, b);
+                VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
+                        .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_2D).format(format);
+                vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+                LongBuffer pView = stack.mallocLong(1);
+                check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView");
+                view = pView.get(0);
+                RtDebugLabels.nameImageView(this, view, label + " view");
             }
-        });
-        return new RtImage(vma, vk, image, allocation, view, width, height);
+            long imageFinal = image;
+            submitSync(cmd -> {
+                try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
+                    VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
+                    b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                            .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_SHADER_READ_BIT | VK10.VK_ACCESS_SHADER_WRITE_BIT
+                                    | VK10.VK_ACCESS_TRANSFER_READ_BIT | VK10.VK_ACCESS_TRANSFER_WRITE_BIT)
+                            .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .image(imageFinal);
+                    b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+                    VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                            0, null, null, b);
+                }
+            });
+            return new RtImage(vma, vk, image, allocation, view, width, height);
+        } catch (Throwable t) {
+            if (view != 0L) {
+                VK10.vkDestroyImageView(vk, view, null);
+            }
+            if (image != 0L) {
+                Vma.vmaDestroyImage(vma, image, allocation);
+            }
+            throw t;
+        }
     }
 
     private void requireStorageImageSupport(int width, int height, int format, int usage, String label) {
@@ -466,46 +476,56 @@ public final class RtContext {
      * often-unsupported device limit). Kept in {@code GENERAL} layout like every other image here.
      */
     public RtImage createTransientMsaaColorImage(int width, int height, int format, int samples, String label) {
-        long image;
-        long allocation;
-        long view;
-        try (MemoryStack stack = MemoryStack.stackPush()) {
-            VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
-                    .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
-                    .mipLevels(1).arrayLayers(1).samples(samples).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
-                    .usage(VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK10.VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
-                    .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
-            ici.extent().set(width, height, 1);
-            VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
-            LongBuffer pImage = stack.mallocLong(1);
-            PointerBuffer pAlloc = stack.mallocPointer(1);
-            check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage");
-            image = pImage.get(0);
-            allocation = pAlloc.get(0);
-            RtDebugLabels.nameImage(this, image, label);
+        long image = 0L;
+        long allocation = 0L;
+        long view = 0L;
+        try {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                VkImageCreateInfo ici = VkImageCreateInfo.calloc(stack).sType$Default()
+                        .imageType(VK10.VK_IMAGE_TYPE_2D).format(format)
+                        .mipLevels(1).arrayLayers(1).samples(samples).tiling(VK10.VK_IMAGE_TILING_OPTIMAL)
+                        .usage(VK10.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK10.VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT)
+                        .sharingMode(VK10.VK_SHARING_MODE_EXCLUSIVE).initialLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED);
+                ici.extent().set(width, height, 1);
+                VmaAllocationCreateInfo iaci = VmaAllocationCreateInfo.calloc(stack).usage(Vma.VMA_MEMORY_USAGE_AUTO);
+                LongBuffer pImage = stack.mallocLong(1);
+                PointerBuffer pAlloc = stack.mallocPointer(1);
+                check(Vma.vmaCreateImage(vma, ici, iaci, pImage, pAlloc, null), "vmaCreateImage");
+                image = pImage.get(0);
+                allocation = pAlloc.get(0);
+                RtDebugLabels.nameImage(this, image, label);
 
-            VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
-                    .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_2D).format(format);
-            vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-            LongBuffer pView = stack.mallocLong(1);
-            check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView");
-            view = pView.get(0);
-            RtDebugLabels.nameImageView(this, view, label + " view");
-        }
-        long imageFinal = image;
-        submitSync(cmd -> {
-            try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
-                VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
-                b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
-                        .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
-                        .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
-                        .image(imageFinal);
-                b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
-                VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        0, null, null, b);
+                VkImageViewCreateInfo vci = VkImageViewCreateInfo.calloc(stack).sType$Default()
+                        .image(image).viewType(VK10.VK_IMAGE_VIEW_TYPE_2D).format(format);
+                vci.subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+                LongBuffer pView = stack.mallocLong(1);
+                check(VK10.vkCreateImageView(vk, vci, null, pView), "vkCreateImageView");
+                view = pView.get(0);
+                RtDebugLabels.nameImageView(this, view, label + " view");
             }
-        });
-        return new RtImage(vma, vk, image, allocation, view, width, height);
+            long imageFinal = image;
+            submitSync(cmd -> {
+                try (MemoryStack stack = MemoryStack.stackPush(); RtDebugLabels.Scope ignored = RtDebugLabels.scope(this, cmd, "init " + label)) {
+                    VkImageMemoryBarrier.Buffer b = VkImageMemoryBarrier.calloc(1, stack);
+                    b.get(0).sType$Default().oldLayout(VK10.VK_IMAGE_LAYOUT_UNDEFINED).newLayout(VK10.VK_IMAGE_LAYOUT_GENERAL)
+                            .srcAccessMask(0).dstAccessMask(VK10.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                            .srcQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED).dstQueueFamilyIndex(VK10.VK_QUEUE_FAMILY_IGNORED)
+                            .image(imageFinal);
+                    b.get(0).subresourceRange().aspectMask(VK10.VK_IMAGE_ASPECT_COLOR_BIT).levelCount(1).layerCount(1);
+                    VK10.vkCmdPipelineBarrier(cmd, VK10.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK10.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            0, null, null, b);
+                }
+            });
+            return new RtImage(vma, vk, image, allocation, view, width, height);
+        } catch (Throwable t) {
+            if (view != 0L) {
+                VK10.vkDestroyImageView(vk, view, null);
+            }
+            if (image != 0L) {
+                Vma.vmaDestroyImage(vma, image, allocation);
+            }
+            throw t;
+        }
     }
 
     /**
@@ -515,12 +535,16 @@ public final class RtContext {
      */
     public synchronized void submitSync(Consumer<VkCommandBuffer> record) {
         ensurePool();
+        VkCommandBuffer cmd = null;
+        long fence = 0L;
+        boolean submitted = false;
+        boolean completed = false;
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkCommandBufferAllocateInfo ai = VkCommandBufferAllocateInfo.calloc(stack).sType$Default()
                     .commandPool(commandPool).level(VK10.VK_COMMAND_BUFFER_LEVEL_PRIMARY).commandBufferCount(1);
             PointerBuffer pCmd = stack.mallocPointer(1);
             check(VK10.vkAllocateCommandBuffers(vk, ai, pCmd), "vkAllocateCommandBuffers");
-            VkCommandBuffer cmd = new VkCommandBuffer(pCmd.get(0), vk);
+            cmd = new VkCommandBuffer(pCmd.get(0), vk);
             RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_COMMAND_BUFFER, cmd.address(), "submitSync command buffer");
 
             VkCommandBufferBeginInfo bi = VkCommandBufferBeginInfo.calloc(stack).sType$Default()
@@ -532,15 +556,27 @@ public final class RtContext {
             VkFenceCreateInfo fci = VkFenceCreateInfo.calloc(stack).sType$Default();
             LongBuffer pFence = stack.mallocLong(1);
             check(VK10.vkCreateFence(vk, fci, null, pFence), "vkCreateFence");
-            long fence = pFence.get(0);
+            fence = pFence.get(0);
             RtDebugLabels.name(this, VK10.VK_OBJECT_TYPE_FENCE, fence, "submitSync fence");
 
             VkSubmitInfo si = VkSubmitInfo.calloc(stack).sType$Default().pCommandBuffers(stack.pointers(cmd));
-            check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit");
+            synchronized (deviceQueueHostLock) {
+                check(VK10.vkQueueSubmit(graphicsQueue.vkQueue(), si, fence), "vkQueueSubmit");
+            }
+            submitted = true;
             check(VK10.vkWaitForFences(vk, pFence, true, Long.MAX_VALUE), "vkWaitForFences");
-
-            VK10.vkDestroyFence(vk, fence, null);
-            VK10.vkFreeCommandBuffers(vk, commandPool, pCmd);
+            completed = true;
+        } finally {
+            if (!submitted || completed) {
+                if (fence != 0L) {
+                    VK10.vkDestroyFence(vk, fence, null);
+                }
+                if (cmd != null) {
+                    try (MemoryStack stack = MemoryStack.stackPush()) {
+                        VK10.vkFreeCommandBuffers(vk, commandPool, stack.pointers(cmd));
+                    }
+                }
+            }
         }
     }
 

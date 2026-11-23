@@ -61,16 +61,26 @@ public final class RtEmissionGrid {
             this.height = Math.max(1, height);
         }
 
-        /** Add one texel's premultiplied emissive radiance and mask weight. */
+        /** Add one texel's premultiplied emissive radiance and mask weight across every overlapped cell. */
         void add(int x, int y, float r, float g, float b, float weight) {
-            int cx = Math.min(SIZE - 1, x * SIZE / width);
-            int cy = Math.min(SIZE - 1, y * SIZE / height);
-            int index = (cy * SIZE + cx) * CELL_FLOATS;
-            sums[index] += r;
-            sums[index + 1] += g;
-            sums[index + 2] += b;
-            sums[index + 3] += weight;
-            counts[cy * SIZE + cx]++;
+            int tx = Math.clamp(x, 0, width - 1);
+            int ty = Math.clamp(y, 0, height - 1);
+            int cx0 = Math.min(SIZE - 1, tx * SIZE / width);
+            int cx1 = Math.max(cx0 + 1, Math.min(SIZE, ((tx + 1) * SIZE + width - 1) / width));
+            int cy0 = Math.min(SIZE - 1, ty * SIZE / height);
+            int cy1 = Math.max(cy0 + 1, Math.min(SIZE, ((ty + 1) * SIZE + height - 1) / height));
+            for (int cy = cy0; cy < cy1; cy++) {
+                int row = cy * SIZE;
+                for (int cx = cx0; cx < cx1; cx++) {
+                    int cell = row + cx;
+                    int index = cell * CELL_FLOATS;
+                    sums[index] += r;
+                    sums[index + 1] += g;
+                    sums[index + 2] += b;
+                    sums[index + 3] += weight;
+                    counts[cell]++;
+                }
+            }
         }
 
         /** Returns null when no texel carried any weight (a non-emissive input). */

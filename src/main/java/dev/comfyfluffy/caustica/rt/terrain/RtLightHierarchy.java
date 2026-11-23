@@ -66,9 +66,9 @@ final class RtLightHierarchy {
             int count = lightCount(section.lights);
             int first = lightIndex;
             double sectionPower = 0.0;
-            float ox = section.sectionX * 16f - rebaseX;
-            float oy = section.sectionY * 16f - rebaseY;
-            float oz = section.sectionZ * 16f - rebaseZ;
+            float ox = (float) ((long) section.sectionX * 16L - rebaseX);
+            float oy = (float) ((long) section.sectionY * 16L - rebaseY);
+            float oz = (float) ((long) section.sectionZ * 16L - rebaseZ);
             for (int j = 0; j < count; j++, lightIndex++) {
                 int source = j * SOURCE_FLOATS_PER_LIGHT;
                 int destination = lightIndex * GPU_FLOATS_PER_LIGHT;

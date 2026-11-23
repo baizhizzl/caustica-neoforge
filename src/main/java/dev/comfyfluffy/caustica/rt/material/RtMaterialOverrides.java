@@ -145,6 +145,13 @@ public final class RtMaterialOverrides {
             int nextModel = model != null ? model : base.model();
             float nextRoughness = roughness != null ? roughness : base.roughness();
             float nextMetalness = metalness != null ? metalness : base.metalness();
+            int nextFeatures = base.features();
+            if (roughness != null) {
+                nextFeatures |= RtMaterialRegistry.FEATURE_OVERRIDE_ROUGHNESS;
+            }
+            if (metalness != null) {
+                nextFeatures |= RtMaterialRegistry.FEATURE_OVERRIDE_METALNESS;
+            }
             float nextIor = ior != null ? ior
                     : (model != null ? defaultIor(nextModel) : base.ior());
             float nextTransmission = transmission != null ? transmission
@@ -154,7 +161,7 @@ public final class RtMaterialOverrides {
             float nextEmissionStrength = emissionStrengthCdM2 != null
                     && base.emissionSource() != RtMaterialDesc.EmissionSource.NONE
                     ? emissionStrengthCdM2 : base.emissionStrength();
-            return new RtMaterialDesc(nextModel, RtMaterialDesc.Source.OVERRIDE, base.features(),
+            return new RtMaterialDesc(nextModel, RtMaterialDesc.Source.OVERRIDE, nextFeatures,
                     nextRoughness, nextMetalness, nextIor, nextTransmission,
                     base.emissionSource(), nextEmissionStrength, base.emissionSummary());
         }

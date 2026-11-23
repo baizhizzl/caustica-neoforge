@@ -41,6 +41,21 @@ final class RtDlssFgSettingsTest {
         assertEquals(0, fg.effectiveMultiFrameCount());
     }
 
+    @Test
+    void runtimeFailureLatchPreservesSupportedStatusForUiRecovery() throws ReflectiveOperationException {
+        RtDlssFg fg = backend(5);
+        fg.setSurfaceFrameLimits(2, 0);
+        fg.setSwapchainFrameLimit(4, 2);
+        Field failed = RtDlssFg.class.getDeclaredField("failed");
+        failed.setAccessible(true);
+        failed.setBoolean(fg, true);
+
+        assertFalse(fg.isAvailable());
+        assertTrue(fg.isSupported());
+        fg.resetFailureLatch();
+        assertTrue(fg.isAvailable());
+    }
+
     private static RtDlssFg backend(int driverMaximum) throws ReflectiveOperationException {
         Constructor<RtDlssFg> constructor = RtDlssFg.class.getDeclaredConstructor();
         constructor.setAccessible(true);

@@ -130,4 +130,30 @@ final class RtMaterialOverridesTest {
         assertFalse(entityRule.matchesEntity(Identifier.parse("minecraft:entity/zombie/husk")));
         assertFalse(blockRule.matchesEntity(Identifier.parse("minecraft:entity/zombie/zombie")));
     }
+
+    @Test
+    void baseRoughnessAndMetalnessOverridesSetShaderOverrideFeatureBits() {
+        RtMaterialDesc labPbrBase = new RtMaterialDesc(RtMaterialRegistry.MODEL_OPAQUE,
+                RtMaterialDesc.Source.LAB_PBR, RtMaterialRegistry.FEATURE_SPEC,
+                0.8f, 0.0f, 1.0f, 0.0f, RtMaterialDesc.EmissionSource.NONE,
+                0.0f, RtMaterialDesc.EmissionSummary.NONE);
+        var roughnessOnly = RtMaterialOverrides.parse(JsonParser.parseString("""
+                {"format":2,"match":{"sprite":"minecraft:block/iron_block"},
+                "base":{"roughness":0.2}}
+                """).getAsJsonObject(), Identifier.parse("test:rough.json"));
+        var metalOnly = RtMaterialOverrides.parse(JsonParser.parseString("""
+                {"format":2,"match":{"sprite":"minecraft:block/iron_block"},
+                "base":{"metalness":1.0}}
+                """).getAsJsonObject(), Identifier.parse("test:metal.json"));
+
+        int roughFeatures = roughnessOnly.apply(labPbrBase).features();
+        assertTrue((roughFeatures & RtMaterialRegistry.FEATURE_SPEC) != 0);
+        assertTrue((roughFeatures & RtMaterialRegistry.FEATURE_OVERRIDE_ROUGHNESS) != 0);
+        assertEquals(0, roughFeatures & RtMaterialRegistry.FEATURE_OVERRIDE_METALNESS);
+
+        int metalFeatures = metalOnly.apply(labPbrBase).features();
+        assertTrue((metalFeatures & RtMaterialRegistry.FEATURE_SPEC) != 0);
+        assertEquals(0, metalFeatures & RtMaterialRegistry.FEATURE_OVERRIDE_ROUGHNESS);
+        assertTrue((metalFeatures & RtMaterialRegistry.FEATURE_OVERRIDE_METALNESS) != 0);
+    }
 }

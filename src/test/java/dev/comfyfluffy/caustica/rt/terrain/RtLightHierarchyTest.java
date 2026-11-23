@@ -96,6 +96,20 @@ final class RtLightHierarchyTest {
     }
 
     @Test
+    void largeCoordinateRebasePreservesExactSubBlockOffset() {
+        // Beyond +/-16,777,216, float32 loses unit precision; 64-bit integer rebase subtraction stays exact.
+        int sectionX = 1_500_001; // world X = 24,000,016
+        int rebaseX = 24_000_005;
+        RtLightHierarchy.Data data = RtLightHierarchy.build(List.of(
+                new RtLightHierarchy.SectionInput(0, sectionX, 0, -sectionX, light(1f, 1f))
+        ), rebaseX, 0, -rebaseX, () -> false);
+
+        // light() puts center at local (0, 0, 0), so rebased X = 24,000,016 - 24,000,005 = +11.0, Z = -11.0.
+        assertEquals(11.0f, data.packedLights()[0], 0.0f);
+        assertEquals(-11.0f, data.packedLights()[2], 0.0f);
+    }
+
+    @Test
     void supersededBuildStopsCooperatively() {
         List<RtLightHierarchy.SectionInput> sections = List.of(
                 new RtLightHierarchy.SectionInput(0, 0, 0, 0, light(1f, 1f)));

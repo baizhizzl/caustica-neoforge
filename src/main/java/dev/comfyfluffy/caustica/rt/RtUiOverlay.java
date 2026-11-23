@@ -186,23 +186,49 @@ public final class RtUiOverlay {
         frameState.populate();
     }
 
-    public static void beginGuiEffect(RtGuiBlend.Mode mode) {
-        RenderTarget main = mainTarget();
-        RtComposite.INSTANCE.captureFgHudless(main);
-        RtGuiBlend.beginSegments(overlay);
-        flushOrdinaryLayer(main);
-        clearGuiColor(mode == RtGuiBlend.Mode.MULTIPLY ? WHITE_MASK : TRANSPARENT);
+    public static boolean beginGuiEffect(RtGuiBlend.Mode mode) {
+        if (compositeFailed || overlay == null) {
+            return false;
+        }
+        try {
+            RenderTarget main = mainTarget();
+            RtComposite.INSTANCE.captureFgHudless(main);
+            RtGuiBlend.beginSegments(overlay);
+            flushOrdinaryLayer(main);
+            clearGuiColor(mode == RtGuiBlend.Mode.MULTIPLY ? WHITE_MASK : TRANSPARENT);
+            return true;
+        } catch (Throwable t) {
+            failComposite("effect setup", t);
+            return false;
+        }
     }
 
     public static void finishGuiEffect(RtGuiBlend.Mode mode) {
-        commitLayer(mainTarget(), mode, true);
-        // The next ordinary layer and the final FG alpha hint both assume a transparent seed.
-        clearGuiColor(TRANSPARENT);
+        if (compositeFailed || overlay == null) {
+            return;
+        }
+        try {
+            commitLayer(mainTarget(), mode, true);
+            // The next ordinary layer and the final FG alpha hint both assume a transparent seed.
+            clearGuiColor(TRANSPARENT);
+        } catch (Throwable t) {
+            failComposite("effect composite", t);
+        }
     }
 
     public static void flushSegmentedGuiBeforeBlur() {
-        if (RtGuiBlend.segmented() && flushOrdinaryLayer(mainTarget())) {
-            clearGuiColor(TRANSPARENT);
+        if (compositeFailed || overlay == null || !frameState.compositePending()) {
+            return;
+        }
+        try {
+            RenderTarget main = mainTarget();
+            RtComposite.INSTANCE.captureFgHudless(main);
+            RtGuiBlend.beginSegments(overlay);
+            if (flushOrdinaryLayer(main)) {
+                clearGuiColor(TRANSPARENT);
+            }
+        } catch (Throwable t) {
+            failComposite("pre-blur flush", t);
         }
     }
 
@@ -238,12 +264,19 @@ public final class RtUiOverlay {
         }
     }
 
+    private static void failComposite(String stage, Throwable t) {
+        compositeFailed = true;
+        frameState.consume();
+        org.slf4j.LoggerFactory.getLogger("Caustica")
+                .error("UI overlay {} failed; disabling overlay", stage, t);
+    }
+
     /**
      * Composite the overlay over the real main target. Called once per frame from {@code GameRendererMixin}
      * after {@code GuiRenderer.render} returns. A compile/render failure latches the overlay off rather than crashing the frame.
      */
     public static void compositeIfUsed() {
-        if (overlay == null || (!frameState.compositePending() && !RtGuiBlend.segmented())) {
+        if (compositeFailed || overlay == null || (!frameState.compositePending() && !RtGuiBlend.segmented())) {
             frameState.consume();
             return;
         }
@@ -259,9 +292,7 @@ public final class RtUiOverlay {
                 RtGuiBlend.resolveSdrUi(main, overlay);
             }
         } catch (Throwable t) {
-            compositeFailed = true;
-            org.slf4j.LoggerFactory.getLogger("Caustica")
-                    .error("UI overlay composite failed; disabling overlay", t);
+            failComposite("composite", t);
         }
     }
 

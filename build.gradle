@@ -127,11 +127,18 @@ abstract class CompileShaders extends DefaultTask {
 				commandLine spirvVal.get(), "--target-env", "vulkan1.2", spv.absolutePath
 			}
 		}
-		def includeDirs = srcDir.get().asFileTree.matching { include "**/*.slang" }.files
-				.collect { it.parentFile }.unique().sort { it.absolutePath }
+		def rootDir = srcDir.get().asFile
+		def commonDir = new File(rootDir, "common")
+		def worldDir = new File(rootDir, "pipelines/world")
 		def compileOneSlang = { File src, File spv, List<String> extra ->
 			spv.parentFile.mkdirs()
-			def includes = [src.parentFile] + includeDirs.findAll { it != src.parentFile }
+			def includes = [src.parentFile, commonDir]
+			def rel = rootDir.toPath().relativize(src.toPath()).toString().replace('\\', '/')
+			if (rel.startsWith("pipelines/sky_lut/") || rel.startsWith("pipelines/light_presample/")
+					|| rel.startsWith("layout/")) {
+				includes.add(worldDir)
+			}
+			includes = includes.findAll { it.isDirectory() }.unique { it.canonicalPath }
 			execOps.exec {
 				// Embed Slang source and line mappings in SPIR-V for RenderDoc/Nsight source debugging.
 				commandLine([slangc.get(), src.absolutePath, "-target", "spirv",
@@ -268,18 +275,18 @@ if (providers.gradleProperty("ngxPlatforms").isPresent()) {
                       }
                   }]]
     }
-    def bundleNgxNatives = tasks.register("bundleNgxNatives") {
+    def bundleNgxNatives = tasks.register("bundleNgxNatives", Sync) {
         group = "build"
         description = "Bundle explicitly selected NGX shim and DLSS native libraries."
         inputs.property("selectedPlatforms", selected)
         inputs.property("shimConfig", shimConfig)
         inputs.property("vendorConfig", vendorConfig)
         inputsByPlatform.each { name, nativeInputs ->
-            inputs.files(nativeInputs.shim).withPropertyName("${name}.shim")
-            inputs.files(nativeInputs.vendor).withPropertyName("${name}.vendor")
+            from(nativeInputs.shim) { into("caustica/natives/${name}") }
+            nativeInputs.vendor.each { tree -> from(tree) { into("caustica/natives/${name}") } }
         }
-        outputs.dir(nativeGenRoot)
-        doLast {
+        into(nativeGenRoot)
+        doFirst {
             def missing = []
             inputsByPlatform.each { name, nativeInputs ->
                 if (!nativeInputs.shim.isFile()) missing.add("${name} shim: ${nativeInputs.shim}")
@@ -288,13 +295,6 @@ if (providers.gradleProperty("ngxPlatforms").isPresent()) {
                 }
             }
             if (!missing.empty) throw new GradleException("Missing NGX inputs:\n - " + missing.join("\n - "))
-            project.sync {
-                inputsByPlatform.each { name, nativeInputs ->
-                    from(nativeInputs.shim) { into("caustica/natives/${name}") }
-                    nativeInputs.vendor.each { tree -> from(tree) { into("caustica/natives/${name}") } }
-                }
-                into(nativeGenRoot)
-            }
         }
     }
     sourceSets.main.resources.srcDir(files(nativeGenRoot).builtBy(bundleNgxNatives))
@@ -346,13 +346,14 @@ publishing {
 // These CPU-only invariants do not require a game launcher or GPU.
 tasks.named("check") { dependsOn(":core-tests:test", "verifyMixinTargets") }
 
+evaluationDependsOn(":core-tests")
 configurations { mixinAuditRuntime }
 dependencies { mixinAuditRuntime "org.ow2.asm:asm-tree:9.9" }
 tasks.register("verifyMixinTargets", JavaExec) {
     group = "verification"
     description = "Audit mixin selectors, members and callback signatures against target Minecraft bytecode."
     dependsOn(tasks.named("classes"), ":core-tests:contractsClasses")
-    classpath = sourceSets.main.runtimeClasspath + configurations.mixinAuditRuntime + files("core-tests/build/classes/java/contracts")
+    classpath = sourceSets.main.runtimeClasspath + configurations.mixinAuditRuntime + project(":core-tests").sourceSets.contracts.output
     mainClass = "dev.comfyfluffy.caustica.compat.VerifyMixinContracts"
     args(file("src/main/resources/caustica.mixins.json").absolutePath)
 }

@@ -172,7 +172,7 @@ abstract class GenerateShaderRecords extends DefaultTask {
             sb << "    public static final int ${upperSnake(field.name)}_CAPACITY = ${field.type.elementCount};\n"
         }
 
-        def validatedFields = fields.findAll { it.type.kind in ["matrix", "struct", "array"] }
+        def validatedFields = fields.findAll { it.type.kind in ["vector", "matrix", "struct", "array"] }
         if (!validatedFields.isEmpty()) {
             sb << "\n    public ${className} {\n"
             validatedFields.each { field ->
@@ -262,11 +262,14 @@ abstract class GenerateShaderRecords extends DefaultTask {
     void generate() {
         def reflectionFile = new File(temporaryDir, "shader-records-reflection.json")
         def probeSpv = new File(temporaryDir, "shader-layout-probe.spv")
-        def includeArgs = shaderRoot.get().asFileTree.matching { include "**/*.slang" }.files
-                .collect { it.parentFile }.unique().sort { it.absolutePath }
+        def rootDir = shaderRoot.get().asFile
+        def probeFile = probeSource.get().asFile
+        def includeArgs = [probeFile.parentFile, new File(rootDir, "common"), new File(rootDir, "pipelines/world")]
+                .findAll { it.isDirectory() }
+                .unique { it.canonicalPath }
                 .collectMany { ["-I", it.absolutePath] }
         execOps.exec {
-            commandLine([slangc.get(), probeSource.get().asFile.absolutePath] + includeArgs +
+            commandLine([slangc.get(), probeFile.absolutePath] + includeArgs +
                     [
                     "-target", "spirv", "-profile", "spirv_1_5", "-matrix-layout-column-major",
                     "-warnings-as-errors", "all", "-warnings-disable", "41012",

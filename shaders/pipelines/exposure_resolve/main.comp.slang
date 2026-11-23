@@ -78,17 +78,24 @@ void main() {
         bool capEmissive = emissivePopulation > emissiveCap * rawTotal;
         float weightedSky = skyPopulation;
         float weightedEmissive = emissivePopulation;
+        if (capSky && !capEmissive) {
+            weightedSky = skyCap <= 0.0 ? 0.0
+                    : skyCap * (surfacePopulation + emissivePopulation) / max(1.0 - skyCap, 1.0e-6);
+            if (weightedEmissive > emissiveCap * (surfacePopulation + weightedSky + weightedEmissive)) {
+                capEmissive = true;
+            }
+        } else if (capEmissive && !capSky) {
+            weightedEmissive = emissiveCap <= 0.0 ? 0.0
+                    : emissiveCap * (surfacePopulation + skyPopulation) / max(1.0 - emissiveCap, 1.0e-6);
+            if (weightedSky > skyCap * (surfacePopulation + weightedSky + weightedEmissive)) {
+                capSky = true;
+            }
+        }
         if (capSky && capEmissive) {
             float ordinaryShare = max(1.0 - skyCap - emissiveCap, 1.0e-6);
             float cappedTotal = surfacePopulation / ordinaryShare;
             weightedSky = skyCap * cappedTotal;
             weightedEmissive = emissiveCap * cappedTotal;
-        } else if (capSky) {
-            weightedSky = skyCap <= 0.0 ? 0.0
-                    : skyCap * (surfacePopulation + emissivePopulation) / max(1.0 - skyCap, 1.0e-6);
-        } else if (capEmissive) {
-            weightedEmissive = emissiveCap <= 0.0 ? 0.0
-                    : emissiveCap * (surfacePopulation + skyPopulation) / max(1.0 - emissiveCap, 1.0e-6);
         }
         skyScale = skyPopulation > 0.0 ? min(1.0, weightedSky / skyPopulation) : 1.0;
         emissiveScale = emissivePopulation > 0.0
@@ -99,17 +106,23 @@ void main() {
     float total = max(population, 1.0);
     float lowPercentile = clamp(min(pc.lowPercentile, pc.highPercentile), 0.0, 1.0);
     float highPercentile = clamp(max(pc.lowPercentile, pc.highPercentile), 0.0, 1.0);
-    float lowCount = min(floor(total * lowPercentile), total - 1.0);
-    float highCount = clamp(ceil(total * highPercentile), lowCount + 1.0, total);
+    float lowCount = total * lowPercentile;
+    float highCount = total * highPercentile;
 
     float cumulative = 0.0;
     float weightedLogLum = 0.0;
     float weightedCount = 0.0;
+    float pivotLogLum = 0.0;
+    bool foundPivot = false;
     for (uint i = 0u; i < 256u; ++i) {
         float count = float(histBins[i]) + float(histBins[256u + i]) * skyScale
                 + float(histBins[512u + i]) * emissiveScale;
         float start = cumulative;
         float end = cumulative + count;
+        if (!foundPivot && count > 0.0 && end >= lowCount) {
+            pivotLogLum = binCenter(i);
+            foundPivot = true;
+        }
         float takeStart = max(start, lowCount);
         float takeEnd = min(end, highCount);
         if (takeEnd > takeStart) {
@@ -120,7 +133,7 @@ void main() {
         cumulative = end;
     }
 
-    float avgLogLum = weightedCount > 0.0 ? weightedLogLum / weightedCount : 0.0;
+    float avgLogLum = weightedCount > 0.0 ? weightedLogLum / weightedCount : pivotLogLum;
     // avgLogLum is log2 of the PRE-EXPOSED stored luminance. evScene is the absolute scene value on
     // the EV100 scale used by the compensation curve's control points and diagnostics.
     float evScene = avgLogLum + pc.evOffset;

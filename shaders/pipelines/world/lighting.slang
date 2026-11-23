@@ -552,7 +552,7 @@ public Reservoir risInitial(float3 hitPos, float3 n, float3 v, float3 rd, float3
 // sample's side of the surface.
 public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, float3 rd, float3 diffAlb,
                       float3 F0, float rough, float3 msScale, bool twoSided,
-                      bool hasBsdfContinuation, float sss) {
+                      bool hasBsdfContinuation, float sss, Medium currentMedium) {
     if (s.W <= 0.0 || s.phat <= 0.0) {
         return float3(0.0, 0.0, 0.0);
     }
@@ -580,6 +580,6 @@ public float3 shadeReservoir(Reservoir s, float3 hitPos, float3 n, float3 v, flo
     VisibilityResult shadow = traceDist > RAY_TMIN
             ? visibility(origin, toL / dist, traceDist)
             : makeUnoccludedVisibility();
-    float3 vis = shadow.transmittance;
+    float3 vis = shadow.transmittance * waterShadowTransmittance(currentMedium, shadow, dist);
     return contrib * vis * s.W;
 }

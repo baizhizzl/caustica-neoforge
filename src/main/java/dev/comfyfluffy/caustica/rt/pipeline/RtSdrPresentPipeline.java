@@ -118,6 +118,9 @@ public final class RtSdrPresentPipeline {
         if (boundOutView == outImageView && boundSdrView == sdrImageView && boundSampler == sampler) {
             return;
         }
+        if (boundOutView != 0L) {
+            ctx.waitIdle();
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkDescriptorImageInfo.Buffer outInfo = VkDescriptorImageInfo.calloc(1, stack);
             outInfo.get(0).imageView(outImageView).imageLayout(VK10.VK_IMAGE_LAYOUT_GENERAL);
